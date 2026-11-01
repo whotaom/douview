@@ -1,0 +1,359 @@
+package com.example.ui
+
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.*
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import com.example.data.LivePreferences
+import com.example.ui.theme.*
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun ControlBottomSheet(
+    currentUrl: String,
+    pageTitle: String,
+    keepScreenOn: Boolean,
+    isDesktopUa: Boolean,
+    forceLandscape: Boolean,
+    onDismissRequest: () -> Unit,
+    onReload: () -> Unit,
+    onKeepScreenOnToggle: (Boolean) -> Unit,
+    onDesktopUaToggle: (Boolean) -> Unit,
+    onOrientationToggle: () -> Unit,
+    onOpenUrlDialog: () -> Unit,
+    onOpenQuickRoomDialog: () -> Unit,
+    onClearCache: () -> Unit
+) {
+    val clipboardManager = LocalClipboardManager.current
+    var showCopiedToast by remember { mutableStateOf(false) }
+
+    ModalBottomSheet(
+        onDismissRequest = onDismissRequest,
+        containerColor = DarkSurface,
+        scrimColor = Color.Black.copy(alpha = 0.65f),
+        shape = RoundedCornerShape(topStart = 24.dp, topEnd = 24.dp)
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 20.dp)
+                .padding(bottom = 32.dp),
+            verticalArrangement = Arrangement.spacedBy(16.dp)
+        ) {
+            // Header
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(36.dp)
+                            .clip(CircleShape)
+                            .background(DouyinRed.copy(alpha = 0.15f)),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Tv,
+                            contentDescription = null,
+                            tint = DouyinRed,
+                            modifier = Modifier.size(20.dp)
+                        )
+                    }
+                    Column {
+                        Text(
+                            text = "抖眸流控 · 控制中心",
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.Bold,
+                            color = TextPrimary
+                        )
+                        Text(
+                            text = if (pageTitle.isNotBlank()) pageTitle else "抖音直播聚合中控台",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = TextSecondary,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                }
+
+                Surface(
+                    shape = RoundedCornerShape(12.dp),
+                    color = DouyinGreen.copy(alpha = 0.15f)
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .size(6.dp)
+                                .clip(CircleShape)
+                                .background(DouyinGreen)
+                        )
+                        Text(
+                            text = "在线",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = DouyinGreen,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                    }
+                }
+            }
+
+            // Current URL Info Card
+            Card(
+                colors = CardDefaults.cardColors(containerColor = DarkSurfaceElevated),
+                shape = RoundedCornerShape(16.dp),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(14.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Text(
+                            text = "当前服务节点",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = TextSecondary
+                        )
+                        TextButton(
+                            onClick = onOpenUrlDialog,
+                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Link,
+                                contentDescription = null,
+                                modifier = Modifier.size(16.dp),
+                                tint = DouyinCyan
+                            )
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text("切换地址", color = DouyinCyan, fontSize = 12.sp)
+                        }
+                    }
+
+                    Text(
+                        text = currentUrl,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = TextPrimary,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        fontWeight = FontWeight.Medium
+                    )
+                }
+            }
+
+            // Quick Actions Grid
+            Text(
+                text = "快捷操作",
+                style = MaterialTheme.typography.labelLarge,
+                color = TextSecondary
+            )
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                QuickActionButton(
+                    icon = Icons.Default.Add,
+                    label = "快速加房",
+                    accentColor = DouyinRed,
+                    modifier = Modifier.weight(1f),
+                    onClick = onOpenQuickRoomDialog
+                )
+
+                QuickActionButton(
+                    icon = Icons.Default.Refresh,
+                    label = "重新加载",
+                    accentColor = DouyinCyan,
+                    modifier = Modifier.weight(1f),
+                    onClick = onReload
+                )
+
+                QuickActionButton(
+                    icon = Icons.Default.ScreenRotation,
+                    label = if (forceLandscape) "横屏锁定" else "屏幕旋转",
+                    accentColor = DouyinGreen,
+                    modifier = Modifier.weight(1f),
+                    onClick = onOrientationToggle
+                )
+            }
+
+            Divider(color = DarkSurfaceBorder, thickness = 0.8.dp)
+
+            // Preference Toggles List
+            Column(
+                modifier = Modifier.fillMaxWidth(),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                SettingSwitchRow(
+                    icon = Icons.Default.LightMode,
+                    title = "屏幕防休眠常亮",
+                    subtitle = "长时间监控或观看直播时防止手机自动锁屏",
+                    checked = keepScreenOn,
+                    onCheckedChange = onKeepScreenOnToggle
+                )
+
+                SettingSwitchRow(
+                    icon = Icons.Default.DesktopMac,
+                    title = "桌面版标识 (User-Agent)",
+                    subtitle = "切换为PC桌面UA，适合平板宽屏多列中控布局",
+                    checked = isDesktopUa,
+                    onCheckedChange = onDesktopUaToggle
+                )
+            }
+
+            // Bottom Clear Cache Action
+            OutlinedButton(
+                onClick = onClearCache,
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(12.dp),
+                colors = ButtonDefaults.outlinedButtonColors(
+                    contentColor = TextSecondary
+                ),
+                border = ButtonDefaults.outlinedButtonBorder.copy(
+                    brush = androidx.compose.ui.graphics.SolidColor(DarkSurfaceBorder)
+                )
+            ) {
+                Icon(
+                    imageVector = Icons.Default.DeleteSweep,
+                    contentDescription = null,
+                    modifier = Modifier.size(18.dp)
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                Text("清理 WebView 网页缓存与本地存储", fontSize = 13.sp)
+            }
+        }
+    }
+}
+
+@Composable
+fun QuickActionButton(
+    icon: ImageVector,
+    label: String,
+    accentColor: Color,
+    modifier: Modifier = Modifier,
+    onClick: () -> Unit
+) {
+    Surface(
+        onClick = onClick,
+        modifier = modifier,
+        shape = RoundedCornerShape(14.dp),
+        color = DarkSurfaceElevated,
+        tonalElevation = 2.dp
+    ) {
+        Column(
+            modifier = Modifier
+                .padding(vertical = 12.dp, horizontal = 8.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(38.dp)
+                    .clip(CircleShape)
+                    .background(accentColor.copy(alpha = 0.12f)),
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(
+                    imageVector = icon,
+                    contentDescription = label,
+                    tint = accentColor,
+                    modifier = Modifier.size(20.dp)
+                )
+            }
+            Text(
+                text = label,
+                style = MaterialTheme.typography.labelMedium,
+                color = TextPrimary,
+                fontWeight = FontWeight.Medium
+            )
+        }
+    }
+}
+
+@Composable
+fun SettingSwitchRow(
+    icon: ImageVector,
+    title: String,
+    subtitle: String,
+    checked: Boolean,
+    onCheckedChange: (Boolean) -> Unit
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(12.dp))
+            .clickable { onCheckedChange(!checked) }
+            .padding(vertical = 8.dp, horizontal = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        Box(
+            modifier = Modifier
+                .size(34.dp)
+                .clip(CircleShape)
+                .background(if (checked) DouyinRed.copy(alpha = 0.15f) else DarkSurfaceElevated),
+            contentAlignment = Alignment.Center
+        ) {
+            Icon(
+                imageVector = icon,
+                contentDescription = null,
+                tint = if (checked) DouyinRed else TextSecondary,
+                modifier = Modifier.size(18.dp)
+            )
+        }
+
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = title,
+                style = MaterialTheme.typography.bodyMedium,
+                fontWeight = FontWeight.Medium,
+                color = TextPrimary
+            )
+            Text(
+                text = subtitle,
+                style = MaterialTheme.typography.bodySmall,
+                color = TextSecondary,
+                fontSize = 11.sp
+            )
+        }
+
+        Switch(
+            checked = checked,
+            onCheckedChange = onCheckedChange,
+            colors = SwitchDefaults.colors(
+                checkedThumbColor = Color.White,
+                checkedTrackColor = DouyinRed,
+                uncheckedThumbColor = TextSecondary,
+                uncheckedTrackColor = DarkSurfaceElevated
+            )
+        )
+    }
+}

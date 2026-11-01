@@ -1,0 +1,6 @@
+{
+  "name": "抖眸流控",
+  "description": "抖音直播聚合中控台，支持直播流解析、画质切换、多屏监控与全屏播放",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
