@@ -3,6 +3,7 @@ package com.example.ui
 import android.app.Activity
 import android.content.pm.ActivityInfo
 import androidx.compose.animation.*
+import androidx.compose.animation.core.*
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -16,6 +17,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
@@ -40,11 +42,12 @@ fun NativeLivePlayerOverlay(
     val playbackState by playerEngine.playbackState.collectAsState()
     val isPortraitStream by playerEngine.isPortraitStream.collectAsState()
     val currentLineName by playerEngine.currentLineName.collectAsState()
+    val isFirstFrameRendered by playerEngine.isFirstFrameRendered.collectAsState()
 
     var showQualityMenu by remember { mutableStateOf(false) }
     var isUserLandscape by remember { mutableStateOf(false) }
 
-    // 当检测到流的横竖比更新且用户未手动强制旋转时，自适应屏幕方向
+    // 智能流向自动适应：竖屏直播竖屏全屏，横屏直播横屏全屏
     LaunchedEffect(isPortraitStream, isUserLandscape) {
         if (!isUserLandscape) {
             activity?.requestedOrientation = if (isPortraitStream) {
@@ -74,6 +77,68 @@ fun NativeLivePlayerOverlay(
                 playerEngine.attachPlayerView(view)
             }
         )
+
+        // 防黑屏骨架占位动画（首帧上屏后平滑淡出）
+        AnimatedVisibility(
+            visible = !isFirstFrameRendered,
+            enter = fadeIn(),
+            exit = fadeOut(animationSpec = tween(400))
+        ) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(
+                        Brush.verticalGradient(
+                            colors = listOf(
+                                Color(0xFF14141E),
+                                Color(0xFF09090C),
+                                Color(0xFF101017)
+                            )
+                        )
+                    ),
+                contentAlignment = Alignment.Center
+            ) {
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(14.dp)
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(60.dp)
+                            .clip(CircleShape)
+                            .background(DouyinRed.copy(alpha = 0.15f)),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Tv,
+                            contentDescription = null,
+                            tint = DouyinRed,
+                            modifier = Modifier.size(30.dp)
+                        )
+                    }
+
+                    Text(
+                        text = roomInfo.anchorName,
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold,
+                        color = TextPrimary
+                    )
+
+                    Text(
+                        text = "正在连接低延迟直播流 · 防黑屏就绪中...",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = TextSecondary,
+                        fontSize = 11.sp
+                    )
+
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(22.dp),
+                        color = DouyinRed,
+                        strokeWidth = 2.dp
+                    )
+                }
+            }
+        }
 
         // 顶部控制与主播信息栏
         Row(
@@ -192,7 +257,7 @@ fun NativeLivePlayerOverlay(
                             },
                             onClick = {
                                 showQualityMenu = false
-                                // 核心调用：无缝切换线路并强制 setPlayWhenReady(true)
+                                // 核心调用：stop() -> 重置 MediaItem -> setPlayWhenReady(true)
                                 playerEngine.switchStreamSource(url, line)
                             }
                         )
@@ -246,26 +311,28 @@ fun NativeLivePlayerOverlay(
         // 缓冲与加载状态提示
         when (val state = playbackState) {
             is LivePlayerEngine.PlaybackState.Buffering -> {
-                Surface(
-                    shape = RoundedCornerShape(16.dp),
-                    color = Color.Black.copy(alpha = 0.75f),
-                    modifier = Modifier.align(Alignment.Center)
-                ) {
-                    Row(
-                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                if (isFirstFrameRendered) {
+                    Surface(
+                        shape = RoundedCornerShape(16.dp),
+                        color = Color.Black.copy(alpha = 0.75f),
+                        modifier = Modifier.align(Alignment.Center)
                     ) {
-                        CircularProgressIndicator(
-                            modifier = Modifier.size(18.dp),
-                            color = DouyinRed,
-                            strokeWidth = 2.dp
-                        )
-                        Text(
-                            text = state.message,
-                            style = MaterialTheme.typography.bodySmall,
-                            color = TextPrimary
-                        )
+                        Row(
+                            modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(10.dp)
+                        ) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(18.dp),
+                                color = DouyinRed,
+                                strokeWidth = 2.dp
+                            )
+                            Text(
+                                text = state.message,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = TextPrimary
+                            )
+                        }
                     }
                 }
             }

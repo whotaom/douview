@@ -44,18 +44,31 @@ class ExampleRobolectricTest {
 
     assertNotNull(engine.getPlayer())
 
-    // 线路切换无缝重载测试
+    // 线路切换无缝重载测试：显式 stop()，重置 MediaItem，setPlayWhenReady(true) 与音量 1.0f
     val testUrl = "https://example.com/live/stream.m3u8"
     engine.switchStreamSource(testUrl, "高清测试线")
 
     assertEquals("高清测试线", engine.currentLineName.value)
     val player = engine.getPlayer()
     assertNotNull(player)
-    // 验证 playWhenReady 显式置为 true 且音量为 1.0f
     assertTrue(player!!.playWhenReady)
     assertEquals(1.0f, player.volume, 0.01f)
 
     engine.release()
+  }
+
+  @Test
+  fun `player activity intent creation`() {
+    val context = ApplicationProvider.getApplicationContext<Context>()
+    val intent = PlayerActivity.createIntent(
+      context = context,
+      roomId = "742819283182",
+      title = "测试直播间",
+      anchor = "主播小张"
+    )
+    assertEquals("742819283182", intent.getStringExtra(PlayerActivity.EXTRA_ROOM_ID))
+    assertEquals("测试直播间", intent.getStringExtra(PlayerActivity.EXTRA_ROOM_TITLE))
+    assertEquals("主播小张", intent.getStringExtra(PlayerActivity.EXTRA_ROOM_ANCHOR))
   }
 
   @Test

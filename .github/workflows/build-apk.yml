@@ -52,7 +52,7 @@ jobs:
 
       - name: Build Debug APK
         run: |
-          ./gradlew assembleDebug --stacktrace --no-daemon
+          ./gradlew assembleDebug --stacktrace --no-daemon -Djava.awt.headless=true
 
       - name: Upload Debug APK Artifact
         uses: actions/upload-artifact@v4

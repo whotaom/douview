@@ -12,7 +12,6 @@ import androidx.media3.common.VideoSize
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.ExoPlayer
-import androidx.media3.exoplayer.hls.HlsMediaSource
 import androidx.media3.ui.PlayerView
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -20,7 +19,8 @@ import kotlinx.coroutines.flow.asStateFlow
 
 /**
  * 军工级 Android 原生直播引擎 (基于 Media3 ExoPlayer)
- * 具备播放状态完整监听、线路无缝切换热重载、显式 setPlayWhenReady(true) 声画保活机制
+ * 具备播放状态完整监听、显式 player.stop() 停流排障、无缝重载机制、
+ * 显式 setPlayWhenReady(true) 声画保活、首帧渲染防黑屏感知与息屏唤醒自愈。
  */
 class LivePlayerEngine(private val context: Context) {
 
@@ -48,6 +48,10 @@ class LivePlayerEngine(private val context: Context) {
 
     private val _currentLineName = MutableStateFlow("默认线路")
     val currentLineName: StateFlow<String> = _currentLineName.asStateFlow()
+
+    // 防黑屏状态标志：只有首帧真正上屏渲染后才置为 true
+    private val _isFirstFrameRendered = MutableStateFlow(false)
+    val isFirstFrameRendered: StateFlow<Boolean> = _isFirstFrameRendered.asStateFlow()
 
     private var currentStreamUrl: String? = null
     private var retryCount = 0
@@ -85,7 +89,6 @@ class LivePlayerEngine(private val context: Context) {
             .setAudioAttributes(audioAttributes, /* handleAudioFocus = */ true)
             .build()
 
-        // 添加状态监听器
         setupPlayerListener(player)
 
         exoPlayer = player
@@ -108,7 +111,7 @@ class LivePlayerEngine(private val context: Context) {
                     }
                     Player.STATE_READY -> {
                         retryCount = 0
-                        // 确保准备就绪时音量处于激活状态
+                        // 准备就绪时确保音量处于激活状态并具有音频焦点
                         player.volume = 1.0f
                         val isPortrait = _isPortraitStream.value
                         val size = player.videoSize
@@ -124,6 +127,12 @@ class LivePlayerEngine(private val context: Context) {
                         _playbackState.value = PlaybackState.Ended
                     }
                 }
+            }
+
+            override fun onRenderedFirstFrame() {
+                // 首帧真正上屏渲染，防黑屏占位层平滑淡出
+                _isFirstFrameRendered.value = true
+                Log.d(TAG, "onRenderedFirstFrame: Black screen averted")
             }
 
             override fun onIsPlayingChanged(isPlaying: Boolean) {
@@ -142,16 +151,20 @@ class LivePlayerEngine(private val context: Context) {
                 if (videoSize.width > 0 && videoSize.height > 0) {
                     val isPortrait = (videoSize.height >= videoSize.width)
                     _isPortraitStream.value = isPortrait
-                    Log.d(TAG, "Video dimension updated: ${videoSize.width}x${videoSize.height}, isPortrait=$isPortrait")
+                    Log.d(TAG, "Video dimension: ${videoSize.width}x${videoSize.height}, isPortrait=$isPortrait")
                 }
             }
 
+            override fun onAudioSessionIdChanged(audioSessionId: Int) {
+                Log.d(TAG, "AudioSessionId assigned: $audioSessionId")
+                player.volume = 1.0f
+            }
+
             override fun onPlayerError(error: PlaybackException) {
-                Log.e(TAG, "ExoPlayer playback error: ${error.errorCodeName}", error)
+                Log.e(TAG, "ExoPlayer error: ${error.errorCodeName}", error)
                 if (retryCount < MAX_AUTO_RETRY && currentStreamUrl != null) {
                     retryCount++
                     _playbackState.value = PlaybackState.Buffering("流信号自愈中 (${retryCount}/$MAX_AUTO_RETRY)...")
-                    // 延迟后无缝重新拉流
                     switchStreamSource(currentStreamUrl!!, _currentLineName.value)
                 } else {
                     _playbackState.value = PlaybackState.Error(
@@ -164,17 +177,24 @@ class LivePlayerEngine(private val context: Context) {
     }
 
     /**
-     * 核心实现：线路切换时的无缝重载机制
-     * 复用当前 ExoPlayer 实例避免硬解堆叠泄露，显式调用 setPlayWhenReady(true) 保证切流后立即发声播放
+     * 核心实现：ExoPlayer 线路切换无缝重载机制
+     * 1. 显式调用 player.stop() 停止当前播放，释放当前解码管道与音频缓冲区
+     * 2. 重置 MediaItem
+     * 3. 显式调用 player.prepare() 与 player.setPlayWhenReady(true)
+     * 4. 监听 Player.Listener 处理音频焦点，彻底杜绝静音与卡顿
      */
     fun switchStreamSource(newUrl: String, lineName: String = "默认线路") {
         val player = exoPlayer ?: return
         currentStreamUrl = newUrl
         _currentLineName.value = lineName
+        _isFirstFrameRendered.value = false
         _playbackState.value = PlaybackState.Buffering("正在平滑换线至 [$lineName]...")
 
         try {
-            // 构建低延迟直播 LiveConfiguration
+            // 步骤 1：显式通过 player.stop() 停止当前播放，立即释放旧流音画解码器
+            player.stop()
+
+            // 步骤 2：重置并构建新流 MediaItem
             val mediaItem = MediaItem.Builder()
                 .setUri(newUrl)
                 .setLiveConfiguration(
@@ -184,17 +204,15 @@ class LivePlayerEngine(private val context: Context) {
                         .build()
                 )
                 .build()
-
-            // 1. 无缝替换当前媒体项并重置播放位置到最新直播时间点
             player.setMediaItem(mediaItem, /* resetPosition = */ true)
 
-            // 2. 准备流媒体资源
+            // 步骤 3：准备媒体资源
             player.prepare()
 
-            // 3. 显式调用 setPlayWhenReady(true) 以消除任何浏览器或移动策略导致的静音卡顿
+            // 步骤 4：显式调用 setPlayWhenReady(true)，确保数据缓冲即刻发声播放
             player.playWhenReady = true
 
-            // 4. 重设音量为 100%，防止由于先前的自动播放失败落入静音陷阱
+            // 步骤 5：恢复 100% 音量，杜绝切流后静音锁死
             player.volume = 1.0f
 
             Log.i(TAG, "Seamlessly switched to stream line [$lineName]: $newUrl, playWhenReady=true")
@@ -205,33 +223,35 @@ class LivePlayerEngine(private val context: Context) {
     }
 
     /**
-     * 重新加载当前线路
+     * 息屏再开时的自愈恢复机制
      */
+    fun resumeOnScreenOn() {
+        exoPlayer?.let { player ->
+            if (currentStreamUrl != null && !player.isPlaying) {
+                Log.d(TAG, "Resuming live stream after screen on")
+                player.prepare()
+                player.playWhenReady = true
+                player.volume = 1.0f
+            }
+        }
+    }
+
     fun reloadCurrentStream() {
         currentStreamUrl?.let { url ->
             switchStreamSource(url, _currentLineName.value)
         }
     }
 
-    /**
-     * 绑定 PlayerView
-     */
     fun attachPlayerView(view: PlayerView) {
         currentPlayerView = view
         view.player = exoPlayer
     }
 
-    /**
-     * 解绑 PlayerView
-     */
     fun detachPlayerView() {
         currentPlayerView?.player = null
         currentPlayerView = null
     }
 
-    /**
-     * 暂停/恢复播放
-     */
     fun togglePlayPause() {
         exoPlayer?.let { player ->
             if (player.isPlaying) {
@@ -247,9 +267,6 @@ class LivePlayerEngine(private val context: Context) {
 
     fun getPlayer(): ExoPlayer? = exoPlayer
 
-    /**
-     * 释放播放器资源
-     */
     fun release() {
         try {
             exoPlayer?.stop()

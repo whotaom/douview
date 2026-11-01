@@ -25,6 +25,7 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.ActivityResultLauncher
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.*
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.*
@@ -277,7 +278,6 @@ class MainActivity : ComponentActivity() {
                                 handler: SslErrorHandler?,
                                 error: SslError?
                             ) {
-                                // 放行同域名资源，提升安全基线并容错私有自建证书节点
                                 val host = Uri.parse(error?.url ?: "").host ?: ""
                                 if (host.contains("fuxiaoya.com") || host.contains("douyin.com") || host.contains("bytevod.com")) {
                                     handler?.proceed()
@@ -306,7 +306,7 @@ class MainActivity : ComponentActivity() {
                                 customViewCallback = callback
                                 isCustomViewActive = true
 
-                                // 智能全屏横竖屏决策
+                                // 智能全屏横竖屏决策：竖屏直播竖屏全屏，横屏直播横屏全屏
                                 applyFullscreenOrientation(fullscreenMode)
                                 setImmersiveMode(true)
 
@@ -358,6 +358,60 @@ class MainActivity : ComponentActivity() {
                     root
                 }
             )
+
+            // 防黑屏优雅过渡层 (在直播控制台加载完成前提供视觉过渡，杜绝黑屏)
+            AnimatedVisibility(
+                visible = isLoading && loadProgress < 90 && !isCustomViewActive && activeNativeRoomInfo == null,
+                enter = fadeIn(),
+                exit = fadeOut(animationSpec = tween(400))
+            ) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .background(DarkBg),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Column(
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.spacedBy(16.dp)
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .size(64.dp)
+                                .clip(CircleShape)
+                                .background(DouyinRed.copy(alpha = 0.15f)),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Tv,
+                                contentDescription = null,
+                                tint = DouyinRed,
+                                modifier = Modifier.size(32.dp)
+                            )
+                        }
+
+                        Text(
+                            text = "抖眸流控 · 正在接入直播中枢",
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.Bold,
+                            color = TextPrimary
+                        )
+
+                        Text(
+                            text = "低延迟通道与解码器就绪中 · 防黑屏加载",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = TextSecondary,
+                            fontSize = 12.sp
+                        )
+
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(24.dp),
+                            color = DouyinRed,
+                            strokeWidth = 2.5.dp
+                        )
+                    }
+                }
+            }
 
             // Top Linear Progress Bar
             if (isLoading && loadProgress in 1..99 && !isCustomViewActive && activeNativeRoomInfo == null) {
@@ -652,9 +706,12 @@ class MainActivity : ComponentActivity() {
                 },
                 onPlayInNativeEngine = { roomInput ->
                     showRoomDialog = false
-                    launchNativePlayerForInput(roomInput) { info ->
-                        activeNativeRoomInfo = info
-                    }
+                    // 启动独立的 PlayerActivity 原生极速播放器
+                    val intent = PlayerActivity.createIntent(
+                        context = this@MainActivity,
+                        roomId = roomInput
+                    )
+                    startActivity(intent)
                 }
             )
         }
@@ -675,26 +732,6 @@ class MainActivity : ComponentActivity() {
                     webView?.reload()
                 }
             )
-        }
-    }
-
-    private fun launchNativePlayerForInput(
-        input: String,
-        onSuccess: (DouyinStreamResolver.LiveRoomInfo) -> Unit
-    ) {
-        Toast.makeText(this, "正在解析直播间直连信号...", Toast.LENGTH_SHORT).show()
-        lifecycleScope.launch {
-            val roomId = DouyinStreamResolver.extractRoomId(input) ?: input
-            val roomInfo = DouyinStreamResolver.resolveLiveRoom(roomId)
-            if (roomInfo != null && roomInfo.streams.isNotEmpty()) {
-                val firstKey = roomInfo.streams.keys.first()
-                val firstUrl = roomInfo.streams[firstKey]!!
-                // 核心：无缝切换线路并强制开启播放与音量
-                livePlayerEngine.switchStreamSource(firstUrl, firstKey)
-                onSuccess(roomInfo)
-            } else {
-                Toast.makeText(this@MainActivity, "无法获取该直播间流地址或当前未开播", Toast.LENGTH_LONG).show()
-            }
         }
     }
 
@@ -858,6 +895,36 @@ class MainActivity : ComponentActivity() {
         webView?.evaluateJavascript(js, null)
     }
 
+    /**
+     * 息屏再开时的网页直播流自愈检测：
+     * 自动检测视频播放状态，若由于锁屏挂起导致假死，自动触发拉流恢复
+     */
+    private fun resumeLiveStreamOnScreenOn() {
+        val js = """
+            (function() {
+                try {
+                    var v = document.getElementById('video') || document.querySelector('video');
+                    if (v) {
+                        v.muted = false;
+                        v.volume = 1.0;
+                        if (v.paused || v.readyState < 2) {
+                            var retryBtn = document.getElementById('retryBtn');
+                            var reloadBtn = document.getElementById('reloadBtn');
+                            if (retryBtn && !retryBtn.hidden) {
+                                retryBtn.click();
+                            } else if (reloadBtn) {
+                                reloadBtn.click();
+                            } else {
+                                v.play().catch(function(){});
+                            }
+                        }
+                    }
+                } catch(e) {}
+            })();
+        """.trimIndent()
+        webView?.evaluateJavascript(js, null)
+    }
+
     private fun injectRoomToWeb(roomInput: String) {
         val sanitized = roomInput.replace("\\", "\\\\").replace("'", "\\'").replace("\"", "\\\"").replace("\n", " ")
         val js = """
@@ -927,6 +994,18 @@ class MainActivity : ComponentActivity() {
         settings.userAgentString = if (isDesktop) desktopUserAgent else defaultMobileUserAgent
 
         wv.setLayerType(View.LAYER_TYPE_HARDWARE, null)
+    }
+
+    override fun onResume() {
+        super.onResume()
+        webView?.onResume()
+        livePlayerEngine.resumeOnScreenOn()
+        resumeLiveStreamOnScreenOn()
+    }
+
+    override fun onPause() {
+        super.onPause()
+        webView?.onPause()
     }
 
     override fun onDestroy() {
