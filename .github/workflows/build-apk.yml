@@ -24,24 +24,26 @@ jobs:
           distribution: 'temurin'
           cache: gradle
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
+      - name: Accept Android SDK Licenses
+        run: |
+          # GitHub Actions ubuntu-latest 环境已预装 Android SDK，直接自动同意许可协议
+          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses 2>/dev/null || true
 
       - name: Prepare Keystore & Environment
         run: |
-          # 确保可执行权限
+          # 确保 gradlew 具备执行权限
           chmod +x gradlew
 
-          # 恢复 debug 签名密钥
+          # 恢复 debug.keystore 签名证书
           if [ -f "debug.keystore.base64" ]; then
             echo "Restoring debug.keystore from base64..."
             base64 -d debug.keystore.base64 > debug.keystore
           elif [ ! -f "debug.keystore" ]; then
-            echo "Generating new debug.keystore..."
+            echo "Generating fallback debug.keystore..."
             keytool -genkey -v -keystore debug.keystore -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
           fi
 
-          # 确保 .env 存在供 Secrets Gradle 插件读取
+          # 确保 .env 文件存在供 Secrets Gradle 插件读取
           if [ ! -f ".env" ] && [ -f ".env.example" ]; then
             cp .env.example .env
           elif [ ! -f ".env" ]; then
@@ -49,7 +51,8 @@ jobs:
           fi
 
       - name: Build Debug APK
-        run: ./gradlew assembleDebug --stacktrace
+        run: |
+          ./gradlew assembleDebug --stacktrace --no-daemon
 
       - name: Upload Debug APK Artifact
         uses: actions/upload-artifact@v4
