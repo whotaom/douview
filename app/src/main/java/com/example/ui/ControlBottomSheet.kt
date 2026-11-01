@@ -14,12 +14,10 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
-import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.example.data.LivePreferences
 import com.example.ui.theme.*
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -37,11 +35,12 @@ fun ControlBottomSheet(
     onOrientationToggle: () -> Unit,
     onOpenUrlDialog: () -> Unit,
     onOpenQuickRoomDialog: () -> Unit,
-    onClearCache: () -> Unit
+    onClearCache: () -> Unit,
+    fullscreenOrientationMode: Int = 0,
+    onOrientationModeSelect: (Int) -> Unit = {},
+    onHealAudioStream: () -> Unit = {},
+    onLaunchNativePlayer: () -> Unit = {}
 ) {
-    val clipboardManager = LocalClipboardManager.current
-    var showCopiedToast by remember { mutableStateOf(false) }
-
     ModalBottomSheet(
         onDismissRequest = onDismissRequest,
         containerColor = DarkSurface,
@@ -169,6 +168,66 @@ fun ControlBottomSheet(
                 }
             }
 
+            // ExoPlayer Native Mode Launcher
+            Card(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable { onLaunchNativePlayer() },
+                shape = RoundedCornerShape(14.dp),
+                colors = CardDefaults.cardColors(containerColor = DarkSurfaceElevated),
+                border = ButtonDefaults.outlinedButtonBorder.copy(
+                    brush = androidx.compose.ui.graphics.SolidColor(DouyinCyan.copy(alpha = 0.35f))
+                )
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 14.dp, vertical = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .size(34.dp)
+                                .clip(CircleShape)
+                                .background(DouyinCyan.copy(alpha = 0.15f)),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.PlayCircle,
+                                contentDescription = null,
+                                tint = DouyinCyan,
+                                modifier = Modifier.size(20.dp)
+                            )
+                        }
+                        Column {
+                            Text(
+                                text = "原生 ExoPlayer 极速模式",
+                                style = MaterialTheme.typography.bodyMedium,
+                                fontWeight = FontWeight.SemiBold,
+                                color = TextPrimary
+                            )
+                            Text(
+                                text = "Media3 原生硬件解码 · 毫秒级换线无缝重载",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = TextSecondary,
+                                fontSize = 11.sp
+                            )
+                        }
+                    }
+                    Icon(
+                        imageVector = Icons.Default.ChevronRight,
+                        contentDescription = null,
+                        tint = TextSecondary,
+                        modifier = Modifier.size(20.dp)
+                    )
+                }
+            }
+
             // Quick Actions Grid
             Text(
                 text = "快捷操作",
@@ -178,7 +237,7 @@ fun ControlBottomSheet(
 
             Row(
                 modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(12.dp)
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
             ) {
                 QuickActionButton(
                     icon = Icons.Default.Add,
@@ -189,19 +248,34 @@ fun ControlBottomSheet(
                 )
 
                 QuickActionButton(
-                    icon = Icons.Default.Refresh,
-                    label = "重新加载",
+                    icon = Icons.Default.VolumeUp,
+                    label = "声画自愈",
                     accentColor = DouyinCyan,
+                    modifier = Modifier.weight(1f),
+                    onClick = onHealAudioStream
+                )
+
+                QuickActionButton(
+                    icon = Icons.Default.Refresh,
+                    label = "刷新重载",
+                    accentColor = DouyinGreen,
                     modifier = Modifier.weight(1f),
                     onClick = onReload
                 )
 
                 QuickActionButton(
                     icon = Icons.Default.ScreenRotation,
-                    label = if (forceLandscape) "横屏锁定" else "屏幕旋转",
-                    accentColor = DouyinGreen,
+                    label = when (fullscreenOrientationMode) {
+                        1 -> "横屏全屏"
+                        2 -> "竖屏全屏"
+                        else -> "智能流向"
+                    },
+                    accentColor = Color(0xFFFFB74D),
                     modifier = Modifier.weight(1f),
-                    onClick = onOrientationToggle
+                    onClick = {
+                        val next = (fullscreenOrientationMode + 1) % 3
+                        onOrientationModeSelect(next)
+                    }
                 )
             }
 
@@ -270,7 +344,7 @@ fun QuickActionButton(
     ) {
         Column(
             modifier = Modifier
-                .padding(vertical = 12.dp, horizontal = 8.dp),
+                .padding(vertical = 12.dp, horizontal = 6.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
@@ -292,7 +366,9 @@ fun QuickActionButton(
                 text = label,
                 style = MaterialTheme.typography.labelMedium,
                 color = TextPrimary,
-                fontWeight = FontWeight.Medium
+                fontWeight = FontWeight.Medium,
+                maxLines = 1,
+                fontSize = 12.sp
             )
         }
     }

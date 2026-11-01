@@ -1,6 +1,5 @@
 package com.example.ui
 
-import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -9,11 +8,11 @@ import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.ContentPaste
 import androidx.compose.material.icons.filled.DeleteSweep
 import androidx.compose.material.icons.filled.Link
+import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.text.font.FontWeight
@@ -57,20 +56,12 @@ fun ChangeUrlDialog(
                     color = TextSecondary
                 )
 
-                // Preset 1: Full Console
+                // 官方综合中控台
                 PresetUrlCard(
                     title = "默认中控台 (包含UI及实时播放器)",
                     url = LivePreferences.DEFAULT_URL,
                     isSelected = customUrl == LivePreferences.DEFAULT_URL,
                     onClick = { customUrl = LivePreferences.DEFAULT_URL }
-                )
-
-                // Preset 2: Direct API
-                PresetUrlCard(
-                    title = "live.php 直连接口 (JSON流解析响应)",
-                    url = LivePreferences.API_ENDPOINT_URL,
-                    isSelected = customUrl == LivePreferences.API_ENDPOINT_URL,
-                    onClick = { customUrl = LivePreferences.API_ENDPOINT_URL }
                 )
 
                 Spacer(modifier = Modifier.height(4.dp))
@@ -177,7 +168,8 @@ fun PresetUrlCard(
 @Composable
 fun QuickRoomDialog(
     onDismiss: () -> Unit,
-    onInjectRoom: (String) -> Unit
+    onInjectRoom: (String) -> Unit,
+    onPlayInNativeEngine: ((String) -> Unit)? = null
 ) {
     var roomInput by remember { mutableStateOf("") }
     val clipboardManager = LocalClipboardManager.current
@@ -235,6 +227,33 @@ fun QuickRoomDialog(
                     Spacer(modifier = Modifier.width(6.dp))
                     Text("从剪贴板读取内容", color = TextPrimary, fontSize = 12.sp)
                 }
+
+                if (onPlayInNativeEngine != null) {
+                    OutlinedButton(
+                        onClick = {
+                            if (roomInput.isNotBlank()) {
+                                onPlayInNativeEngine(roomInput.trim())
+                            }
+                        },
+                        colors = ButtonDefaults.outlinedButtonColors(
+                            contentColor = DouyinCyan
+                        ),
+                        border = ButtonDefaults.outlinedButtonBorder.copy(
+                            brush = androidx.compose.ui.graphics.SolidColor(DouyinCyan)
+                        ),
+                        shape = RoundedCornerShape(10.dp),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.PlayArrow,
+                            contentDescription = null,
+                            tint = DouyinCyan,
+                            modifier = Modifier.size(18.dp)
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("直接以原生 ExoPlayer 播放", fontSize = 12.sp)
+                    }
+                }
             }
         },
         confirmButton = {
@@ -247,7 +266,7 @@ fun QuickRoomDialog(
                 colors = ButtonDefaults.buttonColors(containerColor = DouyinRed),
                 shape = RoundedCornerShape(10.dp)
             ) {
-                Text("注入并播放")
+                Text("中控台载入")
             }
         },
         dismissButton = {
