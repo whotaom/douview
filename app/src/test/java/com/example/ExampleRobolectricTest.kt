@@ -94,12 +94,10 @@ class ExampleRobolectricTest {
   }
 
   @Test
-  fun `room database persistence and favorite toggling`() = runBlocking {
+  fun `database persistence and favorite toggling`() = runBlocking {
     val context = ApplicationProvider.getApplicationContext<Context>()
-    val inMemoryDb = androidx.room.Room.inMemoryDatabaseBuilder(context, com.example.data.db.AppDatabase::class.java)
-      .allowMainThreadQueries()
-      .build()
-    val dao = inMemoryDb.streamRecordDao()
+    val db = com.example.data.db.AppDatabase.getInstance(context)
+    val dao = db.streamRecordDao()
     val repo = com.example.data.db.StreamRecordRepository(dao)
 
     // 1. 记录访问历史
@@ -133,8 +131,33 @@ class ExampleRobolectricTest {
     assertEquals("官方新直播间", record?.title)
     assertEquals("https://example.com/live/10443341948_new.m3u8", record?.streamUrl)
     assertEquals(true, record?.isFavorite) // 收藏状态完好保持
+  }
 
-    inMemoryDb.close()
+  @Test
+  fun `history urls records automatically and limits to at most 5 items`() {
+    val context = ApplicationProvider.getApplicationContext<Context>()
+    val prefs = LivePreferences(context)
+
+    // 清理历史
+    prefs.getHistoryUrls().forEach { prefs.removeHistoryUrl(it) }
+
+    // 添加6个不同地址
+    for (i in 1..6) {
+      prefs.recordHistoryUrl("https://live-$i.douyin.com")
+    }
+
+    val history = prefs.getHistoryUrls()
+    // 严格限制最多5个
+    assertEquals(5, history.size)
+    // 最近记录的在最前
+    assertEquals("https://live-6.douyin.com", history[0])
+    assertEquals("https://live-5.douyin.com", history[1])
+
+    // 重复记录已存在的地址时自动去重并置顶
+    prefs.recordHistoryUrl("https://live-3.douyin.com")
+    val updated = prefs.getHistoryUrls()
+    assertEquals(5, updated.size)
+    assertEquals("https://live-3.douyin.com", updated[0])
   }
 
   @Test

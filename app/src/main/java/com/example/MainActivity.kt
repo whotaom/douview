@@ -104,12 +104,42 @@ class MainActivity : ComponentActivity() {
         val js = if (isInPictureInPictureMode) {
             """
             (function() {
+                var style = document.getElementById('__pip_pure_video_style');
+                if (!style) {
+                    style = document.createElement('style');
+                    style.id = '__pip_pure_video_style';
+                    style.innerHTML = `
+                        body.android-pip-mode {
+                            background: #000000 !important;
+                            overflow: hidden !important;
+                            margin: 0 !important;
+                            padding: 0 !important;
+                        }
+                        body.android-pip-mode * {
+                            visibility: hidden !important;
+                            opacity: 0 !important;
+                            pointer-events: none !important;
+                        }
+                        body.android-pip-mode video,
+                        body.android-pip-mode video * {
+                            visibility: visible !important;
+                            opacity: 1 !important;
+                            pointer-events: auto !important;
+                            position: fixed !important;
+                            top: 0 !important;
+                            left: 0 !important;
+                            width: 100vw !important;
+                            height: 100vh !important;
+                            z-index: 2147483647 !important;
+                            object-fit: contain !important;
+                            background: #000000 !important;
+                        }
+                    `;
+                    document.head.appendChild(style);
+                }
                 document.body.classList.add('android-pip-mode');
                 var v = document.getElementById('video') || document.querySelector('video');
                 if (v) {
-                    v.style.width = '100vw';
-                    v.style.height = '100vh';
-                    v.style.objectFit = 'contain';
                     v.play().catch(function(){});
                 }
             })();
@@ -118,6 +148,10 @@ class MainActivity : ComponentActivity() {
             """
             (function() {
                 document.body.classList.remove('android-pip-mode');
+                var style = document.getElementById('__pip_pure_video_style');
+                if (style && style.parentNode) {
+                    style.parentNode.removeChild(style);
+                }
                 var v = document.getElementById('video') || document.querySelector('video');
                 if (v) {
                     v.style.width = '';
@@ -259,7 +293,6 @@ class MainActivity : ComponentActivity() {
 
         var showBottomSheet by remember { mutableStateOf(false) }
         var showUrlDialog by remember { mutableStateOf(false) }
-        var showRoomDialog by remember { mutableStateOf(false) }
         var showClearCacheDialog by remember { mutableStateOf(false) }
         var showUpdateDialog by remember { mutableStateOf(false) }
 
@@ -281,7 +314,6 @@ class MainActivity : ComponentActivity() {
                 showBottomSheet -> showBottomSheet = false
                 showUpdateDialog -> showUpdateDialog = false
                 showUrlDialog -> showUrlDialog = false
-                showRoomDialog -> showRoomDialog = false
                 showClearCacheDialog -> showClearCacheDialog = false
                 webView?.canGoBack() == true -> {
                     webView?.goBack()
@@ -490,7 +522,14 @@ class MainActivity : ComponentActivity() {
                 Box(
                     modifier = Modifier
                         .fillMaxSize()
-                        .background(DarkBg),
+                        .background(
+                            androidx.compose.ui.graphics.Brush.verticalGradient(
+                                colors = listOf(
+                                    Color(0xFF0C0D14),
+                                    Color(0xFF07080B)
+                                )
+                            )
+                        ),
                     contentAlignment = Alignment.Center
                 ) {
                     Column(
@@ -499,15 +538,24 @@ class MainActivity : ComponentActivity() {
                     ) {
                         Box(
                             modifier = Modifier
-                                .size(64.dp)
+                                .size(68.dp)
                                 .clip(CircleShape)
-                                .background(DouyinRed.copy(alpha = 0.15f)),
+                                .background(
+                                    androidx.compose.ui.graphics.Brush.radialGradient(
+                                        colors = listOf(
+                                            DouyinCyan.copy(alpha = 0.22f),
+                                            DouyinRed.copy(alpha = 0.08f),
+                                            Color.Transparent
+                                        )
+                                    )
+                                )
+                                .border(1.dp, DouyinCyan.copy(alpha = 0.35f), CircleShape),
                             contentAlignment = Alignment.Center
                         ) {
                             Icon(
                                 imageVector = Icons.Default.Tv,
                                 contentDescription = null,
-                                tint = DouyinRed,
+                                tint = DouyinCyan,
                                 modifier = Modifier.size(32.dp)
                             )
                         }
@@ -520,7 +568,7 @@ class MainActivity : ComponentActivity() {
                         )
 
                         Text(
-                            text = "AI 智能信道连接中 · 音画同步加速 · 杜绝卡顿黑屏",
+                            text = "AI 智能信道连接中 · 音画同步加速",
                             style = MaterialTheme.typography.bodySmall,
                             color = TextSecondary,
                             fontSize = 12.sp
@@ -528,7 +576,10 @@ class MainActivity : ComponentActivity() {
 
                         Surface(
                             shape = RoundedCornerShape(12.dp),
-                            color = DouyinCyan.copy(alpha = 0.12f)
+                            color = DouyinCyan.copy(alpha = 0.12f),
+                            border = ButtonDefaults.outlinedButtonBorder.copy(
+                                brush = androidx.compose.ui.graphics.SolidColor(DouyinCyan.copy(alpha = 0.25f))
+                            )
                         ) {
                             Text(
                                 text = "极速硬件加速解码已就绪",
@@ -541,7 +592,7 @@ class MainActivity : ComponentActivity() {
 
                         CircularProgressIndicator(
                             modifier = Modifier.size(24.dp),
-                            color = DouyinRed,
+                            color = DouyinCyan,
                             strokeWidth = 2.5.dp
                         )
                     }
@@ -815,7 +866,7 @@ class MainActivity : ComponentActivity() {
                 },
                 onLaunchNativePlayer = {
                     showBottomSheet = false
-                    showRoomDialog = true
+                    showUrlDialog = true
                 },
                 onEnterPip = {
                     showBottomSheet = false
@@ -827,7 +878,7 @@ class MainActivity : ComponentActivity() {
                 },
                 onOpenQuickRoomDialog = {
                     showBottomSheet = false
-                    showRoomDialog = true
+                    showUrlDialog = true
                 },
                 onClearCache = {
                     showBottomSheet = false
@@ -859,21 +910,6 @@ class MainActivity : ComponentActivity() {
                     currentUrl = newUrl
                     showUrlDialog = false
                     webView?.loadUrl(newUrl)
-                }
-            )
-        }
-
-        if (showRoomDialog) {
-            QuickRoomDialog(
-                onDismiss = { showRoomDialog = false },
-                repository = recordRepository,
-                onInjectRoom = { roomInput ->
-                    showRoomDialog = false
-                    injectRoomToWeb(roomInput)
-                },
-                onPlayInNativeEngine = { roomInput ->
-                    showRoomDialog = false
-                    injectRoomToWeb(roomInput)
                 }
             )
         }

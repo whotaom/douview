@@ -244,14 +244,6 @@ fun ControlBottomSheet(
                 horizontalArrangement = Arrangement.spacedBy(10.dp)
             ) {
                 QuickActionButton(
-                    icon = Icons.Default.Add,
-                    label = "快速加房",
-                    accentColor = DouyinRed,
-                    modifier = Modifier.weight(1f),
-                    onClick = onOpenQuickRoomDialog
-                )
-
-                QuickActionButton(
                     icon = Icons.Default.VolumeUp,
                     label = "声画自愈",
                     accentColor = DouyinCyan,

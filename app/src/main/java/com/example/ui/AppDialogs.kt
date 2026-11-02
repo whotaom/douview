@@ -37,11 +37,15 @@ fun ChangeUrlDialog(
     onDismiss: () -> Unit,
     onConfirmUrl: (String) -> Unit
 ) {
+    val context = LocalContext.current
+    val preferences = remember { LivePreferences(context) }
     var inputUrl by remember { mutableStateOf(currentUrl) }
+    var historyUrls by remember { mutableStateOf(preferences.getHistoryUrls()) }
 
     AlertDialog(
         onDismissRequest = onDismiss,
         containerColor = DarkSurface,
+        modifier = Modifier.widthIn(max = 560.dp),
         title = {
             Text(
                 text = "更换中控服务地址",
@@ -53,7 +57,7 @@ fun ChangeUrlDialog(
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 Text(
-                    text = "输入自定义中控台或前端部署地址：",
+                    text = "输入自定义中控台或前端部署地址（自动记忆，最多5个）：",
                     style = MaterialTheme.typography.bodySmall,
                     color = TextSecondary
                 )
@@ -74,9 +78,72 @@ fun ChangeUrlDialog(
                     )
                 )
 
+                // 记忆的历史地址 (最多5个)
+                if (historyUrls.isNotEmpty()) {
+                    Text(
+                        text = "记忆切换地址 (${historyUrls.size}/${LivePreferences.MAX_HISTORY_URLS})：",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = TextSecondary
+                    )
+                    Column(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        historyUrls.take(LivePreferences.MAX_HISTORY_URLS).forEach { histUrl ->
+                            Surface(
+                                shape = RoundedCornerShape(8.dp),
+                                color = DarkSurfaceElevated,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable { inputUrl = histUrl }
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.SpaceBetween
+                                ) {
+                                    Row(
+                                        modifier = Modifier.weight(1f),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Default.History,
+                                            contentDescription = null,
+                                            tint = DouyinCyan,
+                                            modifier = Modifier.size(14.dp)
+                                        )
+                                        Text(
+                                            text = histUrl,
+                                            fontSize = 12.sp,
+                                            color = TextPrimary,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                    }
+                                    IconButton(
+                                        onClick = {
+                                            preferences.removeHistoryUrl(histUrl)
+                                            historyUrls = preferences.getHistoryUrls()
+                                        },
+                                        modifier = Modifier.size(20.dp)
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Default.Close,
+                                            contentDescription = "删除记录",
+                                            tint = TextSecondary,
+                                            modifier = Modifier.size(14.dp)
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // 快捷预设地址
                 Text(
-                    text = "快捷服务节点：",
+                    text = "快捷默认预设：",
                     style = MaterialTheme.typography.labelSmall,
                     color = TextSecondary
                 )
@@ -115,7 +182,9 @@ fun ChangeUrlDialog(
             Button(
                 onClick = {
                     if (inputUrl.isNotBlank()) {
-                        onConfirmUrl(inputUrl.trim())
+                        val trimmed = inputUrl.trim()
+                        preferences.recordHistoryUrl(trimmed)
+                        onConfirmUrl(trimmed)
                     }
                 },
                 colors = ButtonDefaults.buttonColors(containerColor = DouyinRed),
