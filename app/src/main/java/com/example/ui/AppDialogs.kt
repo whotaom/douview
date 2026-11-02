@@ -198,7 +198,7 @@ fun QuickRoomDialog(
                     Tab(
                         selected = selectedTab == 0,
                         onClick = { selectedTab = 0 },
-                        text = { Text("原生极速加房", fontSize = 12.sp, fontWeight = FontWeight.SemiBold) }
+                        text = { Text("快速加房 (RID)", fontSize = 12.sp, fontWeight = FontWeight.SemiBold) }
                     )
                     Tab(
                         selected = selectedTab == 1,
@@ -237,13 +237,13 @@ fun QuickRoomDialog(
             ) {
                 when (selectedTab) {
                     0 -> {
-                        // 原生极速加房（纯数字 RID <= 15 位，且自动加列表）
+                        // 快速加房（纯数字 RID <= 15 位，且自动加列表）
                         Column(
                             modifier = Modifier.fillMaxWidth(),
                             verticalArrangement = Arrangement.spacedBy(12.dp)
                         ) {
                             Text(
-                                text = "原生极速播放引擎（仅支持 ≤15 位纯数字房间号 RID）：",
+                                text = "输入抖音直播间号（仅支持 ≤15 位纯数字 RID，自动加进直播列表）：",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = TextSecondary
                             )
@@ -266,11 +266,11 @@ fun QuickRoomDialog(
                                         Text(
                                             text = if (roomInput.isEmpty()) {
                                                 "请输入 1~15 位纯数字 RID"
-                                            } else if (isInputValidRid) {
+                                             } else if (isInputValidRid) {
                                                 "格式正确 (自动加进直播列表)"
-                                            } else {
+                                             } else {
                                                 "必须为纯数字且不超过15位"
-                                            },
+                                             },
                                             color = if (isInputValidRid) DouyinGreen else TextSecondary,
                                             fontSize = 11.sp
                                         )
@@ -295,36 +295,34 @@ fun QuickRoomDialog(
                                 )
                             )
 
-                            if (onPlayInNativeEngine != null) {
-                                Button(
-                                    onClick = {
-                                        if (isInputValidRid) {
-                                            val input = roomInput.trim()
-                                            coroutineScope.launch {
-                                                recordRepo.recordAccess(roomId = input)
-                                            }
-                                            onPlayInNativeEngine(input)
+                            Button(
+                                onClick = {
+                                    if (isInputValidRid) {
+                                        val input = roomInput.trim()
+                                        coroutineScope.launch {
+                                            recordRepo.recordAccess(roomId = input)
                                         }
-                                    },
-                                    enabled = isInputValidRid,
-                                    colors = ButtonDefaults.buttonColors(
-                                        containerColor = DouyinRed,
-                                        disabledContainerColor = DarkSurfaceElevated
-                                    ),
-                                    shape = RoundedCornerShape(10.dp),
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .focusable()
-                                ) {
-                                    Icon(
-                                        imageVector = Icons.Default.PlayArrow,
-                                        contentDescription = null,
-                                        tint = if (isInputValidRid) Color.White else TextSecondary,
-                                        modifier = Modifier.size(18.dp)
-                                    )
-                                    Spacer(modifier = Modifier.width(6.dp))
-                                    Text("原生极速播放并加入列表", fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
-                                }
+                                        onInjectRoom(input)
+                                    }
+                                },
+                                enabled = isInputValidRid,
+                                colors = ButtonDefaults.buttonColors(
+                                    containerColor = DouyinRed,
+                                    disabledContainerColor = DarkSurfaceElevated
+                                ),
+                                shape = RoundedCornerShape(10.dp),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .focusable()
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.PlayArrow,
+                                    contentDescription = null,
+                                    tint = if (isInputValidRid) Color.White else TextSecondary,
+                                    modifier = Modifier.size(18.dp)
+                                )
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text("立即接入直播流并加入列表", fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
                             }
                         }
                     }
@@ -545,9 +543,9 @@ fun StreamRecordItemRow(
                     )
                 }
 
-                // 原生极速播放
+                // 播放直播
                 IconButton(
-                    onClick = onPlayNative,
+                    onClick = onInjectWeb,
                     modifier = Modifier
                         .size(32.dp)
                         .clip(CircleShape)
@@ -556,7 +554,7 @@ fun StreamRecordItemRow(
                 ) {
                     Icon(
                         imageVector = Icons.Default.PlayArrow,
-                        contentDescription = "原生播放",
+                        contentDescription = "播放直播",
                         tint = DouyinRed,
                         modifier = Modifier.size(18.dp)
                     )

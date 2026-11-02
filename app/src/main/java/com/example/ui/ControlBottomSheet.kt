@@ -41,6 +41,7 @@ fun ControlBottomSheet(
     onOrientationModeSelect: (Int) -> Unit = {},
     onHealAudioStream: () -> Unit = {},
     onLaunchNativePlayer: () -> Unit = {},
+    onEnterPip: () -> Unit = {},
     onCheckUpdate: () -> Unit = {}
 ) {
     ModalBottomSheet(
@@ -170,11 +171,12 @@ fun ControlBottomSheet(
                 }
             }
 
-            // ExoPlayer Native Mode Launcher
+            // Picture-in-Picture (PiP) Seamless Floating Mode Launcher
             Card(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .clickable { onLaunchNativePlayer() },
+                    .clickable { onEnterPip() }
+                    .focusable(),
                 shape = RoundedCornerShape(14.dp),
                 colors = CardDefaults.cardColors(containerColor = DarkSurfaceElevated),
                 border = ButtonDefaults.outlinedButtonBorder.copy(
@@ -184,7 +186,7 @@ fun ControlBottomSheet(
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(horizontal = 14.dp, vertical = 10.dp),
+                        .padding(horizontal = 14.dp, vertical = 11.dp),
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.SpaceBetween
                 ) {
@@ -200,7 +202,7 @@ fun ControlBottomSheet(
                             contentAlignment = Alignment.Center
                         ) {
                             Icon(
-                                imageVector = Icons.Default.PlayCircle,
+                                imageVector = Icons.Default.PictureInPictureAlt,
                                 contentDescription = null,
                                 tint = DouyinCyan,
                                 modifier = Modifier.size(20.dp)
@@ -208,13 +210,13 @@ fun ControlBottomSheet(
                         }
                         Column {
                             Text(
-                                text = "原生 ExoPlayer 极速模式",
+                                text = "画中画浮窗播放 (PiP)",
                                 style = MaterialTheme.typography.bodyMedium,
                                 fontWeight = FontWeight.SemiBold,
                                 color = TextPrimary
                             )
                             Text(
-                                text = "Media3 原生硬件解码 · 毫秒级换线无缝重载",
+                                text = "与网页端流控无缝接洽 · 置顶小窗 · 边聊边看",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = TextSecondary,
                                 fontSize = 11.sp
@@ -222,10 +224,10 @@ fun ControlBottomSheet(
                         }
                     }
                     Icon(
-                        imageVector = Icons.Default.ChevronRight,
+                        imageVector = Icons.Default.OpenInNew,
                         contentDescription = null,
-                        tint = TextSecondary,
-                        modifier = Modifier.size(20.dp)
+                        tint = DouyinCyan,
+                        modifier = Modifier.size(18.dp)
                     )
                 }
             }

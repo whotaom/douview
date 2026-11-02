@@ -2,9 +2,11 @@ package com.example
 
 import android.annotation.SuppressLint
 import android.app.Activity
+import android.app.PictureInPictureParams
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ActivityInfo
+import android.content.res.Configuration
 import android.media.AudioAttributes
 import android.media.AudioFocusRequest
 import android.media.AudioManager
@@ -12,6 +14,7 @@ import android.net.Uri
 import android.net.http.SslError
 import android.os.Build
 import android.os.Bundle
+import android.util.Rational
 import android.view.KeyEvent
 import android.view.View
 import android.view.ViewGroup
@@ -87,8 +90,73 @@ class MainActivity : ComponentActivity() {
 
     // 实时直播流横竖比标记
     private var isStreamPortrait: Boolean = true
+    // 画中画模式状态
+    private val pipModeState = mutableStateOf(false)
     // 电视遥控器菜单键回调
     private var toggleBottomSheetAction: (() -> Unit)? = null
+
+    override fun onPictureInPictureModeChanged(
+        isInPictureInPictureMode: Boolean,
+        newConfig: Configuration
+    ) {
+        super.onPictureInPictureModeChanged(isInPictureInPictureMode, newConfig)
+        pipModeState.value = isInPictureInPictureMode
+        val js = if (isInPictureInPictureMode) {
+            """
+            (function() {
+                document.body.classList.add('android-pip-mode');
+                var v = document.getElementById('video') || document.querySelector('video');
+                if (v) {
+                    v.style.width = '100vw';
+                    v.style.height = '100vh';
+                    v.style.objectFit = 'contain';
+                    v.play().catch(function(){});
+                }
+            })();
+            """.trimIndent()
+        } else {
+            """
+            (function() {
+                document.body.classList.remove('android-pip-mode');
+                var v = document.getElementById('video') || document.querySelector('video');
+                if (v) {
+                    v.style.width = '';
+                    v.style.height = '';
+                    v.style.objectFit = '';
+                }
+            })();
+            """.trimIndent()
+        }
+        webView?.evaluateJavascript(js, null)
+    }
+
+    override fun onUserLeaveHint() {
+        super.onUserLeaveHint()
+        enterPipModeSafely()
+    }
+
+    fun enterPipModeSafely(): Boolean {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            return try {
+                val ratio = if (isStreamPortrait) {
+                    Rational(9, 16)
+                } else {
+                    Rational(16, 9)
+                }
+                val builder = PictureInPictureParams.Builder()
+                    .setAspectRatio(ratio)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                    builder.setAutoEnterEnabled(true)
+                    builder.setSeamlessResizeEnabled(true)
+                }
+                enterPictureInPictureMode(builder.build())
+            } catch (e: Exception) {
+                e.printStackTrace()
+                false
+            }
+        }
+        return false
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -173,6 +241,7 @@ class MainActivity : ComponentActivity() {
     @SuppressLint("SetJavaScriptEnabled")
     @Composable
     fun MainAppScreen() {
+        val isInPip by pipModeState
         var currentUrl by remember { mutableStateOf(preferences.targetUrl) }
         var pageTitle by remember { mutableStateOf("") }
         var loadProgress by remember { mutableStateOf(0) }
@@ -257,19 +326,40 @@ class MainActivity : ComponentActivity() {
                         setBackgroundColor(android.graphics.Color.parseColor("#09090C"))
                         setupWebSettings(this, preferences.isDesktopUa)
 
-                        // 注入原生与前端通信桥梁，用于实时监测视频宽高比与流切换自愈
+                        // 注入原生与前端通信桥梁，用于实时监测视频宽高比、换线自愈与画中画联动接洽
                         addJavascriptInterface(object {
                             @JavascriptInterface
                             fun onVideoRatioDetected(portrait: Boolean) {
                                 isStreamPortrait = portrait
+                                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && isInPictureInPictureMode) {
+                                    try {
+                                        val ratio = if (portrait) Rational(9, 16) else Rational(16, 9)
+                                        val params = PictureInPictureParams.Builder()
+                                            .setAspectRatio(ratio)
+                                            .build()
+                                        setPictureInPictureParams(params)
+                                    } catch (e: Exception) {}
+                                }
                             }
 
                             @JavascriptInterface
                             fun onStreamLineChanged() {
-                                // 换线时主动解静音
+                                // 换线时主动解静音与恢复流畅播放
                                 post {
                                     healAudioAndStreamSilent()
                                 }
+                            }
+
+                            @JavascriptInterface
+                            fun requestPictureInPicture() {
+                                post {
+                                    enterPipModeSafely()
+                                }
+                            }
+
+                            @JavascriptInterface
+                            fun isPipSupported(): Boolean {
+                                return Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
                             }
                         }, "AndroidLiveBridge")
 
@@ -279,14 +369,17 @@ class MainActivity : ComponentActivity() {
                                 isLoading = true
                                 isPageError = false
                                 if (url != null) currentUrl = url
+                                injectLiveStabilizerScript(view)
                             }
 
                             override fun onPageFinished(view: WebView?, url: String?) {
                                 super.onPageFinished(view, url)
                                 isLoading = false
                                 pageTitle = view?.title ?: ""
-                                // 页面加载完成后注入军工级流媒体声画保活与解静音补丁
+                                // 页面加载完成后注入军工级流媒体声画保活与首帧自播解静音补丁
                                 injectLiveStabilizerScript(view)
+                                postDelayed({ healAudioAndStreamSilent() }, 200)
+                                postDelayed({ healAudioAndStreamSilent() }, 800)
                             }
 
                             override fun onReceivedError(
@@ -390,7 +483,7 @@ class MainActivity : ComponentActivity() {
 
             // 防黑屏优雅过渡层 (在直播控制台加载完成前提供视觉过渡，杜绝黑屏)
             AnimatedVisibility(
-                visible = isLoading && loadProgress < 90 && !isCustomViewActive && activeNativeRoomInfo == null,
+                visible = isLoading && loadProgress < 90 && !isCustomViewActive && activeNativeRoomInfo == null && !isInPip,
                 enter = fadeIn(),
                 exit = fadeOut(animationSpec = tween(400))
             ) {
@@ -420,18 +513,31 @@ class MainActivity : ComponentActivity() {
                         }
 
                         Text(
-                            text = "抖眸流控 · 正在接入直播中枢",
+                            text = "抖眸流控 · 正在秒级接入直播流",
                             style = MaterialTheme.typography.titleMedium,
                             fontWeight = FontWeight.Bold,
                             color = TextPrimary
                         )
 
                         Text(
-                            text = "低延迟通道与解码器就绪中 · 防黑屏加载",
+                            text = "AI 智能信道连接中 · 音画同步加速 · 杜绝卡顿黑屏",
                             style = MaterialTheme.typography.bodySmall,
                             color = TextSecondary,
                             fontSize = 12.sp
                         )
+
+                        Surface(
+                            shape = RoundedCornerShape(12.dp),
+                            color = DouyinCyan.copy(alpha = 0.12f)
+                        ) {
+                            Text(
+                                text = "极速硬件加速解码已就绪",
+                                color = DouyinCyan,
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Medium,
+                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
+                            )
+                        }
 
                         CircularProgressIndicator(
                             modifier = Modifier.size(24.dp),
@@ -443,7 +549,7 @@ class MainActivity : ComponentActivity() {
             }
 
             // Top Linear Progress Bar
-            if (isLoading && loadProgress in 1..99 && !isCustomViewActive && activeNativeRoomInfo == null) {
+            if (isLoading && loadProgress in 1..99 && !isCustomViewActive && activeNativeRoomInfo == null && !isInPip) {
                 LinearProgressIndicator(
                     progress = { loadProgress / 100f },
                     modifier = Modifier
@@ -456,7 +562,7 @@ class MainActivity : ComponentActivity() {
             }
 
             // Error Overlay
-            if (isPageError && !isCustomViewActive && activeNativeRoomInfo == null) {
+            if (isPageError && !isCustomViewActive && activeNativeRoomInfo == null && !isInPip) {
                 Card(
                     modifier = Modifier
                         .align(Alignment.Center)
@@ -529,7 +635,7 @@ class MainActivity : ComponentActivity() {
             }
 
             // Top Status Bar Protective Scrim
-            if (!isCustomViewActive && activeNativeRoomInfo == null) {
+            if (!isCustomViewActive && activeNativeRoomInfo == null && !isInPip) {
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -540,7 +646,7 @@ class MainActivity : ComponentActivity() {
             }
 
             // Floating Control Pill (Normal Mode)
-            if (!isCustomViewActive && activeNativeRoomInfo == null) {
+            if (!isCustomViewActive && activeNativeRoomInfo == null && !isInPip) {
                 Surface(
                     onClick = { showBottomSheet = true },
                     shape = RoundedCornerShape(24.dp),
@@ -582,7 +688,7 @@ class MainActivity : ComponentActivity() {
             }
 
             // Fullscreen Floating Control Bar (Overlay in Video Fullscreen)
-            if (isCustomViewActive) {
+            if (isCustomViewActive && !isInPip) {
                 Surface(
                     shape = RoundedCornerShape(20.dp),
                     color = Color.Black.copy(alpha = 0.65f),
@@ -612,6 +718,19 @@ class MainActivity : ComponentActivity() {
                             Icon(
                                 imageVector = Icons.Default.ScreenRotation,
                                 contentDescription = "旋转屏幕",
+                                tint = DouyinCyan,
+                                modifier = Modifier.size(18.dp)
+                            )
+                        }
+
+                        // 一键画中画浮窗
+                        IconButton(
+                            onClick = { enterPipModeSafely() },
+                            modifier = Modifier.size(36.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.PictureInPictureAlt,
+                                contentDescription = "画中画浮窗",
                                 tint = DouyinCyan,
                                 modifier = Modifier.size(18.dp)
                             )
@@ -647,18 +766,6 @@ class MainActivity : ComponentActivity() {
                         }
                     }
                 }
-            }
-
-            // 原生 ExoPlayer 直播浮层
-            activeNativeRoomInfo?.let { roomInfo ->
-                NativeLivePlayerOverlay(
-                    roomInfo = roomInfo,
-                    playerEngine = livePlayerEngine,
-                    onClose = {
-                        activeNativeRoomInfo = null
-                        requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
-                    }
-                )
             }
         }
 
@@ -709,6 +816,10 @@ class MainActivity : ComponentActivity() {
                 onLaunchNativePlayer = {
                     showBottomSheet = false
                     showRoomDialog = true
+                },
+                onEnterPip = {
+                    showBottomSheet = false
+                    enterPipModeSafely()
                 },
                 onOpenUrlDialog = {
                     showBottomSheet = false
@@ -762,15 +873,7 @@ class MainActivity : ComponentActivity() {
                 },
                 onPlayInNativeEngine = { roomInput ->
                     showRoomDialog = false
-                    lifecycleScope.launch(Dispatchers.IO) {
-                        recordRepository.recordAccess(roomId = roomInput)
-                    }
-                    // 启动独立的 PlayerActivity 原生极速播放器
-                    val intent = PlayerActivity.createIntent(
-                        context = this@MainActivity,
-                        roomId = roomInput
-                    )
-                    startActivity(intent)
+                    injectRoomToWeb(roomInput)
                 }
             )
         }
@@ -828,13 +931,47 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
-     * 军工级流媒体稳定性与声画自愈脚本
+     * 军工级流媒体稳定性、网页端画中画接洽与首次加载自启自愈脚本
      */
     private fun injectLiveStabilizerScript(wv: WebView?) {
         val script = """
             (function() {
-                if (window.__douyin_live_stabilizer_injected) return;
-                window.__douyin_live_stabilizer_injected = true;
+                // 1. 网页端原生与前端画中画接洽融合
+                if (window.HTMLVideoElement && HTMLVideoElement.prototype && !HTMLVideoElement.prototype.__douyin_pip_hooked) {
+                    HTMLVideoElement.prototype.__douyin_pip_hooked = true;
+                    var origRequestPip = HTMLVideoElement.prototype.requestPictureInPicture;
+                    HTMLVideoElement.prototype.requestPictureInPicture = function() {
+                        if (window.AndroidLiveBridge && window.AndroidLiveBridge.requestPictureInPicture) {
+                            window.AndroidLiveBridge.requestPictureInPicture();
+                            return Promise.resolve();
+                        }
+                        if (origRequestPip) return origRequestPip.apply(this, arguments);
+                        return Promise.reject("Native PiP bridge triggered");
+                    };
+                }
+
+                // 全局事件拦截：页面内任意画中画按钮点击无缝接洽原生系统画中画
+                if (!window.__douyin_pip_listener_added) {
+                    window.__douyin_pip_listener_added = true;
+                    document.addEventListener('click', function(e) {
+                        var target = e.target;
+                        while (target && target !== document.body) {
+                            var title = (target.getAttribute && target.getAttribute('title')) || '';
+                            var aria = (target.getAttribute && target.getAttribute('aria-label')) || '';
+                            var cls = target.className || '';
+                            var str = (title + ' ' + aria + ' ' + cls).toLowerCase();
+                            if (str.indexOf('pip') !== -1 || str.indexOf('画中画') !== -1 || str.indexOf('picture-in-picture') !== -1) {
+                                if (window.AndroidLiveBridge && window.AndroidLiveBridge.requestPictureInPicture) {
+                                    window.AndroidLiveBridge.requestPictureInPicture();
+                                    e.preventDefault();
+                                    e.stopPropagation();
+                                    return;
+                                }
+                            }
+                            target = target.parentElement;
+                        }
+                    }, true);
+                }
 
                 function notifyDimensions() {
                     var v = document.getElementById('video') || document.querySelector('video');
@@ -846,69 +983,110 @@ class MainActivity : ComponentActivity() {
                     }
                 }
 
-                function autoUnmute() {
-                    var v = document.getElementById('video') || document.querySelector('video');
-                    if (v) {
+                // 2. 首次载入极速首播与声画自愈，彻底杜绝一卡一卡与需切频道才播的假死问题
+                function triggerImmediateAutoplayAndUnmute() {
+                    var videos = document.querySelectorAll('video');
+                    videos.forEach(function(v) {
+                        v.setAttribute('playsinline', 'true');
+                        v.setAttribute('webkit-playsinline', 'true');
+                        v.setAttribute('x5-video-player-type', 'h5');
+                        v.preload = 'auto';
                         if (v.muted) {
                             v.muted = false;
                         }
-                        var btn = document.getElementById('unmuteBtn');
-                        if (btn && !btn.hidden) {
-                            btn.click();
-                        }
-                    }
-                }
+                        v.volume = 1.0;
 
-                document.addEventListener('play', function(e) {
-                    if (e.target && e.target.tagName === 'VIDEO') {
-                        setTimeout(autoUnmute, 50);
-                        setTimeout(notifyDimensions, 100);
-                    }
-                }, true);
-
-                document.addEventListener('loadedmetadata', function(e) {
-                    if (e.target && e.target.tagName === 'VIDEO') {
-                        notifyDimensions();
-                        setTimeout(autoUnmute, 100);
-                    }
-                }, true);
-
-                document.addEventListener('volumechange', function(e) {
-                    var v = document.getElementById('video') || document.querySelector('video');
-                    if (v && v.muted) {
-                        setTimeout(autoUnmute, 150);
-                    }
-                }, true);
-
-                function onLineChange() {
-                    var v = document.getElementById('video') || document.querySelector('video');
-                    if (v) {
-                        try {
-                            if (v.src && v.src.startsWith('blob:')) {
-                                URL.revokeObjectURL(v.src);
+                        if (v.paused) {
+                            var p = v.play();
+                            if (p && p.catch) {
+                                p.catch(function() {
+                                    // 若策略拦截带声首播，立即先静音解码拉起画面，并在150ms内无缝解静音
+                                    v.muted = true;
+                                    v.play().then(function() {
+                                        setTimeout(function() {
+                                            v.muted = false;
+                                            v.volume = 1.0;
+                                        }, 150);
+                                    }).catch(function() {});
+                                });
                             }
-                        } catch(err) {}
+                        }
+                    });
+
+                    var unmuteBtn = document.getElementById('unmuteBtn');
+                    if (unmuteBtn && !unmuteBtn.hidden) {
+                        unmuteBtn.click();
                     }
-                    if (window.AndroidLiveBridge && window.AndroidLiveBridge.onStreamLineChanged) {
-                        window.AndroidLiveBridge.onStreamLineChanged();
+
+                    var playBtn = document.querySelector('.xgplayer-start, .vjs-big-play-button, .play-btn');
+                    if (playBtn && playBtn.offsetParent !== null) {
+                        playBtn.click();
                     }
-                    setTimeout(autoUnmute, 300);
-                    setTimeout(autoUnmute, 800);
-                    setTimeout(autoUnmute, 1500);
                 }
 
-                var protoSel = document.getElementById('protoSel');
-                var qualSel = document.getElementById('qualSel');
-                if (protoSel) protoSel.addEventListener('change', onLineChange);
-                if (qualSel) qualSel.addEventListener('change', onLineChange);
+                // 立即执行并多频段唤醒
+                triggerImmediateAutoplayAndUnmute();
+                setTimeout(triggerImmediateAutoplayAndUnmute, 100);
+                setTimeout(triggerImmediateAutoplayAndUnmute, 300);
+                setTimeout(triggerImmediateAutoplayAndUnmute, 800);
+                setTimeout(triggerImmediateAutoplayAndUnmute, 1500);
 
-                setInterval(function() {
-                    var v = document.getElementById('video') || document.querySelector('video');
-                    if (v && !v.paused && v.muted) {
-                        autoUnmute();
+                if (!window.__douyin_live_stabilizer_injected) {
+                    window.__douyin_live_stabilizer_injected = true;
+
+                    document.addEventListener('play', function(e) {
+                        if (e.target && e.target.tagName === 'VIDEO') {
+                            setTimeout(triggerImmediateAutoplayAndUnmute, 50);
+                            setTimeout(notifyDimensions, 100);
+                        }
+                    }, true);
+
+                    document.addEventListener('loadedmetadata', function(e) {
+                        if (e.target && e.target.tagName === 'VIDEO') {
+                            notifyDimensions();
+                            setTimeout(triggerImmediateAutoplayAndUnmute, 100);
+                        }
+                    }, true);
+
+                    document.addEventListener('volumechange', function(e) {
+                        var v = document.getElementById('video') || document.querySelector('video');
+                        if (v && v.muted) {
+                            setTimeout(triggerImmediateAutoplayAndUnmute, 150);
+                        }
+                    }, true);
+
+                    function onLineChange() {
+                        var v = document.getElementById('video') || document.querySelector('video');
+                        if (v) {
+                            try {
+                                if (v.src && v.src.startsWith('blob:')) {
+                                    URL.revokeObjectURL(v.src);
+                                }
+                            } catch(err) {}
+                        }
+                        if (window.AndroidLiveBridge && window.AndroidLiveBridge.onStreamLineChanged) {
+                            window.AndroidLiveBridge.onStreamLineChanged();
+                        }
+                        setTimeout(triggerImmediateAutoplayAndUnmute, 200);
+                        setTimeout(triggerImmediateAutoplayAndUnmute, 600);
+                        setTimeout(triggerImmediateAutoplayAndUnmute, 1200);
                     }
-                    notifyDimensions();
-                }, 1500);
+
+                    var protoSel = document.getElementById('protoSel');
+                    var qualSel = document.getElementById('qualSel');
+                    if (protoSel) protoSel.addEventListener('change', onLineChange);
+                    if (qualSel) qualSel.addEventListener('change', onLineChange);
+
+                    setInterval(function() {
+                        var v = document.getElementById('video') || document.querySelector('video');
+                        if (v) {
+                            if (v.paused || v.muted) {
+                                triggerImmediateAutoplayAndUnmute();
+                            }
+                            notifyDimensions();
+                        }
+                    }, 1500);
+                }
             })();
         """.trimIndent()
         wv?.evaluateJavascript(script, null)
