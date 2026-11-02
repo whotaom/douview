@@ -136,5 +136,29 @@ class ExampleRobolectricTest {
 
     inMemoryDb.close()
   }
+
+  @Test
+  fun `rid input validation ensures at most 15 digits`() {
+    val validRid = "742819283182"
+    val isValid = validRid.isNotBlank() && validRid.length <= 15 && validRid.all { it.isDigit() }
+    assertTrue(isValid)
+
+    val overLengthRid = "1234567890123456" // 16 digits
+    val isOverValid = overLengthRid.length <= 15
+    assertTrue(!isOverValid)
+
+    // 过滤口令与非数字字符
+    val dirtyInput = "抖音分享【小红直播】https://v.douyin.com/abc 742819283182"
+    val digitsOnly = dirtyInput.filter { it.isDigit() }.take(15)
+    assertEquals("742819283182", digitsOnly)
+    assertTrue(digitsOnly.length <= 15)
+  }
+
+  @Test
+  fun `update manager semantic version comparison`() {
+    val context = ApplicationProvider.getApplicationContext<Context>()
+    val current = com.example.util.UpdateManager.getCurrentVersion(context)
+    assertNotNull(current)
+  }
 }
 

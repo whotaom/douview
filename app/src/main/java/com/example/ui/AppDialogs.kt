@@ -1,11 +1,14 @@
 package com.example.ui
 
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.focusable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
@@ -14,9 +17,9 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -24,6 +27,8 @@ import com.example.data.LivePreferences
 import com.example.data.db.StreamRecord
 import com.example.data.db.StreamRecordRepository
 import com.example.ui.theme.*
+import com.example.util.AppReleaseInfo
+import com.example.util.UpdateManager
 import kotlinx.coroutines.launch
 
 @Composable
@@ -32,80 +37,91 @@ fun ChangeUrlDialog(
     onDismiss: () -> Unit,
     onConfirmUrl: (String) -> Unit
 ) {
-    var customUrl by remember { mutableStateOf(currentUrl) }
+    var inputUrl by remember { mutableStateOf(currentUrl) }
 
     AlertDialog(
         onDismissRequest = onDismiss,
         containerColor = DarkSurface,
         title = {
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                Icon(
-                    imageVector = Icons.Default.Link,
-                    contentDescription = null,
-                    tint = DouyinCyan
-                )
-                Text("配置中控台接入地址", color = TextPrimary)
-            }
+            Text(
+                text = "更换中控服务地址",
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.Bold,
+                color = TextPrimary
+            )
         },
         text = {
-            Column(
-                modifier = Modifier.fillMaxWidth(),
-                verticalArrangement = Arrangement.spacedBy(14.dp)
-            ) {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 Text(
-                    text = "快速预设线路：",
-                    style = MaterialTheme.typography.labelMedium,
+                    text = "输入自定义中控台或前端部署地址：",
+                    style = MaterialTheme.typography.bodySmall,
                     color = TextSecondary
                 )
-
-                // 官方综合中控台
-                PresetUrlCard(
-                    title = "默认中控台 (包含UI及实时播放器)",
-                    url = LivePreferences.DEFAULT_URL,
-                    isSelected = customUrl == LivePreferences.DEFAULT_URL,
-                    onClick = { customUrl = LivePreferences.DEFAULT_URL }
-                )
-
-                Spacer(modifier = Modifier.height(4.dp))
-
-                Text(
-                    text = "自定义私有节点 / 域名：",
-                    style = MaterialTheme.typography.labelMedium,
-                    color = TextSecondary
-                )
-
                 OutlinedTextField(
-                    value = customUrl,
-                    onValueChange = { customUrl = it.trim() },
-                    placeholder = { Text("https://your-domain.com/live/") },
+                    value = inputUrl,
+                    onValueChange = { inputUrl = it },
                     singleLine = true,
+                    placeholder = { Text("https://...") },
                     modifier = Modifier.fillMaxWidth(),
                     shape = RoundedCornerShape(12.dp),
                     colors = OutlinedTextFieldDefaults.colors(
                         focusedTextColor = TextPrimary,
                         unfocusedTextColor = TextPrimary,
-                        focusedBorderColor = DouyinCyan,
+                        focusedBorderColor = DouyinRed,
                         unfocusedBorderColor = DarkSurfaceBorder,
                         focusedContainerColor = DarkSurfaceElevated,
                         unfocusedContainerColor = DarkSurfaceElevated
                     )
                 )
+
+                // 快捷预设地址
+                Text(
+                    text = "快捷服务节点：",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = TextSecondary
+                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    SuggestionChip(
+                        onClick = { inputUrl = LivePreferences.DEFAULT_URL },
+                        label = { Text("官方默认", fontSize = 11.sp) },
+                        colors = SuggestionChipDefaults.suggestionChipColors(
+                            containerColor = DarkSurfaceElevated,
+                            labelColor = DouyinCyan
+                        ),
+                        border = SuggestionChipDefaults.suggestionChipBorder(
+                            enabled = true,
+                            borderColor = DarkSurfaceBorder
+                        )
+                    )
+                    SuggestionChip(
+                        onClick = { inputUrl = "https://live.douyin.com" },
+                        label = { Text("抖音网页", fontSize = 11.sp) },
+                        colors = SuggestionChipDefaults.suggestionChipColors(
+                            containerColor = DarkSurfaceElevated,
+                            labelColor = TextPrimary
+                        ),
+                        border = SuggestionChipDefaults.suggestionChipBorder(
+                            enabled = true,
+                            borderColor = DarkSurfaceBorder
+                        )
+                    )
+                }
             }
         },
         confirmButton = {
             Button(
                 onClick = {
-                    if (customUrl.isNotBlank()) {
-                        onConfirmUrl(customUrl)
+                    if (inputUrl.isNotBlank()) {
+                        onConfirmUrl(inputUrl.trim())
                     }
                 },
                 colors = ButtonDefaults.buttonColors(containerColor = DouyinRed),
                 shape = RoundedCornerShape(10.dp)
             ) {
-                Text("确认切换")
+                Text("确定生效")
             }
         },
         dismissButton = {
@@ -116,83 +132,40 @@ fun ChangeUrlDialog(
     )
 }
 
-@Composable
-fun PresetUrlCard(
-    title: String,
-    url: String,
-    isSelected: Boolean,
-    onClick: () -> Unit
-) {
-    Card(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clickable(onClick = onClick),
-        shape = RoundedCornerShape(12.dp),
-        colors = CardDefaults.cardColors(
-            containerColor = if (isSelected) DouyinRed.copy(alpha = 0.15f) else DarkSurfaceElevated
-        ),
-        border = if (isSelected) {
-            ButtonDefaults.outlinedButtonBorder.copy(
-                brush = androidx.compose.ui.graphics.SolidColor(DouyinRed)
-            )
-        } else null
-    ) {
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(12.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.SpaceBetween
-        ) {
-            Column(modifier = Modifier.weight(1f)) {
-                Text(
-                    text = title,
-                    style = MaterialTheme.typography.bodyMedium,
-                    fontWeight = FontWeight.SemiBold,
-                    color = if (isSelected) DouyinRed else TextPrimary
-                )
-                Text(
-                    text = url,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = TextSecondary,
-                    fontSize = 11.sp
-                )
-            }
-            if (isSelected) {
-                Icon(
-                    imageVector = Icons.Default.Check,
-                    contentDescription = null,
-                    tint = DouyinRed,
-                    modifier = Modifier.size(18.dp)
-                )
-            }
-        }
-    }
-}
-
+/**
+ * 军工级快速加房与本地持久化中枢
+ * 原生 ExoPlayer 极速模式：
+ * 1. 严格去除口令与短链接添加，去除剪贴板直接读取；
+ * 2. 修正为仅可添加 <= 15 位的纯数字 RID；
+ * 3. 添加时自动加入本地 Room 直播数据库列表（最近与收藏中枢实时同步）。
+ */
 @Composable
 fun QuickRoomDialog(
     onDismiss: () -> Unit,
+    repository: StreamRecordRepository? = null,
     onInjectRoom: (String) -> Unit,
-    onPlayInNativeEngine: ((String) -> Unit)? = null,
-    repository: StreamRecordRepository? = null
+    onPlayInNativeEngine: ((String) -> Unit)? = null
 ) {
     val context = LocalContext.current
     val recordRepo = remember(repository) {
         repository ?: StreamRecordRepository.getInstance(context)
     }
-    val coroutineScope = rememberCoroutineScope()
-    val clipboardManager = LocalClipboardManager.current
-
-    var selectedTab by remember { mutableIntStateOf(0) }
-    var roomInput by remember { mutableStateOf("") }
 
     val favorites by recordRepo.favoriteRecords.collectAsState(initial = emptyList())
     val recents by recordRepo.recentRecords.collectAsState(initial = emptyList())
+    val coroutineScope = rememberCoroutineScope()
+
+    var roomInput by remember { mutableStateOf("") }
+    var selectedTab by remember { mutableIntStateOf(0) } // 0: 原生极速加房, 1: 收藏列表, 2: 最近历史
+
+    val isInputValidRid = remember(roomInput) {
+        roomInput.isNotBlank() && roomInput.length <= 15 && roomInput.all { it.isDigit() }
+    }
 
     AlertDialog(
         onDismissRequest = onDismiss,
         containerColor = DarkSurface,
+        modifier = Modifier.widthIn(max = 640.dp),
         title = {
             Column(modifier = Modifier.fillMaxWidth()) {
                 Row(
@@ -225,7 +198,7 @@ fun QuickRoomDialog(
                     Tab(
                         selected = selectedTab == 0,
                         onClick = { selectedTab = 0 },
-                        text = { Text("快速加房", fontSize = 12.sp, fontWeight = FontWeight.SemiBold) }
+                        text = { Text("原生极速加房", fontSize = 12.sp, fontWeight = FontWeight.SemiBold) }
                     )
                     Tab(
                         selected = selectedTab == 1,
@@ -260,26 +233,57 @@ fun QuickRoomDialog(
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .heightIn(min = 200.dp, max = 360.dp)
+                    .heightIn(min = 210.dp, max = 380.dp)
             ) {
                 when (selectedTab) {
                     0 -> {
-                        // 快速输入 / 粘贴口令
+                        // 原生极速加房（纯数字 RID <= 15 位，且自动加列表）
                         Column(
                             modifier = Modifier.fillMaxWidth(),
                             verticalArrangement = Arrangement.spacedBy(12.dp)
                         ) {
                             Text(
-                                text = "支持直接粘贴抖音分享口令、短链 (v.douyin.com/...) 或纯数字房间号：",
+                                text = "原生极速播放引擎（仅支持 ≤15 位纯数字房间号 RID）：",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = TextSecondary
                             )
 
                             OutlinedTextField(
                                 value = roomInput,
-                                onValueChange = { roomInput = it },
-                                placeholder = { Text("例如: 7421839218 或 https://v.douyin.com/...") },
-                                modifier = Modifier.fillMaxWidth(),
+                                onValueChange = { newVal ->
+                                    // 军工级严格过滤：只允许 0-9 纯数字，最大 15 位，杜绝多余字符与口令
+                                    val digitsOnly = newVal.filter { it.isDigit() }.take(15)
+                                    roomInput = digitsOnly
+                                },
+                                placeholder = { Text("输入纯数字房间号 (例如: 7421839218)") },
+                                singleLine = true,
+                                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                                supportingText = {
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.SpaceBetween
+                                    ) {
+                                        Text(
+                                            text = if (roomInput.isEmpty()) {
+                                                "请输入 1~15 位纯数字 RID"
+                                            } else if (isInputValidRid) {
+                                                "格式正确 (自动加进直播列表)"
+                                            } else {
+                                                "必须为纯数字且不超过15位"
+                                            },
+                                            color = if (isInputValidRid) DouyinGreen else TextSecondary,
+                                            fontSize = 11.sp
+                                        )
+                                        Text(
+                                            text = "${roomInput.length}/15",
+                                            color = if (roomInput.length == 15) DouyinRed else TextSecondary,
+                                            fontSize = 11.sp
+                                        )
+                                    }
+                                },
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .focusable(),
                                 shape = RoundedCornerShape(12.dp),
                                 colors = OutlinedTextFieldDefaults.colors(
                                     focusedTextColor = TextPrimary,
@@ -291,31 +295,10 @@ fun QuickRoomDialog(
                                 )
                             )
 
-                            Button(
-                                onClick = {
-                                    val clip = clipboardManager.getText()?.text
-                                    if (!clip.isNullOrBlank()) {
-                                        roomInput = clip
-                                    }
-                                },
-                                colors = ButtonDefaults.buttonColors(containerColor = DarkSurfaceElevated),
-                                shape = RoundedCornerShape(10.dp),
-                                modifier = Modifier.fillMaxWidth()
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Default.ContentPaste,
-                                    contentDescription = null,
-                                    tint = DouyinCyan,
-                                    modifier = Modifier.size(16.dp)
-                                )
-                                Spacer(modifier = Modifier.width(6.dp))
-                                Text("从剪贴板读取内容", color = TextPrimary, fontSize = 12.sp)
-                            }
-
                             if (onPlayInNativeEngine != null) {
-                                OutlinedButton(
+                                Button(
                                     onClick = {
-                                        if (roomInput.isNotBlank()) {
+                                        if (isInputValidRid) {
                                             val input = roomInput.trim()
                                             coroutineScope.launch {
                                                 recordRepo.recordAccess(roomId = input)
@@ -323,23 +306,24 @@ fun QuickRoomDialog(
                                             onPlayInNativeEngine(input)
                                         }
                                     },
-                                    colors = ButtonDefaults.outlinedButtonColors(
-                                        contentColor = DouyinCyan
-                                    ),
-                                    border = ButtonDefaults.outlinedButtonBorder.copy(
-                                        brush = androidx.compose.ui.graphics.SolidColor(DouyinCyan)
+                                    enabled = isInputValidRid,
+                                    colors = ButtonDefaults.buttonColors(
+                                        containerColor = DouyinRed,
+                                        disabledContainerColor = DarkSurfaceElevated
                                     ),
                                     shape = RoundedCornerShape(10.dp),
-                                    modifier = Modifier.fillMaxWidth()
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .focusable()
                                 ) {
                                     Icon(
                                         imageVector = Icons.Default.PlayArrow,
                                         contentDescription = null,
-                                        tint = DouyinCyan,
+                                        tint = if (isInputValidRid) Color.White else TextSecondary,
                                         modifier = Modifier.size(18.dp)
                                     )
                                     Spacer(modifier = Modifier.width(6.dp))
-                                    Text("直接以原生 ExoPlayer 播放", fontSize = 12.sp)
+                                    Text("原生极速播放并加入列表", fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
                                 }
                             }
                         }
@@ -465,9 +449,9 @@ fun QuickRoomDialog(
         },
         confirmButton = {
             if (selectedTab == 0) {
-                Button(
+                OutlinedButton(
                     onClick = {
-                        if (roomInput.isNotBlank()) {
+                        if (isInputValidRid) {
                             val input = roomInput.trim()
                             coroutineScope.launch {
                                 recordRepo.recordAccess(roomId = input)
@@ -475,15 +459,17 @@ fun QuickRoomDialog(
                             onInjectRoom(input)
                         }
                     },
-                    colors = ButtonDefaults.buttonColors(containerColor = DouyinRed),
-                    shape = RoundedCornerShape(10.dp)
+                    enabled = isInputValidRid,
+                    shape = RoundedCornerShape(10.dp),
+                    colors = ButtonDefaults.outlinedButtonColors(contentColor = DouyinCyan),
+                    modifier = Modifier.focusable()
                 ) {
-                    Text("中控台载入")
+                    Text("中控台解析")
                 }
             }
         },
         dismissButton = {
-            TextButton(onClick = onDismiss) {
+            TextButton(onClick = onDismiss, modifier = Modifier.focusable()) {
                 Text("关闭", color = TextSecondary)
             }
         }
@@ -501,7 +487,9 @@ fun StreamRecordItemRow(
     Card(
         shape = RoundedCornerShape(10.dp),
         colors = CardDefaults.cardColors(containerColor = DarkSurfaceElevated),
-        modifier = Modifier.fillMaxWidth()
+        modifier = Modifier
+            .fillMaxWidth()
+            .focusable()
     ) {
         Row(
             modifier = Modifier
@@ -547,7 +535,7 @@ fun StreamRecordItemRow(
                 // 收藏星标
                 IconButton(
                     onClick = onToggleFavorite,
-                    modifier = Modifier.size(32.dp)
+                    modifier = Modifier.size(32.dp).focusable()
                 ) {
                     Icon(
                         imageVector = if (record.isFavorite) Icons.Default.Star else Icons.Default.StarBorder,
@@ -564,6 +552,7 @@ fun StreamRecordItemRow(
                         .size(32.dp)
                         .clip(CircleShape)
                         .background(DouyinRed.copy(alpha = 0.15f))
+                        .focusable()
                 ) {
                     Icon(
                         imageVector = Icons.Default.PlayArrow,
@@ -576,7 +565,7 @@ fun StreamRecordItemRow(
                 // 删除
                 IconButton(
                     onClick = onDelete,
-                    modifier = Modifier.size(32.dp)
+                    modifier = Modifier.size(32.dp).focusable()
                 ) {
                     Icon(
                         imageVector = Icons.Default.Delete,
@@ -628,6 +617,173 @@ fun ClearCacheConfirmDialog(
         dismissButton = {
             TextButton(onClick = onDismiss) {
                 Text("取消", color = TextSecondary)
+            }
+        }
+    )
+}
+
+/**
+ * 在线版本检查与直接更新弹窗
+ */
+@Composable
+fun UpdateDialog(
+    onDismiss: () -> Unit,
+    onDownloadApk: (url: String) -> Unit
+) {
+    val context = LocalContext.current
+    var isLoading by remember { mutableStateOf(true) }
+    var releaseInfo by remember { mutableStateOf<AppReleaseInfo?>(null) }
+    var errorMessage by remember { mutableStateOf<String?>(null) }
+
+    LaunchedEffect(Unit) {
+        val result = UpdateManager.checkUpdate(context)
+        isLoading = false
+        result.fold(
+            onSuccess = { releaseInfo = it },
+            onFailure = { errorMessage = it.localizedMessage ?: "检查更新失败" }
+        )
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = DarkSurface,
+        modifier = Modifier.widthIn(max = 560.dp),
+        icon = {
+            Icon(
+                imageVector = Icons.Default.SystemUpdate,
+                contentDescription = null,
+                tint = DouyinCyan,
+                modifier = Modifier.size(28.dp)
+            )
+        },
+        title = {
+            Text(
+                text = "版本更新检查",
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.Bold,
+                color = TextPrimary
+            )
+        },
+        text = {
+            Column(
+                modifier = Modifier.fillMaxWidth(),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                if (isLoading) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 20.dp),
+                        horizontalArrangement = Arrangement.Center,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        CircularProgressIndicator(
+                            color = DouyinCyan,
+                            strokeWidth = 3.dp,
+                            modifier = Modifier.size(24.dp)
+                        )
+                        Spacer(modifier = Modifier.width(12.dp))
+                        Text("正在检索在线最新版本...", color = TextSecondary, fontSize = 13.sp)
+                    }
+                } else if (errorMessage != null) {
+                    Text(
+                        text = "无法连接至发布节点: $errorMessage",
+                        color = DouyinRed,
+                        fontSize = 13.sp
+                    )
+                } else if (releaseInfo != null) {
+                    val info = releaseInfo!!
+                    Surface(
+                        shape = RoundedCornerShape(10.dp),
+                        color = DarkSurfaceElevated,
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(12.dp),
+                            verticalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = info.title,
+                                    fontWeight = FontWeight.Bold,
+                                    color = TextPrimary,
+                                    fontSize = 14.sp
+                                )
+                                Surface(
+                                    shape = RoundedCornerShape(6.dp),
+                                    color = if (info.hasUpdate) DouyinRed.copy(alpha = 0.2f) else DouyinGreen.copy(alpha = 0.2f)
+                                ) {
+                                    Text(
+                                        text = if (info.hasUpdate) "有新版: ${info.latestVersion}" else "已是最新版",
+                                        color = if (info.hasUpdate) DouyinRed else DouyinGreen,
+                                        fontSize = 11.sp,
+                                        fontWeight = FontWeight.SemiBold,
+                                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                    )
+                                }
+                            }
+
+                            Text(
+                                text = "当前运行版本: v${info.currentVersion}",
+                                color = TextSecondary,
+                                fontSize = 11.sp
+                            )
+                        }
+                    }
+
+                    Text(
+                        text = "更新说明：",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = TextSecondary
+                    )
+                    Surface(
+                        shape = RoundedCornerShape(8.dp),
+                        color = DarkSurfaceElevated,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(max = 140.dp)
+                    ) {
+                        Text(
+                            text = info.changelog,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = TextPrimary,
+                            modifier = Modifier.padding(10.dp)
+                        )
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            if (releaseInfo != null) {
+                val info = releaseInfo!!
+                Button(
+                    onClick = {
+                        val targetUrl = info.apkUrl ?: info.releasePageUrl
+                        onDownloadApk(targetUrl)
+                    },
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = if (info.hasUpdate) DouyinRed else DouyinCyan
+                    ),
+                    shape = RoundedCornerShape(10.dp),
+                    modifier = Modifier.focusable()
+                ) {
+                    Icon(
+                        imageVector = if (info.hasUpdate) Icons.Default.CloudDownload else Icons.Default.OpenInBrowser,
+                        contentDescription = null,
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(if (info.hasUpdate) "立即下载更新 (APK)" else "访问发布页面")
+                }
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss, modifier = Modifier.focusable()) {
+                Text("关闭", color = TextSecondary)
             }
         }
     )

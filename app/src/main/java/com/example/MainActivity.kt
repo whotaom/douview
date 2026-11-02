@@ -12,6 +12,7 @@ import android.net.Uri
 import android.net.http.SslError
 import android.os.Build
 import android.os.Bundle
+import android.view.KeyEvent
 import android.view.View
 import android.view.ViewGroup
 import android.view.WindowManager
@@ -28,6 +29,7 @@ import androidx.compose.animation.*
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.focusable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -56,7 +58,9 @@ import com.example.ui.ClearCacheConfirmDialog
 import com.example.ui.ControlBottomSheet
 import com.example.ui.NativeLivePlayerOverlay
 import com.example.ui.QuickRoomDialog
+import com.example.ui.UpdateDialog
 import com.example.ui.theme.*
+import com.example.util.UpdateManager
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 
@@ -83,10 +87,17 @@ class MainActivity : ComponentActivity() {
 
     // 实时直播流横竖比标记
     private var isStreamPortrait: Boolean = true
+    // 电视遥控器菜单键回调
+    private var toggleBottomSheetAction: (() -> Unit)? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+
+        // 手机状态栏可见色保障 (暗色背景下强制白色状态栏文字与图标，杜绝隐形)
+        val insetsController = WindowCompat.getInsetsController(window, window.decorView)
+        insetsController.isAppearanceLightStatusBars = false
+        insetsController.isAppearanceLightNavigationBars = false
 
         preferences = LivePreferences(this)
         recordRepository = StreamRecordRepository.getInstance(this)
@@ -114,6 +125,14 @@ class MainActivity : ComponentActivity() {
                 MainAppScreen()
             }
         }
+    }
+
+    override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
+        if (keyCode == KeyEvent.KEYCODE_MENU) {
+            toggleBottomSheetAction?.invoke()
+            return true
+        }
+        return super.onKeyDown(keyCode, event)
     }
 
     private fun requestAppAudioFocus() {
@@ -173,6 +192,11 @@ class MainActivity : ComponentActivity() {
         var showUrlDialog by remember { mutableStateOf(false) }
         var showRoomDialog by remember { mutableStateOf(false) }
         var showClearCacheDialog by remember { mutableStateOf(false) }
+        var showUpdateDialog by remember { mutableStateOf(false) }
+
+        LaunchedEffect(Unit) {
+            toggleBottomSheetAction = { showBottomSheet = !showBottomSheet }
+        }
 
         // Back button handler
         BackHandler {
@@ -186,6 +210,7 @@ class MainActivity : ComponentActivity() {
                     isCustomViewActive = false
                 }
                 showBottomSheet -> showBottomSheet = false
+                showUpdateDialog -> showUpdateDialog = false
                 showUrlDialog -> showUrlDialog = false
                 showRoomDialog -> showRoomDialog = false
                 showClearCacheDialog -> showClearCacheDialog = false
@@ -503,6 +528,17 @@ class MainActivity : ComponentActivity() {
                 }
             }
 
+            // Top Status Bar Protective Scrim
+            if (!isCustomViewActive && activeNativeRoomInfo == null) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .align(Alignment.TopCenter)
+                        .background(DarkBg.copy(alpha = 0.45f))
+                        .statusBarsPadding()
+                )
+            }
+
             // Floating Control Pill (Normal Mode)
             if (!isCustomViewActive && activeNativeRoomInfo == null) {
                 Surface(
@@ -516,6 +552,7 @@ class MainActivity : ComponentActivity() {
                         .statusBarsPadding()
                         .padding(top = 10.dp, end = 12.dp)
                         .border(1.dp, DarkSurfaceBorder, RoundedCornerShape(24.dp))
+                        .focusable()
                 ) {
                     Row(
                         modifier = Modifier.padding(horizontal = 12.dp, vertical = 7.dp),
@@ -684,6 +721,20 @@ class MainActivity : ComponentActivity() {
                 onClearCache = {
                     showBottomSheet = false
                     showClearCacheDialog = true
+                },
+                onCheckUpdate = {
+                    showBottomSheet = false
+                    showUpdateDialog = true
+                }
+            )
+        }
+
+        if (showUpdateDialog) {
+            UpdateDialog(
+                onDismiss = { showUpdateDialog = false },
+                onDownloadApk = { downloadUrl ->
+                    showUpdateDialog = false
+                    UpdateManager.startDownloadApk(this@MainActivity, downloadUrl)
                 }
             )
         }

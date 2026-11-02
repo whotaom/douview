@@ -1,10 +1,16 @@
 package com.example
 
 import android.app.Activity
+import android.app.PictureInPictureParams
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ActivityInfo
+import android.content.pm.PackageManager
+import android.content.res.Configuration
+import android.os.Build
 import android.os.Bundle
+import android.util.Rational
+import android.view.KeyEvent
 import android.view.WindowManager
 import android.widget.Toast
 import androidx.activity.ComponentActivity
@@ -14,6 +20,7 @@ import androidx.compose.animation.*
 import androidx.compose.animation.core.*
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.focusable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -51,8 +58,9 @@ import kotlinx.coroutines.launch
  * 1. resetPlayer()：显式调用 player.stop() 与 player.clearMediaItems()；
  * 2. 线路重载前显式展示 Loading UI，并通过 player.prepare() 与 player.setPlayWhenReady(true) 实现无缝切换；
  * 3. 布局中居中展示 CircularProgressIndicator，基于 Player.Listener 监听，在 STATE_BUFFERING 或 STATE_IDLE 时显示，杜绝黑屏；
- * 4. 抖音竖屏直播全屏自适应；
- * 5. 息屏唤醒自愈拉流。
+ * 4. 抖音竖屏直播全屏自适应与电视端 D-pad 遥控适配；
+ * 5. 全面画中画 (Picture-in-Picture) 模式支持与切后台无缝播放；
+ * 6. 状态栏明亮高对比度文字与息屏唤醒自愈拉流。
  */
 class PlayerActivity : ComponentActivity() {
 
@@ -84,6 +92,10 @@ class PlayerActivity : ComponentActivity() {
     private var isPlayingBeforePause: Boolean = false
     private lateinit var recordRepository: StreamRecordRepository
 
+    // 画中画状态与视频流宽高比
+    private val isInPipModeState = mutableStateOf(false)
+    private var isCurrentStreamPortrait: Boolean = true
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
@@ -93,8 +105,10 @@ class PlayerActivity : ComponentActivity() {
         // 保持屏幕常亮
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
-        // 沉浸式全屏
+        // 沉浸式全屏与状态栏文字亮度保障 (确保暗色背景下状态栏图标清晰可见)
         val insetsController = WindowCompat.getInsetsController(window, window.decorView)
+        insetsController.isAppearanceLightStatusBars = false
+        insetsController.isAppearanceLightNavigationBars = false
         insetsController.hide(WindowInsetsCompat.Type.systemBars())
         insetsController.systemBarsBehavior =
             WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
@@ -143,7 +157,7 @@ class PlayerActivity : ComponentActivity() {
     }
 
     /**
-     * 重构方法：重置播放器
+     * 重置播放器：
      * 显式调用 player.stop() 与 player.clearMediaItems()，彻底释放旧流硬解与音频队列
      */
     fun resetPlayer() {
@@ -193,6 +207,82 @@ class PlayerActivity : ComponentActivity() {
         player.volume = 1.0f
     }
 
+    /**
+     * 军工级安全画中画模式调起
+     */
+    fun enterPipModeSafely() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            try {
+                val paramsBuilder = PictureInPictureParams.Builder()
+                // 根据当前流横竖屏设置精准画中画比例
+                val aspectRatio = if (isCurrentStreamPortrait) Rational(9, 16) else Rational(16, 9)
+                paramsBuilder.setAspectRatio(aspectRatio)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                    paramsBuilder.setAutoEnterEnabled(true)
+                }
+                enterPictureInPictureMode(paramsBuilder.build())
+            } catch (e: Exception) {
+                try {
+                    @Suppress("DEPRECATION")
+                    enterPictureInPictureMode()
+                } catch (e2: Exception) {
+                    Toast.makeText(this, "当前设备暂不支持画中画", Toast.LENGTH_SHORT).show()
+                }
+            }
+        } else {
+            Toast.makeText(this, "当前系统版本低于 Android 8.0，不支持画中画", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    override fun onUserLeaveHint() {
+        super.onUserLeaveHint()
+        // 用户按 Home 键离开时自动切入画中画
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && exoPlayer?.isPlaying == true) {
+            enterPipModeSafely()
+        }
+    }
+
+    override fun onPictureInPictureModeChanged(
+        isInPictureInPictureMode: Boolean,
+        newConfig: Configuration
+    ) {
+        super.onPictureInPictureModeChanged(isInPictureInPictureMode, newConfig)
+        isInPipModeState.value = isInPictureInPictureMode
+    }
+
+    override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
+        when (keyCode) {
+            KeyEvent.KEYCODE_DPAD_CENTER,
+            KeyEvent.KEYCODE_ENTER,
+            KeyEvent.KEYCODE_SPACE,
+            KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE -> {
+                exoPlayer?.let { player ->
+                    if (player.isPlaying) {
+                        player.pause()
+                    } else {
+                        player.play()
+                    }
+                    return true
+                }
+            }
+            KeyEvent.KEYCODE_MEDIA_PLAY -> {
+                exoPlayer?.play()
+                return true
+            }
+            KeyEvent.KEYCODE_MEDIA_PAUSE -> {
+                exoPlayer?.pause()
+                return true
+            }
+            KeyEvent.KEYCODE_BACK -> {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N && isInPictureInPictureMode) {
+                    finish()
+                    return true
+                }
+            }
+        }
+        return super.onKeyDown(keyCode, event)
+    }
+
     @Composable
     fun PlayerScreen(
         roomId: String,
@@ -206,11 +296,13 @@ class PlayerActivity : ComponentActivity() {
         var currentLine by remember { mutableStateOf("默认线路") }
 
         // 播放器状态监听：STATE_IDLE, STATE_BUFFERING, STATE_READY, STATE_ENDED
-        var playbackState by remember { mutableStateOf(Player.STATE_IDLE) }
+        var playbackState by remember { mutableIntStateOf(Player.STATE_IDLE) }
         var isManualLoading by remember { mutableStateOf(true) }
         var isPortraitStream by remember { mutableStateOf(true) }
         var showLineDropdown by remember { mutableStateOf(false) }
         var isUserManualRotated by remember { mutableStateOf(false) }
+
+        val isInPip by isInPipModeState
 
         val coroutineScope = rememberCoroutineScope()
         val recordKey = if (roomId.isNotBlank()) roomId else (initialStreamUrl ?: "")
@@ -226,13 +318,11 @@ class PlayerActivity : ComponentActivity() {
                     if (state == Player.STATE_READY) {
                         isManualLoading = false
                         exoPlayer?.volume = 1.0f
-                    } else if (state == Player.STATE_BUFFERING || state == Player.STATE_IDLE) {
-                        // 处于 STATE_BUFFERING 或 STATE_IDLE 状态
                     }
                 }
 
                 override fun onRenderedFirstFrame() {
-                    // 首帧真正上屏渲染，结束一切过渡加载，杜绝黑屏
+                    // 首帧渲染上屏，彻底消除黑屏
                     isManualLoading = false
                     playbackState = Player.STATE_READY
                 }
@@ -241,7 +331,8 @@ class PlayerActivity : ComponentActivity() {
                     if (videoSize.width > 0 && videoSize.height > 0) {
                         val isPortrait = (videoSize.height >= videoSize.width)
                         isPortraitStream = isPortrait
-                        if (!isUserManualRotated) {
+                        isCurrentStreamPortrait = isPortrait
+                        if (!isUserManualRotated && !isInPip) {
                             // 抖音竖屏直播全屏自适应
                             requestedOrientation = if (isPortrait) {
                                 ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
@@ -252,18 +343,13 @@ class PlayerActivity : ComponentActivity() {
                     }
                 }
 
-                override fun onAudioSessionIdChanged(audioSessionId: Int) {
-                    exoPlayer?.volume = 1.0f
-                }
-
                 override fun onPlayerError(error: PlaybackException) {
                     isManualLoading = false
-                    Toast.makeText(this@PlayerActivity, "信号中断，自动重连中...", Toast.LENGTH_SHORT).show()
-                    currentUrl?.let { url ->
-                        switchStreamSource(url, currentLine) {
-                            isManualLoading = true
-                        }
-                    }
+                    Toast.makeText(
+                        this@PlayerActivity,
+                        "流媒体播放异常，建议切换备用线路",
+                        Toast.LENGTH_SHORT
+                    ).show()
                 }
             }
 
@@ -273,8 +359,9 @@ class PlayerActivity : ComponentActivity() {
             }
         }
 
-        // 初始拉流与持久化到 Room 数据库
-        LaunchedEffect(roomId) {
+        // 解析并启动流播放
+        LaunchedEffect(roomId, initialStreamUrl) {
+            isManualLoading = true
             if (!initialStreamUrl.isNullOrBlank()) {
                 currentUrl = initialStreamUrl
                 lifecycleScope.launch(Dispatchers.IO) {
@@ -285,7 +372,7 @@ class PlayerActivity : ComponentActivity() {
                         anchorName = initialAnchor
                     )
                 }
-                switchStreamSource(initialStreamUrl, "直连线路") {
+                switchStreamSource(initialStreamUrl, "直连接口") {
                     isManualLoading = true
                 }
             } else {
@@ -335,209 +422,281 @@ class PlayerActivity : ComponentActivity() {
                 }
             )
 
-            // 核心实现：当播放器处于 STATE_BUFFERING 或 STATE_IDLE（或换线加载中）时居中显示 CircularProgressIndicator
-            val showLoading = isManualLoading ||
-                playbackState == Player.STATE_BUFFERING ||
-                playbackState == Player.STATE_IDLE
+            // 画中画模式下隐藏所有浮层，全屏仅保留纯净视频
+            if (!isInPip) {
+                // 核心实现：当播放器处于 STATE_BUFFERING 或 STATE_IDLE（或换线加载中）时居中显示 CircularProgressIndicator
+                val showLoading = isManualLoading ||
+                    playbackState == Player.STATE_BUFFERING ||
+                    playbackState == Player.STATE_IDLE
 
-            if (showLoading) {
-                Box(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .background(Color(0xFF09090C).copy(alpha = 0.65f)),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Column(
-                        horizontalAlignment = Alignment.CenterHorizontally,
-                        verticalArrangement = Arrangement.spacedBy(16.dp)
+                if (showLoading) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .background(Color(0xFF09090C).copy(alpha = 0.65f)),
+                        contentAlignment = Alignment.Center
                     ) {
-                        CircularProgressIndicator(
-                            modifier = Modifier.size(48.dp),
-                            color = DouyinRed,
-                            strokeWidth = 3.5.dp
-                        )
-                        Text(
-                            text = if (playbackState == Player.STATE_BUFFERING) "正在缓冲直播信号..." else "正在接入直播通道...",
-                            style = MaterialTheme.typography.bodyMedium,
-                            fontWeight = FontWeight.Medium,
-                            color = TextPrimary
-                        )
+                        Column(
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            verticalArrangement = Arrangement.spacedBy(16.dp)
+                        ) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(48.dp),
+                                color = DouyinRed,
+                                strokeWidth = 3.5.dp
+                            )
+                            Text(
+                                text = if (playbackState == Player.STATE_BUFFERING) "正在缓冲直播信号..." else "正在接入直播通道...",
+                                style = MaterialTheme.typography.bodyMedium,
+                                fontWeight = FontWeight.Medium,
+                                color = TextPrimary
+                            )
+                        }
                     }
                 }
-            }
 
-            // 顶部浮动控制胶囊
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .statusBarsPadding()
-                    .padding(horizontal = 14.dp, vertical = 10.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween
-            ) {
-                // 主播与房间信息
-                Surface(
-                    shape = RoundedCornerShape(20.dp),
-                    color = DarkSurface.copy(alpha = 0.75f),
+                // 顶部浮动控制胶囊
+                Row(
                     modifier = Modifier
-                        .weight(1f, fill = false)
-                        .border(0.8.dp, DarkSurfaceBorder, RoundedCornerShape(20.dp))
+                        .fillMaxWidth()
+                        .statusBarsPadding()
+                        .padding(horizontal = 14.dp, vertical = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
                 ) {
+                    // 主播与房间信息
+                    Surface(
+                        shape = RoundedCornerShape(20.dp),
+                        color = DarkSurface.copy(alpha = 0.75f),
+                        modifier = Modifier
+                            .weight(1f, fill = false)
+                            .border(0.8.dp, DarkSurfaceBorder, RoundedCornerShape(20.dp))
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .size(24.dp)
+                                    .clip(CircleShape)
+                                    .background(DouyinRed.copy(alpha = 0.2f)),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.LiveTv,
+                                    contentDescription = null,
+                                    tint = DouyinRed,
+                                    modifier = Modifier.size(14.dp)
+                                )
+                            }
+
+                            Column {
+                                Text(
+                                    text = anchor,
+                                    style = MaterialTheme.typography.labelMedium,
+                                    fontWeight = FontWeight.Bold,
+                                    color = TextPrimary,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                                Text(
+                                    text = title,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = TextSecondary,
+                                    fontSize = 10.sp,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.width(8.dp))
+
+                    // 右侧功能键：收藏、画中画、重载、线路、旋转、退出
                     Row(
-                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
-                        Box(
+                        // 收藏按钮
+                        IconButton(
+                            onClick = {
+                                coroutineScope.launch {
+                                    val targetId = currentRecord?.id ?: if (roomId.isNotBlank()) roomId else (currentUrl ?: "")
+                                    recordRepository.recordAccess(
+                                        roomId = roomId,
+                                        streamUrl = currentUrl ?: "",
+                                        title = title,
+                                        anchorName = anchor
+                                    )
+                                    recordRepository.toggleFavorite(targetId)
+                                    val newFav = !isFavorite
+                                    Toast.makeText(
+                                        this@PlayerActivity,
+                                        if (newFav) "已收藏该直播间" else "已取消收藏",
+                                        Toast.LENGTH_SHORT
+                                    ).show()
+                                }
+                            },
                             modifier = Modifier
-                                .size(8.dp)
+                                .size(36.dp)
                                 .clip(CircleShape)
-                                .background(DouyinGreen)
-                        )
-                        Column {
-                            Text(
-                                text = anchor,
-                                style = MaterialTheme.typography.labelMedium,
-                                fontWeight = FontWeight.Bold,
-                                color = TextPrimary,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis
-                            )
-                            Text(
-                                text = title,
-                                style = MaterialTheme.typography.labelSmall,
-                                color = TextSecondary,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                                fontSize = 10.sp
+                                .background(DarkSurface.copy(alpha = 0.75f))
+                                .focusable()
+                        ) {
+                            Icon(
+                                imageVector = if (isFavorite) Icons.Default.Star else Icons.Default.StarBorder,
+                                contentDescription = if (isFavorite) "取消收藏" else "收藏直播间",
+                                tint = if (isFavorite) Color(0xFFFFB800) else TextPrimary,
+                                modifier = Modifier.size(19.dp)
                             )
                         }
-                    }
-                }
 
-                Spacer(modifier = Modifier.width(8.dp))
-
-                // 控制操作区
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    // 线路无缝切换下拉菜单
-                    if (streamsMap.isNotEmpty()) {
-                        Surface(
-                            onClick = { showLineDropdown = true },
-                            shape = RoundedCornerShape(18.dp),
-                            color = DouyinRed.copy(alpha = 0.85f)
+                        // 画中画 (PiP) 模式按钮
+                        IconButton(
+                            onClick = {
+                                enterPipModeSafely()
+                            },
+                            modifier = Modifier
+                                .size(36.dp)
+                                .clip(CircleShape)
+                                .background(DarkSurface.copy(alpha = 0.75f))
+                                .focusable()
                         ) {
-                            Row(
-                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(4.dp)
-                            ) {
-                                Text(
-                                    text = currentLine,
-                                    style = MaterialTheme.typography.labelSmall,
-                                    fontWeight = FontWeight.SemiBold,
-                                    color = Color.White
-                                )
-                                Icon(
-                                    imageVector = Icons.Default.ArrowDropDown,
-                                    contentDescription = "切换线路",
-                                    tint = Color.White,
-                                    modifier = Modifier.size(16.dp)
-                                )
-                            }
+                            Icon(
+                                imageVector = Icons.Default.PictureInPictureAlt,
+                                contentDescription = "画中画",
+                                tint = DouyinCyan,
+                                modifier = Modifier.size(18.dp)
+                            )
                         }
 
-                        DropdownMenu(
-                            expanded = showLineDropdown,
-                            onDismissRequest = { showLineDropdown = false },
-                            modifier = Modifier.background(DarkSurfaceElevated)
-                        ) {
-                            streamsMap.forEach { (name, url) ->
-                                DropdownMenuItem(
-                                    text = {
+                        // 换线下拉
+                        if (streamsMap.isNotEmpty()) {
+                            Box {
+                                Surface(
+                                    onClick = { showLineDropdown = true },
+                                    shape = RoundedCornerShape(18.dp),
+                                    color = DarkSurface.copy(alpha = 0.75f),
+                                    modifier = Modifier
+                                        .height(36.dp)
+                                        .border(0.8.dp, DarkSurfaceBorder, RoundedCornerShape(18.dp))
+                                        .focusable()
+                                ) {
+                                    Row(
+                                        modifier = Modifier.padding(horizontal = 10.dp),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+                                    ) {
                                         Text(
-                                            text = name,
-                                            color = if (name == currentLine) DouyinRed else TextPrimary,
-                                            fontWeight = if (name == currentLine) FontWeight.Bold else FontWeight.Normal
+                                            text = currentLine,
+                                            style = MaterialTheme.typography.labelSmall,
+                                            fontWeight = FontWeight.SemiBold,
+                                            color = DouyinCyan
                                         )
-                                    },
-                                    onClick = {
-                                        showLineDropdown = false
-                                        currentLine = name
-                                        // 核心调用：重载前显示 Loading UI -> resetPlayer() -> prepare() -> setPlayWhenReady(true)
-                                        switchStreamSource(url, name) {
-                                            isManualLoading = true
-                                        }
+                                        Icon(
+                                            imageVector = Icons.Default.ArrowDropDown,
+                                            contentDescription = "切换线路",
+                                            tint = DouyinCyan,
+                                            modifier = Modifier.size(16.dp)
+                                        )
                                     }
-                                )
+                                }
+
+                                DropdownMenu(
+                                    expanded = showLineDropdown,
+                                    onDismissRequest = { showLineDropdown = false },
+                                    modifier = Modifier.background(DarkSurfaceElevated)
+                                ) {
+                                    streamsMap.forEach { (name, url) ->
+                                        DropdownMenuItem(
+                                            text = {
+                                                Text(
+                                                    text = name,
+                                                    color = if (name == currentLine) DouyinRed else TextPrimary,
+                                                    fontWeight = if (name == currentLine) FontWeight.Bold else FontWeight.Normal
+                                                )
+                                            },
+                                            onClick = {
+                                                showLineDropdown = false
+                                                if (name != currentLine) {
+                                                    currentLine = name
+                                                    switchStreamSource(url, name) {
+                                                        isManualLoading = true
+                                                    }
+                                                }
+                                            }
+                                        )
+                                    }
+                                }
                             }
                         }
-                    }
 
-                    // 收藏星标按钮 (Room 本地数据库持久化)
-                    IconButton(
-                        onClick = {
-                            coroutineScope.launch {
-                                val newFav = recordRepository.toggleFavorite(recordKey)
-                                Toast.makeText(
-                                    this@PlayerActivity,
-                                    if (newFav) "已添加收藏 ⭐" else "已取消收藏",
-                                    Toast.LENGTH_SHORT
-                                ).show()
-                            }
-                        },
-                        modifier = Modifier
-                            .size(36.dp)
-                            .clip(CircleShape)
-                            .background(DarkSurface.copy(alpha = 0.75f))
-                    ) {
-                        Icon(
-                            imageVector = if (isFavorite) Icons.Default.Star else Icons.Default.StarBorder,
-                            contentDescription = if (isFavorite) "取消收藏" else "加入收藏",
-                            tint = if (isFavorite) Color(0xFFFFB800) else Color.White,
-                            modifier = Modifier.size(19.dp)
-                        )
-                    }
+                        // 重载当前线路
+                        IconButton(
+                            onClick = {
+                                currentUrl?.let { url ->
+                                    switchStreamSource(url, currentLine) {
+                                        isManualLoading = true
+                                    }
+                                }
+                            },
+                            modifier = Modifier
+                                .size(36.dp)
+                                .clip(CircleShape)
+                                .background(DarkSurface.copy(alpha = 0.75f))
+                                .focusable()
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Refresh,
+                                contentDescription = "重载",
+                                tint = TextPrimary,
+                                modifier = Modifier.size(19.dp)
+                            )
+                        }
 
-                    // 旋转屏幕
-                    IconButton(
-                        onClick = {
-                            isUserManualRotated = true
-                            requestedOrientation = if (requestedOrientation == ActivityInfo.SCREEN_ORIENTATION_PORTRAIT) {
-                                ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
-                            } else {
-                                ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
-                            }
-                        },
-                        modifier = Modifier
-                            .size(36.dp)
-                            .clip(CircleShape)
-                            .background(DarkSurface.copy(alpha = 0.75f))
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.ScreenRotation,
-                            contentDescription = "旋转屏幕",
-                            tint = DouyinCyan,
-                            modifier = Modifier.size(18.dp)
-                        )
-                    }
+                        // 旋转屏幕
+                        IconButton(
+                            onClick = {
+                                isUserManualRotated = true
+                                requestedOrientation = if (requestedOrientation == ActivityInfo.SCREEN_ORIENTATION_PORTRAIT) {
+                                    ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+                                } else {
+                                    ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+                                }
+                            },
+                            modifier = Modifier
+                                .size(36.dp)
+                                .clip(CircleShape)
+                                .background(DarkSurface.copy(alpha = 0.75f))
+                                .focusable()
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.ScreenRotation,
+                                contentDescription = "旋转屏幕",
+                                tint = DouyinCyan,
+                                modifier = Modifier.size(18.dp)
+                            )
+                        }
 
-                    // 退出 Activity
-                    IconButton(
-                        onClick = { finish() },
-                        modifier = Modifier
-                            .size(36.dp)
-                            .clip(CircleShape)
-                            .background(DarkSurface.copy(alpha = 0.75f))
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.Close,
-                            contentDescription = "关闭",
-                            tint = TextPrimary,
-                            modifier = Modifier.size(20.dp)
-                        )
+                        // 退出 Activity
+                        IconButton(
+                            onClick = { finish() },
+                            modifier = Modifier
+                                .size(36.dp)
+                                .clip(CircleShape)
+                                .background(DarkSurface.copy(alpha = 0.75f))
+                                .focusable()
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Close,
+                                contentDescription = "关闭",
+                                tint = TextPrimary,
+                                modifier = Modifier.size(20.dp)
+                            )
+                        }
                     }
                 }
             }
@@ -557,6 +716,10 @@ class PlayerActivity : ComponentActivity() {
 
     override fun onPause() {
         super.onPause()
+        // 画中画模式下保持播放，不执行 pause
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N && isInPictureInPictureMode) {
+            return
+        }
         isPlayingBeforePause = exoPlayer?.isPlaying == true
         exoPlayer?.pause()
     }

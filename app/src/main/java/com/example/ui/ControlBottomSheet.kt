@@ -2,6 +2,7 @@ package com.example.ui
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.focusable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -39,7 +40,8 @@ fun ControlBottomSheet(
     fullscreenOrientationMode: Int = 0,
     onOrientationModeSelect: (Int) -> Unit = {},
     onHealAudioStream: () -> Unit = {},
-    onLaunchNativePlayer: () -> Unit = {}
+    onLaunchNativePlayer: () -> Unit = {},
+    onCheckUpdate: () -> Unit = {}
 ) {
     ModalBottomSheet(
         onDismissRequest = onDismissRequest,
@@ -303,25 +305,46 @@ fun ControlBottomSheet(
                 )
             }
 
-            // Bottom Clear Cache Action
-            OutlinedButton(
-                onClick = onClearCache,
+            // System Actions: Check Update & Clear Cache
+            Row(
                 modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(12.dp),
-                colors = ButtonDefaults.outlinedButtonColors(
-                    contentColor = TextSecondary
-                ),
-                border = ButtonDefaults.outlinedButtonBorder.copy(
-                    brush = androidx.compose.ui.graphics.SolidColor(DarkSurfaceBorder)
-                )
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
             ) {
-                Icon(
-                    imageVector = Icons.Default.DeleteSweep,
-                    contentDescription = null,
-                    modifier = Modifier.size(18.dp)
-                )
-                Spacer(modifier = Modifier.width(8.dp))
-                Text("清理 WebView 网页缓存与本地存储", fontSize = 13.sp)
+                OutlinedButton(
+                    onClick = onCheckUpdate,
+                    modifier = Modifier.weight(1f).focusable(),
+                    shape = RoundedCornerShape(12.dp),
+                    colors = ButtonDefaults.outlinedButtonColors(contentColor = DouyinCyan),
+                    border = ButtonDefaults.outlinedButtonBorder.copy(
+                        brush = androidx.compose.ui.graphics.SolidColor(DouyinCyan.copy(alpha = 0.4f))
+                    )
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.SystemUpdate,
+                        contentDescription = null,
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text("检查版本更新", fontSize = 12.sp)
+                }
+
+                OutlinedButton(
+                    onClick = onClearCache,
+                    modifier = Modifier.weight(1f).focusable(),
+                    shape = RoundedCornerShape(12.dp),
+                    colors = ButtonDefaults.outlinedButtonColors(contentColor = TextSecondary),
+                    border = ButtonDefaults.outlinedButtonBorder.copy(
+                        brush = androidx.compose.ui.graphics.SolidColor(DarkSurfaceBorder)
+                    )
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.DeleteSweep,
+                        contentDescription = null,
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text("清理网络缓存", fontSize = 12.sp)
+                }
             }
         }
     }
@@ -337,7 +360,7 @@ fun QuickActionButton(
 ) {
     Surface(
         onClick = onClick,
-        modifier = modifier,
+        modifier = modifier.focusable(),
         shape = RoundedCornerShape(14.dp),
         color = DarkSurfaceElevated,
         tonalElevation = 2.dp
