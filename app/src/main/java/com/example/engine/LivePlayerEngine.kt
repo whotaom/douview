@@ -19,7 +19,7 @@ import kotlinx.coroutines.flow.asStateFlow
 
 /**
  * 军工级 Android 原生直播引擎 (基于 Media3 ExoPlayer)
- * 具备播放状态完整监听、显式 player.stop() 停流排障、无缝重载机制、
+ * 具备播放状态完整监听、显式 resetPlayer() (stop + clearMediaItems) 停流排障、
  * 显式 setPlayWhenReady(true) 声画保活、首帧渲染防黑屏感知与息屏唤醒自愈。
  */
 class LivePlayerEngine(private val context: Context) {
@@ -177,8 +177,18 @@ class LivePlayerEngine(private val context: Context) {
     }
 
     /**
+     * 重置播放器：显式调用 player.stop() 与 player.clearMediaItems()
+     */
+    fun resetPlayer() {
+        exoPlayer?.let { player ->
+            player.stop()
+            player.clearMediaItems()
+        }
+    }
+
+    /**
      * 核心实现：ExoPlayer 线路切换无缝重载机制
-     * 1. 显式调用 player.stop() 停止当前播放，释放当前解码管道与音频缓冲区
+     * 1. 显式调用 resetPlayer() 停止当前播放并清空媒体队列
      * 2. 重置 MediaItem
      * 3. 显式调用 player.prepare() 与 player.setPlayWhenReady(true)
      * 4. 监听 Player.Listener 处理音频焦点，彻底杜绝静音与卡顿
@@ -191,8 +201,8 @@ class LivePlayerEngine(private val context: Context) {
         _playbackState.value = PlaybackState.Buffering("正在平滑换线至 [$lineName]...")
 
         try {
-            // 步骤 1：显式通过 player.stop() 停止当前播放，立即释放旧流音画解码器
-            player.stop()
+            // 步骤 1：显式调用 resetPlayer (stop + clearMediaItems)
+            resetPlayer()
 
             // 步骤 2：重置并构建新流 MediaItem
             val mediaItem = MediaItem.Builder()
@@ -269,7 +279,7 @@ class LivePlayerEngine(private val context: Context) {
 
     fun release() {
         try {
-            exoPlayer?.stop()
+            resetPlayer()
             exoPlayer?.release()
         } catch (e: Exception) {
             e.printStackTrace()

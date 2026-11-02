@@ -48,6 +48,7 @@ import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.lifecycle.lifecycleScope
 import com.example.data.LivePreferences
+import com.example.data.db.StreamRecordRepository
 import com.example.engine.DouyinStreamResolver
 import com.example.engine.LivePlayerEngine
 import com.example.ui.ChangeUrlDialog
@@ -56,6 +57,7 @@ import com.example.ui.ControlBottomSheet
 import com.example.ui.NativeLivePlayerOverlay
 import com.example.ui.QuickRoomDialog
 import com.example.ui.theme.*
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
@@ -73,6 +75,7 @@ class MainActivity : ComponentActivity() {
 
     // 原生 Media3 ExoPlayer 直播引擎
     private lateinit var livePlayerEngine: LivePlayerEngine
+    private lateinit var recordRepository: StreamRecordRepository
 
     private val desktopUserAgent =
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
@@ -86,6 +89,7 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
 
         preferences = LivePreferences(this)
+        recordRepository = StreamRecordRepository.getInstance(this)
         livePlayerEngine = LivePlayerEngine(this)
         defaultMobileUserAgent = WebSettings.getDefaultUserAgent(this)
         audioManager = getSystemService(Context.AUDIO_SERVICE) as? AudioManager
@@ -700,12 +704,16 @@ class MainActivity : ComponentActivity() {
         if (showRoomDialog) {
             QuickRoomDialog(
                 onDismiss = { showRoomDialog = false },
+                repository = recordRepository,
                 onInjectRoom = { roomInput ->
                     showRoomDialog = false
                     injectRoomToWeb(roomInput)
                 },
                 onPlayInNativeEngine = { roomInput ->
                     showRoomDialog = false
+                    lifecycleScope.launch(Dispatchers.IO) {
+                        recordRepository.recordAccess(roomId = roomInput)
+                    }
                     // 启动独立的 PlayerActivity 原生极速播放器
                     val intent = PlayerActivity.createIntent(
                         context = this@MainActivity,
@@ -926,6 +934,9 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun injectRoomToWeb(roomInput: String) {
+        lifecycleScope.launch(Dispatchers.IO) {
+            recordRepository.recordAccess(roomId = roomInput)
+        }
         val sanitized = roomInput.replace("\\", "\\\\").replace("'", "\\'").replace("\"", "\\\"").replace("\n", " ")
         val js = """
             (function() {

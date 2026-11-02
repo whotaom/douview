@@ -26,7 +26,12 @@ jobs:
 
       - name: Accept Android SDK Licenses
         run: |
-          # GitHub Actions ubuntu-latest 环境已预装 Android SDK，直接自动同意许可协议
+          # 军工级防御：直接写入 Android SDK 官方许可证哈希，无需依赖网络或外部 CLI
+          mkdir -p "$ANDROID_HOME/licenses" || true
+          echo "24333f8a63b6825ea9c5514f83c2829b004d1fee" > "$ANDROID_HOME/licenses/android-sdk-license"
+          echo "84831b9409646a578e442d802a4e9ee1974773c5" >> "$ANDROID_HOME/licenses/android-sdk-license"
+          echo "d56f5187479451eabf01fb78af6dfcb131a6481e" >> "$ANDROID_HOME/licenses/android-sdk-license"
+          echo "24333f8a63b6825ea9c5514f83c2829b004d1fee" > "$ANDROID_HOME/licenses/android-sdk-preview-license"
           yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses 2>/dev/null || true
 
       - name: Prepare Keystore & Environment

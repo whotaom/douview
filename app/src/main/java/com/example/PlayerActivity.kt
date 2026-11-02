@@ -23,9 +23,7 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -40,18 +38,21 @@ import androidx.media3.common.*
 import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.PlayerView
+import com.example.data.db.StreamRecord
+import com.example.data.db.StreamRecordRepository
 import com.example.engine.DouyinStreamResolver
 import com.example.ui.theme.*
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 
 /**
  * 军工级原生 ExoPlayer 直播 Activity
- * 实现要求：
- * 1. 显式通过 player.stop() 停止当前播放，在新流准备好后重置 MediaItem 并调用 player.setPlayWhenReady(true)；
- * 2. 监听 Player.Listener 处理音频焦点，彻底解决切换后的静音与卡顿；
- * 3. 抖音竖屏直播全屏时智能为竖屏全屏；
- * 4. 防黑屏骨架加载屏（等待首帧上屏后平滑淡出）；
- * 5. 息屏再开自动唤醒重拉流，防止假死。
+ * 核心特性：
+ * 1. resetPlayer()：显式调用 player.stop() 与 player.clearMediaItems()；
+ * 2. 线路重载前显式展示 Loading UI，并通过 player.prepare() 与 player.setPlayWhenReady(true) 实现无缝切换；
+ * 3. 布局中居中展示 CircularProgressIndicator，基于 Player.Listener 监听，在 STATE_BUFFERING 或 STATE_IDLE 时显示，杜绝黑屏；
+ * 4. 抖音竖屏直播全屏自适应；
+ * 5. 息屏唤醒自愈拉流。
  */
 class PlayerActivity : ComponentActivity() {
 
@@ -81,10 +82,13 @@ class PlayerActivity : ComponentActivity() {
     private var currentPlayerView: PlayerView? = null
     private var currentUrl: String? = null
     private var isPlayingBeforePause: Boolean = false
+    private lateinit var recordRepository: StreamRecordRepository
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+
+        recordRepository = StreamRecordRepository.getInstance(this)
 
         // 保持屏幕常亮
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -138,6 +142,57 @@ class PlayerActivity : ComponentActivity() {
             .build()
     }
 
+    /**
+     * 重构方法：重置播放器
+     * 显式调用 player.stop() 与 player.clearMediaItems()，彻底释放旧流硬解与音频队列
+     */
+    fun resetPlayer() {
+        exoPlayer?.let { player ->
+            player.stop()
+            player.clearMediaItems()
+        }
+    }
+
+    /**
+     * 核心重构实现：无缝切换线路
+     * 1. 重载新流前显式置为 Loading 状态；
+     * 2. 执行 resetPlayer() (stop + clearMediaItems)；
+     * 3. 准备新流并调用 player.prepare() 与 player.setPlayWhenReady(true)。
+     */
+    fun switchStreamSource(
+        newUrl: String,
+        lineName: String,
+        onSetLoading: () -> Unit
+    ) {
+        val player = exoPlayer ?: return
+        currentUrl = newUrl
+
+        // 1. 在重载新流前添加显示 Loading UI 的逻辑
+        onSetLoading()
+
+        // 2. 显式调用 resetPlayer 方法 (stop + clearMediaItems)
+        resetPlayer()
+
+        // 3. 构建并设置新流 MediaItem
+        val mediaItem = MediaItem.Builder()
+            .setUri(newUrl)
+            .setLiveConfiguration(
+                MediaItem.LiveConfiguration.Builder()
+                    .setMaxPlaybackSpeed(1.05f)
+                    .setMinPlaybackSpeed(0.95f)
+                    .build()
+            )
+            .build()
+        player.setMediaItem(mediaItem, /* resetPosition = */ true)
+
+        // 4. 准备流并显式调用 setPlayWhenReady(true) 实现无缝切换
+        player.prepare()
+        player.playWhenReady = true
+
+        // 5. 确保音量完全激活
+        player.volume = 1.0f
+    }
+
     @Composable
     fun PlayerScreen(
         roomId: String,
@@ -149,35 +204,37 @@ class PlayerActivity : ComponentActivity() {
         var anchor by remember { mutableStateOf(initialAnchor) }
         var streamsMap by remember { mutableStateOf<Map<String, String>>(emptyMap()) }
         var currentLine by remember { mutableStateOf("默认线路") }
-        var isBuffering by remember { mutableStateOf(true) }
-        var isFirstFrameRendered by remember { mutableStateOf(false) }
+
+        // 播放器状态监听：STATE_IDLE, STATE_BUFFERING, STATE_READY, STATE_ENDED
+        var playbackState by remember { mutableStateOf(Player.STATE_IDLE) }
+        var isManualLoading by remember { mutableStateOf(true) }
         var isPortraitStream by remember { mutableStateOf(true) }
         var showLineDropdown by remember { mutableStateOf(false) }
         var isUserManualRotated by remember { mutableStateOf(false) }
 
-        // 设置播放状态监听器以管理音频焦点与防黑屏
+        val coroutineScope = rememberCoroutineScope()
+        val recordKey = if (roomId.isNotBlank()) roomId else (initialStreamUrl ?: "")
+        val recordFlow = remember(recordKey) { recordRepository.observeRecord(recordKey) }
+        val currentRecord by recordFlow.collectAsState(initial = null)
+        val isFavorite = currentRecord?.isFavorite == true
+
+        // 注册 Player.Listener 监听播放器状态
         DisposableEffect(exoPlayer) {
             val listener = object : Player.Listener {
                 override fun onPlaybackStateChanged(state: Int) {
-                    when (state) {
-                        Player.STATE_BUFFERING -> {
-                            isBuffering = true
-                        }
-                        Player.STATE_READY -> {
-                            isBuffering = false
-                            exoPlayer?.volume = 1.0f
-                        }
-                        Player.STATE_ENDED -> {
-                            isBuffering = false
-                        }
-                        Player.STATE_IDLE -> {}
+                    playbackState = state
+                    if (state == Player.STATE_READY) {
+                        isManualLoading = false
+                        exoPlayer?.volume = 1.0f
+                    } else if (state == Player.STATE_BUFFERING || state == Player.STATE_IDLE) {
+                        // 处于 STATE_BUFFERING 或 STATE_IDLE 状态
                     }
                 }
 
                 override fun onRenderedFirstFrame() {
-                    // 首帧已真正渲染，平滑淡出加载占位层，彻底解决载入前黑屏
-                    isFirstFrameRendered = true
-                    isBuffering = false
+                    // 首帧真正上屏渲染，结束一切过渡加载，杜绝黑屏
+                    isManualLoading = false
+                    playbackState = Player.STATE_READY
                 }
 
                 override fun onVideoSizeChanged(videoSize: VideoSize) {
@@ -185,7 +242,7 @@ class PlayerActivity : ComponentActivity() {
                         val isPortrait = (videoSize.height >= videoSize.width)
                         isPortraitStream = isPortrait
                         if (!isUserManualRotated) {
-                            // 抖音竖屏直播全屏时智能为竖屏全屏，横屏直播转横屏全屏
+                            // 抖音竖屏直播全屏自适应
                             requestedOrientation = if (isPortrait) {
                                 ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
                             } else {
@@ -196,14 +253,17 @@ class PlayerActivity : ComponentActivity() {
                 }
 
                 override fun onAudioSessionIdChanged(audioSessionId: Int) {
-                    // 确保音频焦点分配后音量非静音
                     exoPlayer?.volume = 1.0f
                 }
 
                 override fun onPlayerError(error: PlaybackException) {
-                    isBuffering = false
-                    Toast.makeText(this@PlayerActivity, "信号中断，正在自愈重试...", Toast.LENGTH_SHORT).show()
-                    currentUrl?.let { switchStreamSource(it, currentLine) }
+                    isManualLoading = false
+                    Toast.makeText(this@PlayerActivity, "信号中断，自动重连中...", Toast.LENGTH_SHORT).show()
+                    currentUrl?.let { url ->
+                        switchStreamSource(url, currentLine) {
+                            isManualLoading = true
+                        }
+                    }
                 }
             }
 
@@ -213,11 +273,21 @@ class PlayerActivity : ComponentActivity() {
             }
         }
 
-        // 初始拉流
+        // 初始拉流与持久化到 Room 数据库
         LaunchedEffect(roomId) {
             if (!initialStreamUrl.isNullOrBlank()) {
                 currentUrl = initialStreamUrl
-                switchStreamSource(initialStreamUrl, "直连线路")
+                lifecycleScope.launch(Dispatchers.IO) {
+                    recordRepository.recordAccess(
+                        roomId = roomId,
+                        streamUrl = initialStreamUrl,
+                        title = initialTitle,
+                        anchorName = initialAnchor
+                    )
+                }
+                switchStreamSource(initialStreamUrl, "直连线路") {
+                    isManualLoading = true
+                }
             } else {
                 val roomInfo = DouyinStreamResolver.resolveLiveRoom(roomId)
                 if (roomInfo != null && roomInfo.streams.isNotEmpty()) {
@@ -228,8 +298,20 @@ class PlayerActivity : ComponentActivity() {
                     val firstUrl = roomInfo.streams[firstKey]!!
                     currentUrl = firstUrl
                     currentLine = firstKey
-                    switchStreamSource(firstUrl, firstKey)
+                    lifecycleScope.launch(Dispatchers.IO) {
+                        recordRepository.recordAccess(
+                            roomId = roomId,
+                            streamUrl = firstUrl,
+                            title = roomInfo.title,
+                            anchorName = roomInfo.anchorName,
+                            coverUrl = roomInfo.avatarUrl
+                        )
+                    }
+                    switchStreamSource(firstUrl, firstKey) {
+                        isManualLoading = true
+                    }
                 } else {
+                    isManualLoading = false
                     Toast.makeText(this@PlayerActivity, "当前未开播或无法拉取流地址", Toast.LENGTH_LONG).show()
                 }
             }
@@ -240,7 +322,7 @@ class PlayerActivity : ComponentActivity() {
                 .fillMaxSize()
                 .background(Color.Black)
         ) {
-            // ExoPlayer 核心视图
+            // ExoPlayer 核心视频视图
             AndroidView(
                 modifier = Modifier.fillMaxSize(),
                 factory = { ctx ->
@@ -253,92 +335,32 @@ class PlayerActivity : ComponentActivity() {
                 }
             )
 
-            // 防黑屏骨架加载层 (在首帧上屏前展示高质感流媒体接入动效，避免冷冰冰的纯黑屏)
-            AnimatedVisibility(
-                visible = !isFirstFrameRendered,
-                enter = fadeIn(),
-                exit = fadeOut(animationSpec = tween(500))
-            ) {
+            // 核心实现：当播放器处于 STATE_BUFFERING 或 STATE_IDLE（或换线加载中）时居中显示 CircularProgressIndicator
+            val showLoading = isManualLoading ||
+                playbackState == Player.STATE_BUFFERING ||
+                playbackState == Player.STATE_IDLE
+
+            if (showLoading) {
                 Box(
                     modifier = Modifier
                         .fillMaxSize()
-                        .background(
-                            Brush.verticalGradient(
-                                colors = listOf(
-                                    Color(0xFF1A1A24),
-                                    Color(0xFF09090C),
-                                    Color(0xFF121218)
-                                )
-                            )
-                        ),
+                        .background(Color(0xFF09090C).copy(alpha = 0.65f)),
                     contentAlignment = Alignment.Center
                 ) {
                     Column(
                         horizontalAlignment = Alignment.CenterHorizontally,
                         verticalArrangement = Arrangement.spacedBy(16.dp)
                     ) {
-                        // 呼吸式直播光环
-                        val infiniteTransition = rememberInfiniteTransition(label = "pulse")
-                        val scale by infiniteTransition.animateFloat(
-                            initialValue = 0.9f,
-                            targetValue = 1.15f,
-                            animationSpec = infiniteRepeatable(
-                                animation = tween(1000, easing = FastOutSlowInEasing),
-                                repeatMode = RepeatMode.Reverse
-                            ),
-                            label = "scale"
-                        )
-                        val alpha by infiniteTransition.animateFloat(
-                            initialValue = 0.4f,
-                            targetValue = 0.9f,
-                            animationSpec = infiniteRepeatable(
-                                animation = tween(1000, easing = FastOutSlowInEasing),
-                                repeatMode = RepeatMode.Reverse
-                            ),
-                            label = "alpha"
-                        )
-
-                        Box(
-                            modifier = Modifier
-                                .size(72.dp)
-                                .clip(CircleShape)
-                                .background(DouyinRed.copy(alpha = 0.15f * scale)),
-                            contentAlignment = Alignment.Center
-                        ) {
-                            Box(
-                                modifier = Modifier
-                                    .size(52.dp)
-                                    .clip(CircleShape)
-                                    .background(DouyinRed.copy(alpha = alpha)),
-                                contentAlignment = Alignment.Center
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Default.Tv,
-                                    contentDescription = null,
-                                    tint = Color.White,
-                                    modifier = Modifier.size(28.dp)
-                                )
-                            }
-                        }
-
-                        Text(
-                            text = anchor.ifBlank { "正在接入直播信号" },
-                            style = MaterialTheme.typography.titleMedium,
-                            fontWeight = FontWeight.Bold,
-                            color = TextPrimary
-                        )
-
-                        Text(
-                            text = "低延迟极速流解码准备中，防黑屏自适应缓冲...",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = TextSecondary,
-                            fontSize = 12.sp
-                        )
-
                         CircularProgressIndicator(
-                            modifier = Modifier.size(24.dp),
+                            modifier = Modifier.size(48.dp),
                             color = DouyinRed,
-                            strokeWidth = 2.5.dp
+                            strokeWidth = 3.5.dp
+                        )
+                        Text(
+                            text = if (playbackState == Player.STATE_BUFFERING) "正在缓冲直播信号..." else "正在接入直播通道...",
+                            style = MaterialTheme.typography.bodyMedium,
+                            fontWeight = FontWeight.Medium,
+                            color = TextPrimary
                         )
                     }
                 }
@@ -400,7 +422,7 @@ class PlayerActivity : ComponentActivity() {
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    // 线路切换
+                    // 线路无缝切换下拉菜单
                     if (streamsMap.isNotEmpty()) {
                         Surface(
                             onClick = { showLineDropdown = true },
@@ -444,13 +466,39 @@ class PlayerActivity : ComponentActivity() {
                                     onClick = {
                                         showLineDropdown = false
                                         currentLine = name
-                                        currentUrl = url
-                                        // 核心调用：stop -> setMediaItem -> setPlayWhenReady(true)
-                                        switchStreamSource(url, name)
+                                        // 核心调用：重载前显示 Loading UI -> resetPlayer() -> prepare() -> setPlayWhenReady(true)
+                                        switchStreamSource(url, name) {
+                                            isManualLoading = true
+                                        }
                                     }
                                 )
                             }
                         }
+                    }
+
+                    // 收藏星标按钮 (Room 本地数据库持久化)
+                    IconButton(
+                        onClick = {
+                            coroutineScope.launch {
+                                val newFav = recordRepository.toggleFavorite(recordKey)
+                                Toast.makeText(
+                                    this@PlayerActivity,
+                                    if (newFav) "已添加收藏 ⭐" else "已取消收藏",
+                                    Toast.LENGTH_SHORT
+                                ).show()
+                            }
+                        },
+                        modifier = Modifier
+                            .size(36.dp)
+                            .clip(CircleShape)
+                            .background(DarkSurface.copy(alpha = 0.75f))
+                    ) {
+                        Icon(
+                            imageVector = if (isFavorite) Icons.Default.Star else Icons.Default.StarBorder,
+                            contentDescription = if (isFavorite) "取消收藏" else "加入收藏",
+                            tint = if (isFavorite) Color(0xFFFFB800) else Color.White,
+                            modifier = Modifier.size(19.dp)
+                        )
                     }
 
                     // 旋转屏幕
@@ -496,43 +544,6 @@ class PlayerActivity : ComponentActivity() {
         }
     }
 
-    /**
-     * 核心实现：
-     * 显式通过 player.stop() 停止当前播放，在新流准备好后重置 MediaItem 并调用 player.setPlayWhenReady(true)，
-     * 彻底解决切换后的静音与卡顿问题。
-     */
-    private fun switchStreamSource(newUrl: String, lineName: String) {
-        val player = exoPlayer ?: return
-
-        // 步骤 1：显式通过 player.stop() 停止当前播放，释放解码硬件与音频缓存
-        player.stop()
-
-        // 步骤 2：重置 MediaItem
-        val mediaItem = MediaItem.Builder()
-            .setUri(newUrl)
-            .setLiveConfiguration(
-                MediaItem.LiveConfiguration.Builder()
-                    .setMaxPlaybackSpeed(1.05f)
-                    .setMinPlaybackSpeed(0.95f)
-                    .build()
-            )
-            .build()
-        player.setMediaItem(mediaItem, /* resetPosition = */ true)
-
-        // 步骤 3：准备播放器资源
-        player.prepare()
-
-        // 步骤 4：显式调用 setPlayWhenReady(true) 保证切流后立即发声起播
-        player.playWhenReady = true
-
-        // 步骤 5：确保音量恢复满格
-        player.volume = 1.0f
-    }
-
-    /**
-     * 修复息屏再开也要重载才行：
-     * 在 onResume 中检查流的活性，自动触发 prepare 与 setPlayWhenReady(true)
-     */
     override fun onResume() {
         super.onResume()
         exoPlayer?.let { player ->
@@ -551,7 +562,7 @@ class PlayerActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
-        exoPlayer?.stop()
+        resetPlayer()
         exoPlayer?.release()
         exoPlayer = null
         super.onDestroy()

@@ -44,7 +44,7 @@ class ExampleRobolectricTest {
 
     assertNotNull(engine.getPlayer())
 
-    // 线路切换无缝重载测试：显式 stop()，重置 MediaItem，setPlayWhenReady(true) 与音量 1.0f
+    // 线路切换无缝重载测试：显式 resetPlayer()，重置 MediaItem，setPlayWhenReady(true) 与音量 1.0f
     val testUrl = "https://example.com/live/stream.m3u8"
     engine.switchStreamSource(testUrl, "高清测试线")
 
@@ -53,6 +53,21 @@ class ExampleRobolectricTest {
     assertNotNull(player)
     assertTrue(player!!.playWhenReady)
     assertEquals(1.0f, player.volume, 0.01f)
+
+    engine.release()
+  }
+
+  @Test
+  fun `live player engine resetPlayer clears media items and stops`() {
+    val context = ApplicationProvider.getApplicationContext<Context>()
+    val engine = LivePlayerEngine(context)
+
+    val testUrl = "https://example.com/live/stream.m3u8"
+    engine.switchStreamSource(testUrl, "测试线")
+    assertEquals(1, engine.getPlayer()?.mediaItemCount)
+
+    engine.resetPlayer()
+    assertEquals(0, engine.getPlayer()?.mediaItemCount)
 
     engine.release()
   }
@@ -77,4 +92,49 @@ class ExampleRobolectricTest {
     val parsed = DouyinStreamResolver.extractRoomId(rawNumeric)
     assertEquals(rawNumeric, parsed)
   }
+
+  @Test
+  fun `room database persistence and favorite toggling`() = runBlocking {
+    val context = ApplicationProvider.getApplicationContext<Context>()
+    val inMemoryDb = androidx.room.Room.inMemoryDatabaseBuilder(context, com.example.data.db.AppDatabase::class.java)
+      .allowMainThreadQueries()
+      .build()
+    val dao = inMemoryDb.streamRecordDao()
+    val repo = com.example.data.db.StreamRecordRepository(dao)
+
+    // 1. 记录访问历史
+    repo.recordAccess(
+      roomId = "10443341948",
+      streamUrl = "https://example.com/live/10443341948.m3u8",
+      title = "官方直播间",
+      anchorName = "官方主播"
+    )
+
+    var record = dao.getRecordById("10443341948")
+    assertNotNull(record)
+    assertEquals("官方直播间", record?.title)
+    assertEquals("官方主播", record?.anchorName)
+    assertEquals(false, record?.isFavorite)
+
+    // 2. 切换收藏状态
+    val isFav = repo.toggleFavorite("10443341948")
+    assertTrue(isFav)
+    assertEquals(true, dao.getRecordById("10443341948")?.isFavorite)
+
+    // 3. 再次访问时更新标题与流地址，同时保持收藏状态不变 (向下兼容稳如磐石)
+    repo.recordAccess(
+      roomId = "10443341948",
+      streamUrl = "https://example.com/live/10443341948_new.m3u8",
+      title = "官方新直播间",
+      anchorName = "官方主播"
+    )
+    record = dao.getRecordById("10443341948")
+    assertNotNull(record)
+    assertEquals("官方新直播间", record?.title)
+    assertEquals("https://example.com/live/10443341948_new.m3u8", record?.streamUrl)
+    assertEquals(true, record?.isFavorite) // 收藏状态完好保持
+
+    inMemoryDb.close()
+  }
 }
+
