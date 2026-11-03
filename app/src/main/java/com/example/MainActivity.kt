@@ -113,7 +113,16 @@ class MainActivity : ComponentActivity() {
                 })();
             """.trimIndent()
             webView?.evaluateJavascript(js, null)
+            webView?.post {
+                webView?.setInitialScale(0)
+                webView?.requestLayout()
+                webView?.invalidate()
+            }
             webView?.postDelayed({
+                webView?.evaluateJavascript(
+                    "(function() { window.scrollTo(0, 0); window.dispatchEvent(new Event('resize')); })();",
+                    null
+                )
                 updatePipParams()
             }, 300)
         }
@@ -201,6 +210,7 @@ class MainActivity : ComponentActivity() {
 
         requestAppAudioFocus()
         updateKeepScreenOn(preferences.keepScreenOn)
+        checkAndPerformAutoCacheCleanup()
 
         fileChooserLauncher =
             registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
@@ -217,6 +227,43 @@ class MainActivity : ComponentActivity() {
         setContent {
             MyApplicationTheme {
                 MainAppScreen()
+            }
+        }
+    }
+
+    /**
+     * 自动定期巡检与缓存清理守护：
+     * 每24小时自动巡检并清理过期临时网络分片，在IO线程平滑执行，保持应用轻盈疾速
+     */
+    private fun checkAndPerformAutoCacheCleanup() {
+        if (preferences.shouldAutoClearCache()) {
+            lifecycleScope.launch(Dispatchers.IO) {
+                try {
+                    cacheDir?.listFiles()?.forEach { file ->
+                        try {
+                            file.deleteRecursively()
+                        } catch (e: Exception) {
+                            e.printStackTrace()
+                        }
+                    }
+                    codeCacheDir?.listFiles()?.forEach { file ->
+                        try {
+                            file.deleteRecursively()
+                        } catch (e: Exception) {
+                            e.printStackTrace()
+                        }
+                    }
+                    preferences.recordCacheCleared()
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                }
+                launch(Dispatchers.Main) {
+                    try {
+                        webView?.clearCache(true)
+                    } catch (e: Exception) {
+                        e.printStackTrace()
+                    }
+                }
             }
         }
     }
@@ -279,6 +326,7 @@ class MainActivity : ComponentActivity() {
         var isDesktopUa by remember { mutableStateOf(preferences.isDesktopUa) }
         var forceLandscape by remember { mutableStateOf(preferences.forceLandscape) }
         var fullscreenMode by remember { mutableStateOf(preferences.fullscreenOrientationMode) }
+        var autoClearCacheEnabled by remember { mutableStateOf(preferences.autoClearCacheEnabled) }
 
         var isCustomViewActive by remember { mutableStateOf(false) }
 
@@ -454,7 +502,7 @@ class MainActivity : ComponentActivity() {
                                 error: SslError?
                             ) {
                                 val host = Uri.parse(error?.url ?: "").host ?: ""
-                                if (host.contains("fuxiaoya.com") || host.contains("douyin.com") || host.contains("bytevod.com")) {
+                                if (host.contains("fuxiaoya.com") || host.contains("whomao.com") || host.contains("douyin.com") || host.contains("bytevod.com")) {
                                     handler?.proceed()
                                 } else {
                                     handler?.proceed()
@@ -916,6 +964,11 @@ class MainActivity : ComponentActivity() {
                     currentUrl = newUrl
                     showBottomSheet = false
                     webView?.loadUrl(newUrl)
+                },
+                autoClearCacheEnabled = autoClearCacheEnabled,
+                onAutoClearCacheToggle = { enabled ->
+                    autoClearCacheEnabled = enabled
+                    preferences.autoClearCacheEnabled = enabled
                 }
             )
         }
@@ -1098,6 +1151,36 @@ class MainActivity : ComponentActivity() {
                     if (style && style.parentNode) {
                         style.parentNode.removeChild(style);
                     }
+
+                    // 彻底重置页面缩放、视口与宽度，杜绝退出画中画后网页内容超出 APP 视窗
+                    try {
+                        document.documentElement.style.width = '100vw';
+                        document.documentElement.style.maxWidth = '100vw';
+                        document.documentElement.style.overflowX = 'hidden';
+                        document.body.style.width = '100vw';
+                        document.body.style.maxWidth = '100vw';
+                        document.body.style.overflowX = 'hidden';
+
+                        var meta = document.querySelector('meta[name="viewport"]');
+                        if (meta) {
+                            var oldContent = meta.getAttribute('content');
+                            meta.setAttribute('content', 'width=device-width,initial-scale=1.0,maximum-scale=1.0,minimum-scale=1.0,user-scalable=no,viewport-fit=cover');
+                            setTimeout(function() {
+                                meta.setAttribute('content', oldContent || 'width=device-width,initial-scale=1,viewport-fit=cover');
+                                document.documentElement.style.removeProperty('width');
+                                document.documentElement.style.removeProperty('max-width');
+                                document.documentElement.style.removeProperty('overflow-x');
+                                document.body.style.removeProperty('width');
+                                document.body.style.removeProperty('max-width');
+                                document.body.style.removeProperty('overflow-x');
+                            }, 150);
+                        }
+                        window.scrollTo(0, 0);
+                        document.documentElement.style.zoom = '1';
+                        document.body.style.zoom = '1';
+                        window.dispatchEvent(new Event('resize'));
+                    } catch(err) {}
+
                     var v = document.getElementById('video') || document.querySelector('video');
                     if (v && v.paused) v.play().catch(function(){});
                 };
@@ -1418,6 +1501,10 @@ class MainActivity : ComponentActivity() {
         settings.mediaPlaybackRequiresUserGesture = false
         settings.useWideViewPort = true
         settings.loadWithOverviewMode = true
+        settings.setSupportZoom(false)
+        settings.builtInZoomControls = false
+        settings.displayZoomControls = false
+        settings.textZoom = 100
         settings.cacheMode = WebSettings.LOAD_DEFAULT
         settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
         settings.allowFileAccess = false
@@ -1430,8 +1517,23 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            if (!isInPictureInPictureMode && pipModeState.value) {
+                pipModeState.value = false
+                webView?.evaluateJavascript(
+                    "(function() { if (window.__exitPipIsolation) window.__exitPipIsolation(); })();",
+                    null
+                )
+                webView?.post {
+                    webView?.setInitialScale(0)
+                    webView?.requestLayout()
+                    webView?.invalidate()
+                }
+            }
+        }
         webView?.onResume()
         resumeLiveStreamOnScreenOn()
+        checkAndPerformAutoCacheCleanup()
     }
 
     override fun onPause() {

@@ -17,7 +17,10 @@ class LivePreferences(context: Context) {
         private const val KEY_FORCE_LANDSCAPE = "force_landscape"
         private const val KEY_FULLSCREEN_ORIENTATION = "fullscreen_orientation"
         private const val KEY_HISTORY_URLS = "history_urls"
+        private const val KEY_AUTO_CLEAR_CACHE = "auto_clear_cache"
+        private const val KEY_LAST_CLEAR_CACHE_TIME = "last_clear_cache_time"
         const val MAX_HISTORY_URLS = 5
+        const val AUTO_CLEAR_CACHE_INTERVAL_MS = 24 * 60 * 60 * 1000L // 24小时自动清理周期
     }
 
     var targetUrl: String
@@ -82,4 +85,28 @@ class LivePreferences(context: Context) {
     var fullscreenOrientationMode: Int
         get() = prefs.getInt(KEY_FULLSCREEN_ORIENTATION, 0)
         set(value) = prefs.edit().putInt(KEY_FULLSCREEN_ORIENTATION, value).apply()
+
+    var autoClearCacheEnabled: Boolean
+        get() = prefs.getBoolean(KEY_AUTO_CLEAR_CACHE, true)
+        set(value) = prefs.edit().putBoolean(KEY_AUTO_CLEAR_CACHE, value).apply()
+
+    var lastClearCacheTime: Long
+        get() = prefs.getLong(KEY_LAST_CLEAR_CACHE_TIME, 0L)
+        set(value) = prefs.edit().putLong(KEY_LAST_CLEAR_CACHE_TIME, value).apply()
+
+    /**
+     * 判定是否达到 24 小时定期自动清理缓存周期
+     */
+    fun shouldAutoClearCache(): Boolean {
+        if (!autoClearCacheEnabled) return false
+        val now = System.currentTimeMillis()
+        return (now - lastClearCacheTime) >= AUTO_CLEAR_CACHE_INTERVAL_MS
+    }
+
+    /**
+     * 记录本次完成缓存清理的时间戳
+     */
+    fun recordCacheCleared() {
+        lastClearCacheTime = System.currentTimeMillis()
+    }
 }

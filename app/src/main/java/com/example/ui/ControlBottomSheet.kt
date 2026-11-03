@@ -43,7 +43,9 @@ fun ControlBottomSheet(
     onLaunchNativePlayer: () -> Unit = {},
     onEnterPip: () -> Unit = {},
     onCheckUpdate: () -> Unit = {},
-    onSwitchLine: (String) -> Unit = {}
+    onSwitchLine: (String) -> Unit = {},
+    autoClearCacheEnabled: Boolean = true,
+    onAutoClearCacheToggle: (Boolean) -> Unit = {}
 ) {
     ModalBottomSheet(
         onDismissRequest = onDismissRequest,
@@ -330,6 +332,14 @@ fun ControlBottomSheet(
                     subtitle = "切换为PC桌面UA，适合平板宽屏多列中控布局",
                     checked = isDesktopUa,
                     onCheckedChange = onDesktopUaToggle
+                )
+
+                SettingSwitchRow(
+                    icon = Icons.Default.DeleteSweep,
+                    title = "定期自动巡检清理缓存 (24小时)",
+                    subtitle = "每24小时自动巡检并清理过期临时网络分片，保持应用轻盈疾速",
+                    checked = autoClearCacheEnabled,
+                    onCheckedChange = onAutoClearCacheToggle
                 )
             }
 
