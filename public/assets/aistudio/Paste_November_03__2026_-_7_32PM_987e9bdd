@@ -1,0 +1,1846 @@
+/**
+ * 抖音直播工作台播放核心 v1.0.0
+ */
+
+const AVATAR_PLACEHOLDER = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 40 40'%3E%3Crect fill='%23222' width='40' height='40'/%3E%3C/svg%3E";
+
+// 播放库按需加载：主程序启动不依赖 CDN；主源失败/超时自动切备用源。
+const LIB_SOURCES = {
+  Hls: [
+    'https://cdn.jsdelivr.net/npm/hls.js@1.5.8/dist/hls.min.js',
+    'https://unpkg.com/hls.js@1.5.8/dist/hls.min.js'
+  ],
+  mpegts: [
+    'https://cdn.jsdelivr.net/npm/mpegts.js@1.7.3/dist/mpegts.js',
+    'https://unpkg.com/mpegts.js@1.7.3/dist/mpegts.js'
+  ]
+};
+const LIB_TIMEOUT_MS = 10000;
+const libPending = {};
+
+function loadLib(name) {
+  if (window[name]) return Promise.resolve(true);
+  if (libPending[name]) return libPending[name];
+  const urls = LIB_SOURCES[name] || [];
+  libPending[name] = (async () => {
+    for (const url of urls) {
+      const loaded = await new Promise(resolve => {
+        let done = false;
+        const finish = ok => { if (!done) { done = true; clearTimeout(timer); resolve(ok); } };
+        const timer = setTimeout(() => finish(false), LIB_TIMEOUT_MS);
+        const el = document.createElement('script');
+        el.async = true;
+        el.src = url;
+        el.onload = () => finish(!!window[name]);
+        el.onerror = () => finish(false);
+        document.head.appendChild(el);
+      });
+      if (loaded || window[name]) return true;
+    }
+    delete libPending[name];   // 全部失败：允许之后再次尝试
+    return false;
+  })();
+  return libPending[name];
+}
+
+class LiveWorkbench {
+  constructor() {
+    this.storageKey = 'dy_workbench_channels_v2';
+    this.channels = [];
+    this.activeRid = null;
+    this.currentStreamData = null;
+    this.playerInstance = null;
+    this.probeTimer = null;
+    this.probeInFlight = false;
+    this.probeQueued = false;
+    this.retryCount = 0;
+    this.maxRetry = 3;
+
+    // 新增状态
+    this.prefsKey = 'dy_workbench_prefs_v1';
+    this.prefs = { proto: '', quality: '' };
+    this.playToken = 0;                 // 防止快速切台时旧请求覆盖新频道
+    this.retryTimer = null;
+    this.streamCache = new Map();       // rid -> { data, ts }
+    this.streamCacheTtl = 20000;        // 与 live.php 的 TTL_LIVE(20s) 保持一致
+    this.itemEls = new Map();           // rid -> <li>，用于增量渲染
+    this.listBusy = false;              // 用户正按压列表时暂缓自动重排，防止误点
+    this.listBusyTimer = null;
+    this.listRenderPending = false;
+    this.lastProbeAt = 0;
+    this.visibilityBound = false;
+    this.firstProbePurged = false;      // 启动后首轮成功探活时，清理一次已下播的一次性主播
+    this.startupPurged = 0;
+    // 秒开：第 1 层 = 内存（snapMem / streamCache），第 2 层 = 本地存储快照
+    this.snapKey = 'dy_workbench_snap_v1';       // 历史标题/头像（长期）
+    this.streamKey = 'dy_workbench_stream_v1';   // 取流结果（仅 20 秒内有效，最多 4 条）
+    this.snapMem = new Map();
+    this.snapTimer = null;
+    this.exportBlobUrl = '';
+    this.libGaveUp = {};                // 某播放库所有源均加载失败后，退回原有降级路径，避免循环等待
+
+    this.applyInputMode();
+    this.cacheElements();
+    this.loadPrefs();
+    this.loadSnapshots();
+    this.loadStreamLayer();
+    this.initStorage();
+    this.bindEvents();
+    this.bindKeyboardShortcuts();
+    this.renderList();
+    if (this.startupPurged > 0) this.toast(`已自动清理 ${this.startupPurged} 个已下播的一次性主播`);
+
+    if (this.channels.length > 0) {
+      // 列表已按“在线优先”排序，首个即最优候选（在线频道 > 待核验 > 离线）。
+      const target = this.getSortedChannels()[0];
+      this.playChannel(target.rid, false);
+    } else {
+      this.setMask(true, '请选择直播间', false, false);
+    }
+    this.startProbeScheduler();
+  }
+
+  /* ===== 输入环境识别：电脑端才显示键盘快捷键说明 ===== */
+  detectDesktopInput() {
+    let fine = true;
+    try {
+      if (typeof window.matchMedia === 'function') {
+        fine = window.matchMedia('(hover: hover) and (pointer: fine)').matches;
+      }
+    } catch { fine = true; }
+    const ua = navigator.userAgent || '';
+    const mobileUA = /Android|iPhone|iPad|iPod|Mobile|HarmonyOS|Windows Phone|BlackBerry|Opera Mini|IEMobile/i.test(ua);
+    const iPadOS = /Macintosh/i.test(ua) && (navigator.maxTouchPoints || 0) > 1;
+    return fine && !mobileUA && !iPadOS;
+  }
+
+  applyInputMode() {
+    const apply = () => {
+      document.documentElement.setAttribute('data-input', this.detectDesktopInput() ? 'desktop' : 'touch');
+    };
+    apply();
+    try {
+      const mql = window.matchMedia('(hover: hover) and (pointer: fine)');
+      if (mql.addEventListener) mql.addEventListener('change', apply);
+      else if (mql.addListener) mql.addListener(apply);
+    } catch {}
+  }
+
+  /* ===== 用户偏好（协议 / 清晰度）持久化 ===== */
+  loadPrefs() {
+    try {
+      const raw = localStorage.getItem(this.prefsKey);
+      const parsed = raw ? JSON.parse(raw) : null;
+      if (parsed && typeof parsed === 'object') {
+        if (parsed.proto === 'hls' || parsed.proto === 'flv') this.prefs.proto = parsed.proto;
+        if (typeof parsed.quality === 'string' && /^[A-Za-z0-9_-]{1,20}$/.test(parsed.quality)) this.prefs.quality = parsed.quality;
+      }
+    } catch {}
+    if (this.prefs.proto && this.protoSel) this.protoSel.value = this.prefs.proto;
+  }
+
+  savePrefs() {
+    try {
+      localStorage.setItem(this.prefsKey, JSON.stringify(this.prefs));
+    } catch {}
+  }
+
+  /* ===== 列表排序：在线靠前 → 待核验 → 离线靠后（同级保持原有顺序，仅影响显示，不改动存储顺序） ===== */
+  getSortedChannels() {
+    const rank = c => (c.isLive ? 0 : (c.statusKnown === false ? 1 : 2));
+    return this.channels
+      .map((c, i) => ({ c, i, r: rank(c) }))
+      .sort((a, b) => (a.r - b.r) || (a.i - b.i))
+      .map(x => x.c);
+  }
+
+  /* ===== 取流结果短时缓存：内存 + 本地存储（跨刷新），TTL 与 live.php 对齐 ===== */
+  isSafeAvatar(a) {
+    return typeof a === 'string' && a.length > 0 && a.length <= 500
+      && (/^https?:\/\/[^\s"'<>`]+$/i.test(a) || /^data:image\/(?:png|jpe?g|gif|webp);base64,[A-Za-z0-9+/=]+$/i.test(a));
+  }
+
+  getCachedStream(rid) {
+    const hit = this.streamCache.get(rid);
+    if (!hit) return null;
+    if (Date.now() - hit.ts > this.streamCacheTtl) {
+      this.streamCache.delete(rid);
+      return null;
+    }
+    return hit.data;
+  }
+
+  setCachedStream(rid, data) {
+    this.streamCache.set(rid, { data, ts: Date.now() });
+    if (this.streamCache.size > 30) {
+      const oldest = this.streamCache.keys().next().value;
+      this.streamCache.delete(oldest);
+    }
+    this.persistStreamLayer();
+  }
+
+  dropCachedStream(rid) {
+    if (this.streamCache.delete(rid)) this.persistStreamLayer();
+  }
+
+  // 从本地存储读回的数据一律重新校验，字段与协议不合规即丢弃，绝不把未校验内容交给播放器。
+  sanitizeStreamData(d) {
+    if (!d || typeof d !== 'object' || Number(d.code) !== 200 || !d.streams || typeof d.streams !== 'object') return null;
+    const okUrl = u => typeof u === 'string' && u.length <= 2048 && /^https?:\/\/[^\s"'<>`]+$/i.test(u);
+    const streams = {};
+    Object.keys(d.streams).slice(0, 12).forEach(k => {
+      const v = d.streams[k];
+      if (!/^[A-Za-z0-9_-]{1,20}$/.test(k) || !v || typeof v !== 'object') return;
+      const entry = { name: typeof v.name === 'string' ? v.name.slice(0, 40) : k };
+      if (okUrl(v.flv)) entry.flv = v.flv;
+      if (okUrl(v.hls)) entry.hls = v.hls;
+      if (entry.flv || entry.hls) streams[k] = entry;
+    });
+    if (Object.keys(streams).length === 0) return null;
+    return {
+      code: 200,
+      web_rid: String(d.web_rid || ''),
+      anchor_name: typeof d.anchor_name === 'string' ? d.anchor_name.slice(0, 50) : '',
+      title: typeof d.title === 'string' ? d.title.slice(0, 100) : '',
+      avatar: this.isSafeAvatar(d.avatar) ? d.avatar : '',
+      streams
+    };
+  }
+
+  persistStreamLayer() {
+    try {
+      const now = Date.now();
+      const items = [];
+      this.streamCache.forEach((v, rid) => {
+        if (now - v.ts <= this.streamCacheTtl) items.push([rid, { ts: v.ts, d: v.data }]);
+      });
+      const recent = items.slice(-4);
+      if (recent.length === 0) localStorage.removeItem(this.streamKey);
+      else localStorage.setItem(this.streamKey, JSON.stringify({ v: 1, items: recent }));
+    } catch {}
+  }
+
+  loadStreamLayer() {
+    try {
+      const parsed = JSON.parse(localStorage.getItem(this.streamKey) || 'null');
+      if (!parsed || parsed.v !== 1 || !Array.isArray(parsed.items)) return;
+      const now = Date.now();
+      parsed.items.slice(0, 4).forEach(it => {
+        if (!Array.isArray(it) || it.length !== 2) return;
+        const rid = String(it[0]);
+        const ts = it[1] && Number(it[1].ts);
+        if (!/^\d{3,22}$/.test(rid) || !Number.isFinite(ts) || ts > now + 5000 || now - ts > this.streamCacheTtl) return;
+        const data = this.sanitizeStreamData(it[1].d);
+        if (data) this.streamCache.set(rid, { data, ts });
+      });
+    } catch {}
+  }
+
+  /* ===== 历史标题 / 头像快照：切台即刻呈现，不依赖网络 ===== */
+  snapGet(rid) {
+    return this.snapMem.get(String(rid)) || null;
+  }
+
+  snapSet(rid, info) {
+    rid = String(rid);
+    if (!/^\d{3,22}$/.test(rid) || !info) return;
+    const old = this.snapMem.get(rid) || { n: '', t: '', a: '' };
+    const next = { n: old.n, t: old.t, a: old.a, ts: Date.now() };
+    const n = typeof info.n === 'string' ? info.n.trim() : '';
+    const t = typeof info.t === 'string' ? info.t.trim() : '';
+    if (n && !this.isPlaceholderName(n, rid)) next.n = n.slice(0, 50);
+    if (t && !this.isPlaceholderTitle(t)) next.t = t.slice(0, 100);
+    if (this.isSafeAvatar(info.a)) next.a = info.a;
+    if (next.n === old.n && next.t === old.t && next.a === old.a) return;   // 无变化：不写盘
+    this.snapMem.delete(rid);
+    this.snapMem.set(rid, next);
+    while (this.snapMem.size > 80) this.snapMem.delete(this.snapMem.keys().next().value);
+    this.scheduleSnapPersist();
+  }
+
+  snapDrop(rid) {
+    if (this.snapMem.delete(String(rid))) this.scheduleSnapPersist();
+  }
+
+  scheduleSnapPersist() {
+    clearTimeout(this.snapTimer);
+    this.snapTimer = setTimeout(() => {
+      try {
+        localStorage.setItem(this.snapKey, JSON.stringify({ v: 1, items: Array.from(this.snapMem.entries()) }));
+      } catch {}
+    }, 800);
+  }
+
+  loadSnapshots() {
+    try {
+      const parsed = JSON.parse(localStorage.getItem(this.snapKey) || 'null');
+      if (!parsed || parsed.v !== 1 || !Array.isArray(parsed.items)) return;
+      parsed.items.slice(-80).forEach(it => {
+        if (!Array.isArray(it) || it.length !== 2 || !it[1] || typeof it[1] !== 'object') return;
+        const rid = String(it[0]);
+        if (!/^\d{3,22}$/.test(rid)) return;
+        this.snapMem.set(rid, {
+          n: typeof it[1].n === 'string' ? it[1].n.slice(0, 50) : '',
+          t: typeof it[1].t === 'string' ? it[1].t.slice(0, 100) : '',
+          a: this.isSafeAvatar(it[1].a) ? it[1].a : '',
+          ts: Number(it[1].ts) || 0
+        });
+      });
+    } catch {}
+  }
+
+  showPoster(avatar) {
+    if (!this.stage) return;
+    if (this.isSafeAvatar(avatar)) {
+      this.stage.style.setProperty('--poster', `url(${JSON.stringify(avatar)})`);
+      this.stage.classList.add('has-poster');
+    } else {
+      this.stage.classList.remove('has-poster');
+    }
+  }
+
+  // 精选常驻全天候直播预设清单
+  getDefaultChannels() {
+    return [
+      {
+        rid: "127453393722",
+        name: "央视网快看",
+        avatar: "https://p11.douyinpic.com/aweme/100x100/aweme-avatar/tos-cn-avt-0015_9f9763d9e7dee65a1aab0367eb18fbf7.jpeg?from=3067671334",
+        title: "总台央视新闻频道正在播出",
+        isLive: true
+      },
+      {
+        rid: "232551178364",
+        name: "电影频道云影院",
+        avatar: "https://p11.douyinpic.com/aweme/100x100/aweme-avatar/tos-cn-i-0813c001_oUFo1iCeNB1CQEAdbgAGABo1EfLE6nAiVpIArA.jpeg?from=3067671334",
+        title: "直播丨𝐂𝐂𝐓𝐕𝟔电影频道🎬",
+        isLive: true
+      },
+      {
+        rid: "50828500437",
+        name: "央视频",
+        avatar: "https://p3.douyinpic.com/aweme/100x100/aweme-avatar/douyin-user-private-image_d3bd1f1f37aab2648c3983977878aa84_1129948451452958.jpeg?from=3067671334",
+        title: "新闻正在直播",
+        isLive: true
+      },
+      {
+        rid: "662843050230",
+        name: "央视文艺",
+        avatar: "https://p3.douyinpic.com/aweme/100x100/aweme-avatar/tos-cn-avt-0015_5ccbed59fefa7532c128978954f8ee1c.jpeg?from=3067671334",
+        title: "金秋综艺特辑",
+        isLive: false
+      },
+      {
+        rid: "971054279946",
+        name: "央视网美学",
+        avatar: "https://p11.douyinpic.com/aweme/100x100/aweme-avatar/tos-cn-avt-0015_38ef7871eadde681c4ebd394980e96be.jpeg?from=3067671334",
+        title: "央视纪录片频道直播",
+        isLive: false
+      },
+      {
+        rid: "296728101980",
+        name: "央视网财经",
+        avatar: "https://p3.douyinpic.com/aweme/100x100/aweme-avatar/douyin-user-private-image_720916559455351_3f464b16c37ad87ab87bed82636eb7f45a2e4c32c374bbf5b78cf69c95453bab.jpeg?from=3067671334",
+        title: "央视财经频道节目直播",
+        isLive: false
+      },
+      {
+        rid: "783811579858",
+        name: "央视三农",
+        title: "CCTV-17节目真好看！",
+        avatar: "https://p11.douyinpic.com/aweme/100x100/aweme-avatar/tos-cn-avt-0015_e09edb984889a1774ab8c954991ba986.jpeg?from=3067671334",
+        isLive: true,
+      },
+      {
+        rid: "193671986973",
+        name: "安静听歌（24小时听歌）",
+        avatar: "https://p11.douyinpic.com/aweme/100x100/aweme-avatar/tos-cn-avt-0015_168266fd62fc19e0f60b1dffea96e55a.jpeg?from=3067671334",
+        title: "热门流行伤感经典好听伤感怀旧音乐老歌1000首！",
+        isLive: true
+      }
+    ];
+  }
+
+  cacheElements() {
+    this.curAvatar = document.getElementById('curAvatar');
+    this.curName = document.getElementById('curName');
+    this.curTitle = document.getElementById('curTitle');
+    this.reloadBtn = document.getElementById('reloadBtn');
+    this.stage = document.getElementById('stage');
+    this.video = document.getElementById('video');
+    this.mask = document.getElementById('mask');
+    this.spinner = document.getElementById('spinner');
+    this.maskText = document.getElementById('maskText');
+    this.retryBtn = document.getElementById('retryBtn');
+    this.unmuteBtn = document.getElementById('unmuteBtn');
+    this.protoSel = document.getElementById('protoSel');
+    this.qualSel = document.getElementById('qualSel');
+    this.pipBtn = document.getElementById('pipBtn');
+    this.fsBtn = document.getElementById('fsBtn');
+    this.count = document.getElementById('count');
+    this.exportBtn = document.getElementById('exportBtn');
+    this.importBtn = document.getElementById('importBtn');
+    this.addForm = document.getElementById('addForm');
+    this.q = document.getElementById('q');
+    this.list = document.getElementById('list');
+    this.toasts = document.getElementById('toasts');
+    this.file = document.getElementById('file');
+    this.dlg = document.getElementById('dlg');
+    this.dlgMsg = document.getElementById('dlgMsg');
+
+    // 删除确认与多格式导出组件
+    this.deleteDlg = document.getElementById('deleteDlg');
+    this.deleteMsg = document.getElementById('deleteMsg');
+    this.exportDlg = document.getElementById('exportDlg');
+    this.exportFormat = document.getElementById('exportFormat');
+    this.onceDlg = document.getElementById('onceDlg');
+    this.onceDlgMsg = document.getElementById('onceDlgMsg');
+    this.exportDoneDlg = document.getElementById('exportDoneDlg');
+    this.exportDoneName = document.getElementById('exportDoneName');
+    this.exportDonePath = document.getElementById('exportDonePath');
+    this.exportDoneMeta = document.getElementById('exportDoneMeta');
+    this.exportDoneTip = document.getElementById('exportDoneTip');
+
+    // 远程导入组件
+    this.remoteImportBtn = document.getElementById('remoteImportBtn');
+    this.remoteDlg = document.getElementById('remoteDlg');
+    this.remoteForm = document.getElementById('remoteForm');
+    this.remoteUrlInput = document.getElementById('remoteUrlInput');
+    this.remoteCancelBtn = document.getElementById('remoteCancelBtn');
+
+    // 功能说明及帮助组件
+    this.helpBtn = document.getElementById('helpBtn');
+    this.helpDlg = document.getElementById('helpDlg');
+    this.helpCloseBtn = document.getElementById('helpCloseBtn');
+    this.helpOkBtn = document.getElementById('helpOkBtn');
+  }
+
+  initStorage() {
+    try {
+      const raw = localStorage.getItem(this.storageKey);
+      const defaults = this.getDefaultChannels();
+
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          // 对旧版本地数据进行归一化，避免被篡改的属性进入 HTML 模板。
+          let normalized = parsed.map(item => this.sanitizeChannel(item)).filter(Boolean);
+          // 安全网：上次关闭时若已确认下播的一次性主播（如浏览器被系统直接结束，未触发 pagehide），此处补删。
+          const before = normalized.length;
+          normalized = normalized.filter(item => !this.isPurgeable(item));
+          this.startupPurged = before - normalized.length;
+          const existingRids = new Set(normalized.map(item => item.rid));
+          const toAppend = defaults.filter(d => !existingRids.has(String(d.rid)));
+          this.channels = [...normalized, ...toAppend];
+        } else {
+          this.channels = defaults;
+        }
+      } else {
+        this.channels = defaults;
+      }
+      this.saveChannels(false);
+    } catch {
+      this.channels = this.getDefaultChannels();
+      this.saveChannels(false);
+    }
+  }
+
+  updateCount(animate = true) {
+    if (!this.count) return;
+    const current = String(this.channels.length);
+    if (this.count.textContent !== current) {
+      this.count.textContent = current;
+      if (animate) {
+        this.count.classList.remove('bump');
+        void this.count.offsetWidth;
+        this.count.classList.add('bump');
+        setTimeout(() => this.count.classList.remove('bump'), 260);
+      }
+    }
+  }
+
+  /* ===== 一次性主播（短链接 / 口令）管理 ===== */
+  // 判定：解析出的是临时 room_id（≥15 位，与 live.php 的 room_id 判定一致），且来源为
+  // 短链接 / 口令 / 15 位以上的纯数字房间号（如 19 位）。
+  // live.douyin.com / follow/live 链接，以及解析为短 web_rid（<15 位）的结果为长期有效，不判定为一次性。
+  isOneTimeSource(inputText, rid) {
+    const id = String(rid || '');
+    if (!/^\d{15,22}$/.test(id)) return false;
+    const t = String(inputText || '').trim();
+    if (!/v\.douyin\.com\//i.test(t) && /(?:live\.douyin\.com\/|follow\/live\/)\d{3,22}/i.test(t)) return false;
+    return true;
+  }
+
+  // 可清理：一次性 + 已确认下播（待核验状态不动，避免误删）
+  isPurgeable(c) {
+    return !!c && c.ephemeral === true && !c.isLive && c.statusKnown !== false;
+  }
+
+  // 只写存储、不改内存：用于 pagehide / 切后台。bfcache 恢复或用户立刻返回时界面不受影响。
+  persistWithoutEphemeralOffline() {
+    try {
+      if (!Array.isArray(this.channels) || !this.channels.some(c => this.isPurgeable(c))) return;
+      const kept = this.channels.filter(c => !this.isPurgeable(c));
+      localStorage.setItem(this.storageKey, JSON.stringify(kept));
+    } catch {}
+  }
+
+  // 立即从内存与存储中清理（启动后首轮探活确认时使用），返回清理数量
+  purgeEphemeralOffline() {
+    const doomed = this.channels.filter(c => this.isPurgeable(c));
+    if (doomed.length === 0) return 0;
+    const ids = new Set(doomed.map(c => c.rid));
+    this.channels = this.channels.filter(c => !ids.has(c.rid));
+    ids.forEach(rid => { this.dropCachedStream(rid); this.snapDrop(rid); });
+    if (this.activeRid && ids.has(this.activeRid)) {
+      this.playToken++;
+      clearTimeout(this.retryTimer);
+      this.activeRid = null;
+      this.currentStreamData = null;
+      this.destroyPlayer();
+      this.resetQualityOptions();
+      this.curName.textContent = '请选择直播间';
+      this.curTitle.textContent = '从列表中点击一个频道开始观看';
+      this.curAvatar.removeAttribute('src');
+      this.setMask(true, '请选择左侧频道', false, false);
+    }
+    this.saveChannels(true);
+    this.renderList();
+    this.toast(`已自动清理 ${doomed.length} 个已下播的一次性主播`);
+    return doomed.length;
+  }
+
+  showOnceNotice(name) {
+    if (!this.onceDlg) return;
+    if (this.onceDlgMsg) this.onceDlgMsg.textContent = name ? `「${name}」已添加。` : '';
+    this.onceDlg.returnValue = '';
+    try {
+      if (!this.onceDlg.open) this.onceDlg.showModal();
+    } catch {}
+  }
+
+  saveChannels(animate = true) {
+    try {
+      localStorage.setItem(this.storageKey, JSON.stringify(this.channels));
+    } catch (e) {
+      this.toast('本地存储容量超限');
+    }
+    this.updateCount(animate);
+  }
+
+  async safeFetchJson(url, timeoutMs = 30000) {
+    // 超时保护：避免网络挂起导致探活锁（probeInFlight）永久占用或界面一直转圈。
+    const ctrl = typeof AbortController === 'function' ? new AbortController() : null;
+    const timer = ctrl ? setTimeout(() => ctrl.abort(), timeoutMs) : null;
+    try {
+      const res = await fetch(url, ctrl ? { signal: ctrl.signal } : undefined);
+      const text = await res.text();
+      try {
+        return JSON.parse(text);
+      } catch (err) {
+        const cleanErr = text.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 80);
+        throw new Error(cleanErr || '服务端未响应标准 JSON 数据');
+      }
+    } catch (err) {
+      if (err && err.name === 'AbortError') throw new Error('请求超时，请检查网络后重试');
+      throw err;
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  showToast(msg, btnText = null, cb = null, duration = 3200) {
+    const el = document.createElement('div');
+    el.className = 'toast';
+    el.textContent = msg;
+
+    if (btnText && typeof cb === 'function') {
+      const b = document.createElement('button');
+      b.textContent = btnText;
+      b.onclick = () => { cb(); el.remove(); };
+      el.appendChild(b);
+    }
+
+    this.toasts.appendChild(el);
+    requestAnimationFrame(() => el.classList.add('show'));
+    setTimeout(() => {
+      el.classList.remove('show');
+      setTimeout(() => el.remove(), 300);
+    }, duration);
+  }
+
+  toast(m, duration) { this.showToast(m, null, null, duration || 3200); }
+
+  setMask(show, text = '', canRetry = false, isBuffering = false) {
+    if (!show) {
+      this.mask.hidden = true;
+      this.mask.classList.remove('buffering');
+      if (this.stage) this.stage.classList.remove('has-poster');   // 画面已出/遮罩撤下，海报同步撤下
+      return;
+    }
+    this.mask.hidden = false;
+    if (isBuffering) {
+      this.mask.classList.add('buffering');
+    } else {
+      this.mask.classList.remove('buffering');
+    }
+    this.spinner.hidden = !text.includes('正在') && !text.includes('缓冲');
+    this.maskText.textContent = text;
+    this.retryBtn.hidden = !canRetry;
+  }
+
+  /* 单个频道行：DOM API 构建（天然防注入），结构与 class 名与旧版模板保持一致 */
+  buildChannelItem(rid) {
+    const li = document.createElement('li');
+    li.className = 'ch';
+    li.dataset.rid = rid;
+
+    const box = document.createElement('div');
+    box.className = 'ch-avatar-box';
+    const img = document.createElement('img');
+    img.alt = '';
+    img.loading = 'lazy';
+    img.decoding = 'async';
+    img.addEventListener('error', () => {
+      if (img.dataset.fb !== '1') {
+        img.dataset.fb = '1';
+        img.src = AVATAR_PLACEHOLDER;
+      }
+    });
+    const dot = document.createElement('span');
+    box.append(img, dot);
+
+    const names = document.createElement('div');
+    names.className = 'names';
+    const n = document.createElement('div');
+    n.className = 'n';
+    const nm = document.createElement('span');
+    nm.className = 'nm';
+    const tag = document.createElement('span');
+    const once = document.createElement('span');
+    n.append(nm, tag, once);
+    const info = document.createElement('div');
+    info.className = 'i';
+    names.append(n, info);
+
+    const del = document.createElement('button');
+    del.className = 'del';
+    del.dataset.del = rid;
+    del.setAttribute('aria-label', '删除频道');
+    del.title = '删除频道';
+    del.textContent = '✕';
+
+    li.append(box, names, del);
+    li._refs = { img, dot, nm, tag, once, info };
+    return li;
+  }
+
+  updateChannelItem(li, c) {
+    const active = c.rid === this.activeRid;
+    const checking = c.statusKnown === false;
+    const name = c.name || ('房间 ' + c.rid);
+    const infoText = c.title || (checking ? '直播资料待核验' : (c.isLive ? '正在直播' : '当前未开播'));
+    const avatar = c.avatar || AVATAR_PLACEHOLDER;
+    const ephemeral = c.ephemeral === true;
+    const sig = [active ? 1 : 0, c.isLive ? 1 : 0, checking ? 1 : 0, ephemeral ? 1 : 0, name, infoText, avatar].join('\u0001');
+    if (li._sig === sig) return;
+    li._sig = sig;
+
+    const r = li._refs;
+    li.className = 'ch' + (active ? ' on' : '') + (!c.isLive && !checking ? ' off' : '');
+    r.dot.className = 'status-dot' + (c.isLive ? ' live' : '') + (checking ? ' checking' : '');
+    r.dot.title = checking ? '正在核验直播状态' : (c.isLive ? '正在直播' : '已确认未开播');
+    r.nm.textContent = name;
+    if (checking) {
+      r.tag.className = 'checking-tag';
+      r.tag.textContent = '待核验';
+    } else if (c.isLive) {
+      r.tag.className = 'live-tag';
+      r.tag.textContent = 'LIVE';
+    } else {
+      r.tag.className = '';
+      r.tag.textContent = '';
+    }
+    if (ephemeral) {
+      r.once.className = 'once-tag';
+      r.once.textContent = '一次性';
+      r.once.title = '临时房间（短链接/口令/15位以上房间号）：下播后不可复用，关闭或重载页面时自动删除';
+    } else {
+      r.once.className = '';
+      r.once.textContent = '';
+      r.once.removeAttribute('title');
+    }
+    r.info.textContent = infoText;
+    if (r.img.getAttribute('src') !== avatar) {
+      r.img.dataset.fb = '';
+      r.img.src = avatar;
+    }
+  }
+
+  renderList() {
+    this.updateCount(false);
+    if (this.channels.length === 0) {
+      this.list.innerHTML = '<li class="empty">暂无直播频道<br>粘贴分享口令或房间号快速添加</li>';
+      this.itemEls.clear();
+      return;
+    }
+
+    const view = this.getSortedChannels();
+    const liveCount = view.filter(c => c.isLive).length;
+    if (this.count) this.count.title = `在线 ${liveCount} / 共 ${view.length}`;
+
+    const empty = this.list.querySelector('.empty');
+    if (empty) empty.remove();
+    if (this.list.querySelector('.sk')) {
+      this.list.querySelectorAll('.sk').forEach(el => el.remove());   // 首屏骨架屏
+      this.list.removeAttribute('aria-busy');
+    }
+
+    // 记录重排前位置，用于 FLIP 平滑动画（顺序未变化、频道较多或用户偏好减少动态效果时跳过，避免无谓的强制布局）
+    const domIds = Array.from(this.list.children).map(el => (el.dataset ? el.dataset.rid : ''));
+    const orderChanged = view.length !== domIds.length || view.some((c, i) => c.rid !== domIds[i]);
+    const animate = orderChanged && view.length <= 80 && this.itemEls.size > 0 && typeof Element.prototype.animate === 'function'
+      && !(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+    const before = new Map();
+    if (animate) this.itemEls.forEach((el, rid) => { if (el.isConnected) before.set(rid, el.getBoundingClientRect().top); });
+
+    // 移除已不存在的频道
+    const alive = new Set(view.map(c => c.rid));
+    this.itemEls.forEach((el, rid) => {
+      if (!alive.has(rid)) { el.remove(); this.itemEls.delete(rid); }
+    });
+
+    // 更新 / 创建，并按排序结果就位（仅在位置不符时才移动 DOM）
+    let cursor = this.list.firstElementChild;
+    view.forEach(c => {
+      let el = this.itemEls.get(c.rid);
+      if (!el) {
+        el = this.buildChannelItem(c.rid);
+        this.itemEls.set(c.rid, el);
+      }
+      this.updateChannelItem(el, c);
+      if (el === cursor) {
+        cursor = cursor.nextElementSibling;
+      } else {
+        this.list.insertBefore(el, cursor);
+      }
+    });
+
+    if (animate) {
+      view.forEach(c => {
+        const el = this.itemEls.get(c.rid);
+        const oldTop = before.get(c.rid);
+        if (!el || oldTop === undefined) return;
+        const dy = oldTop - el.getBoundingClientRect().top;
+        if (Math.abs(dy) > 1) {
+          el.animate([{ transform: `translateY(${dy}px)` }, { transform: 'none' }], { duration: 260, easing: 'cubic-bezier(0.2, 0.8, 0.2, 1)' });
+        }
+      });
+    }
+  }
+
+  // 自动探活触发的重绘：用户正在按压列表时暂缓，松手后再应用，避免“点的瞬间列表重排”造成误点
+  requestListRender() {
+    if (this.listBusy) {
+      this.listRenderPending = true;
+      return;
+    }
+    this.renderList();
+  }
+
+  escapeHtml(str) {
+    const d = document.createElement('div');
+    d.textContent = str;
+    return d.innerHTML;
+  }
+
+  isPlaceholderName(name, rid = '') {
+    const value = String(name || '').trim();
+    if (!value || value === '抖音主播' || value === '精彩直播' || value === '已导入频道') return true;
+    return /^(?:频道|房间)\s*\d{3,22}$/.test(value) || (rid && value === String(rid));
+  }
+
+  isPlaceholderTitle(title) {
+    const value = String(title || '').trim();
+    return !value || ['已导入频道', '精彩直播', '直播间', '未知直播'].includes(value);
+  }
+
+  mergeProbeResult(channel, hit) {
+    if (!channel || !hit || typeof hit !== 'object') return false;
+    let changed = false;
+
+    // 只有服务端明确确认 live/offline 时才修改状态；unknown/限流/网络错误不覆盖旧状态。
+    if (hit.status === 'live' || hit.status === 'offline') {
+      const liveNow = hit.status === 'live';
+      if (!liveNow) this.dropCachedStream(channel.rid);
+      if (channel.isLive !== liveNow) {
+        channel.isLive = liveNow;
+        changed = true;
+      }
+      if (channel.statusKnown !== true) {
+        channel.statusKnown = true;
+        changed = true;
+      }
+    }
+
+    // 名称、标题和头像与在线状态解耦：已确认离线的频道同样需要修正资料。
+    const remoteName = typeof hit.name === 'string' ? hit.name.trim() : '';
+    if (remoteName && !this.isPlaceholderName(remoteName, channel.rid) && channel.name !== remoteName) {
+      channel.name = remoteName.slice(0, 50);
+      changed = true;
+    }
+
+    const remoteTitle = typeof hit.title === 'string' ? hit.title.trim() : '';
+    if (remoteTitle && !this.isPlaceholderTitle(remoteTitle) && channel.title !== remoteTitle) {
+      channel.title = remoteTitle.slice(0, 100);
+      changed = true;
+    }
+
+    const remoteAvatar = typeof hit.avatar === 'string' ? hit.avatar.trim() : '';
+    if (remoteAvatar && /^https:\/\/[^\s"'<>`]+$/i.test(remoteAvatar) && channel.avatar !== remoteAvatar) {
+      channel.avatar = remoteAvatar.slice(0, 500);
+      changed = true;
+    }
+    return changed;
+  }
+
+  async probeAllChannels() {
+    if (this.probeInFlight) {
+      this.probeQueued = true;
+      return false;
+    }
+    if (!Array.isArray(this.channels) || this.channels.length === 0) return false;
+    this.probeInFlight = true;
+    this.lastProbeAt = Date.now();
+    let updated = false;
+    let anyBatchOk = false;
+    try {
+      const rids = [...new Set(this.channels.map(channel => String(channel.rid || '')).filter(rid => /^\d{3,22}$/.test(rid)))];
+      // live.php 原有 batch 参数最多 20 个，分批请求保持接口和调用约定不变。
+      for (let offset = 0; offset < rids.length; offset += 20) {
+        const chunk = rids.slice(offset, offset + 20);
+        try {
+          const json = await this.safeFetchJson(`live.php?batch=${encodeURIComponent(chunk.join(','))}`, 45000);
+          if (json && json.code === 200 && json.batch && typeof json.batch === 'object') {
+            anyBatchOk = true;
+            this.channels.forEach(channel => {
+              const hit = json.batch[channel.rid];
+              if (hit && this.mergeProbeResult(channel, hit)) updated = true;
+            });
+          }
+        } catch (err) {
+          // 单批失败不阻断后续批次；不把失败误判为离线。
+        }
+      }
+      if (updated) {
+        this.channels.forEach(c => { if (c.statusKnown !== false) this.snapSet(c.rid, { n: c.name, t: c.title, a: c.avatar }); });
+        this.saveChannels(false);
+        this.requestListRender();
+        const active = this.channels.find(channel => channel.rid === this.activeRid);
+        if (active) {
+          if (this.curName) this.curName.textContent = active.name || `房间 ${active.rid}`;
+          if (this.curTitle) this.curTitle.textContent = active.title || (active.isLive ? '正在直播' : '当前未开播');
+          if (active.avatar && this.curAvatar) this.curAvatar.src = active.avatar;
+        }
+      }
+      // 启动后首轮成功探活：清理“上次关闭后才下播”的一次性主播（之后仅在关闭/重载时清理）
+      if (anyBatchOk && !this.firstProbePurged) {
+        this.firstProbePurged = true;
+        if (this.purgeEphemeralOffline() > 0) updated = true;
+      }
+      return updated;
+    } finally {
+      this.probeInFlight = false;
+      if (this.probeQueued) {
+        this.probeQueued = false;
+        setTimeout(() => this.probeAllChannels(), 0);
+      }
+    }
+  }
+
+  startProbeScheduler() {
+    if (this.probeTimer) clearInterval(this.probeTimer);
+    setTimeout(() => this.probeAllChannels(), 800);
+    // 页面在后台时不轮询，节省流量与上游压力；回到前台若已超过 25 秒则立即补探。
+    this.probeTimer = setInterval(() => {
+      if (!document.hidden) this.probeAllChannels();
+    }, 25000);
+    if (!this.visibilityBound) {
+      this.visibilityBound = true;
+      document.addEventListener('visibilitychange', () => {
+        if (!document.hidden && Date.now() - this.lastProbeAt > 25000) this.probeAllChannels();
+      });
+    }
+  }
+
+  async playChannel(rid, userTriggered = true, opts = {}) {
+    // 新增的第三个参数为可选：{ fresh: true } 表示跳过本地短时缓存强制重新取流（刷新/重试使用）。
+    const token = ++this.playToken;
+    const fresh = !!(opts && opts.fresh);
+    clearTimeout(this.retryTimer);
+    this.libGaveUp = {};
+    this.activeRid = rid;
+    this.currentStreamData = null;
+    this.renderList();
+    this.setMask(true, '正在连接直播信号...', false, false);
+    this.destroyPlayer();
+    this.setQualityLoading(true);
+
+    const local = this.channels.find(c => c.rid === rid);
+    // 秒开：优先用频道自身资料，缺失或仍是占位文案时回落到本地快照（历史标题/头像），立即呈现，不等网络。
+    const snap = this.snapGet(rid);
+    if (local || snap) {
+      const nm = (local && local.name && !this.isPlaceholderName(local.name, rid)) ? local.name
+        : ((snap && snap.n) || (local && local.name) || '连接中...');
+      const tt = (local && local.title && !this.isPlaceholderTitle(local.title)) ? local.title
+        : ((snap && snap.t) || (local && local.title) || `房间号: ${rid}`);
+      const av = (local && local.avatar) || (snap && snap.a) || '';
+      this.curName.textContent = nm;
+      this.curTitle.textContent = tt;
+      if (av) this.curAvatar.src = av;
+      this.showPoster(av);
+    }
+
+    try {
+      let data = fresh ? null : this.getCachedStream(rid);
+      if (!data && !fresh) {
+        // 首屏预取：index.html 预启动脚本已与主程序下载并行发起同一频道的请求，仅首次使用。
+        const boot = window.__dyBoot;
+        window.__dyBoot = null;
+        if (boot && boot.rid === rid && boot.p) data = await boot.p;
+        if (data && !(data.code === 200 && data.streams)) data = null;   // 预取结果不可用：走常规请求（含离线判定）
+      }
+      if (!data) data = await this.safeFetchJson(`live.php?rid=${encodeURIComponent(rid)}`);
+
+      if (!data || data.code !== 200 || !data.streams) {
+        this.dropCachedStream(rid);
+        const error = new Error((data && data.msg) || '主播当前未开播');
+        error.definitiveOffline = !!data && Number(data.code) === 404;
+        throw error;
+      }
+
+      this.setCachedStream(rid, data);
+      this.snapSet(rid, { n: data.anchor_name, t: data.title, a: data.avatar });
+
+      if (local) {
+        if (typeof data.anchor_name === 'string' && data.anchor_name.trim()) local.name = data.anchor_name.trim().slice(0, 50);
+        if (typeof data.title === 'string' && data.title.trim()) local.title = data.title.trim().slice(0, 100);
+        if (typeof data.avatar === 'string' && /^https?:\/\/[^\s"'<>`]+$/i.test(data.avatar)) local.avatar = data.avatar.slice(0, 500);
+        local.isLive = true;
+        local.statusKnown = true;
+        this.saveChannels(false);
+        this.renderList();
+      }
+
+      // 期间用户已切到别的频道：丢弃本次结果，不得覆盖新频道的播放与界面
+      if (token !== this.playToken) return;
+
+      this.currentStreamData = data;
+      this.retryCount = 0;
+
+      this.curName.textContent = (data.anchor_name && data.anchor_name.trim()) || (local && local.name) || `房间 ${rid}`;
+      this.curTitle.textContent = (data.title && data.title.trim()) || (local && local.title) || `房间号: ${rid}`;
+      if (data.avatar && /^https?:\/\/[^\s"'<>`]+$/i.test(data.avatar)) this.curAvatar.src = data.avatar;
+
+      this.renderQualityOptions(data.streams);
+      this.loadStreamSource();
+    } catch (e) {
+      // 只有接口明确返回 404（已确认未开播）才改为离线；超时/风控/网络错误保留最后一次可信状态。
+      if (local && e && e.definitiveOffline) {
+        local.isLive = false;
+        local.statusKnown = true;
+        this.saveChannels(false);
+        this.renderList();
+      }
+      if (token !== this.playToken) return;
+      this.resetQualityOptions();
+      this.setMask(true, (e && e.message) || '取流异常', true, false);
+    }
+  }
+
+  setQualityLoading(loading) {
+    const fld = this.qualSel.closest('.fld');
+    if (fld) fld.classList.toggle('is-loading', !!loading);
+    if (loading) {
+      this.qualSel.innerHTML = '';
+      const opt = document.createElement('option');
+      opt.textContent = '载入中…';
+      this.qualSel.appendChild(opt);
+      this.qualSel.disabled = true;
+    }
+  }
+
+  resetQualityOptions() {
+    this.setQualityLoading(false);
+    this.qualSel.innerHTML = '<option>—</option>';
+    this.qualSel.disabled = true;
+  }
+
+  renderQualityOptions(streams) {
+    this.setQualityLoading(false);
+    this.qualSel.innerHTML = '';
+    const keys = Object.keys(streams);
+    if (keys.length === 0) {
+      this.qualSel.disabled = true;
+      this.qualSel.innerHTML = '<option>默认清晰度</option>';
+      return;
+    }
+    keys.forEach(k => {
+      const opt = document.createElement('option');
+      opt.value = k;
+      opt.textContent = streams[k].name || k;
+      this.qualSel.appendChild(opt);
+    });
+    // 记住用户上次选择的清晰度；当前直播间不提供该档位时回退到第一档（原有行为），且不覆盖偏好。
+    if (this.prefs.quality && Object.prototype.hasOwnProperty.call(streams, this.prefs.quality)) {
+      this.qualSel.value = this.prefs.quality;
+    }
+    this.qualSel.disabled = false;
+  }
+
+  destroyPlayer() {
+    if (this.playerInstance) {
+      try {
+        if (typeof this.playerInstance.destroy === 'function') {
+          this.playerInstance.destroy();
+        }
+      } catch {}
+      this.playerInstance = null;
+    }
+    this.video.pause();
+    this.video.removeAttribute('src');
+    this.video.load();
+  }
+
+  loadStreamSource() {
+    if (!this.currentStreamData || !this.currentStreamData.streams) return;
+
+    const proto = this.protoSel.value;
+    const qual = this.qualSel.value || Object.keys(this.currentStreamData.streams)[0];
+    const streamObj = this.currentStreamData.streams[qual] || Object.values(this.currentStreamData.streams)[0];
+
+    if (!streamObj) {
+      this.setMask(true, '未找到对应画质的流地址', true, false);
+      return;
+    }
+
+    const playUrl = (proto === 'flv' && streamObj.flv) ? streamObj.flv : (streamObj.hls || streamObj.flv);
+
+    // 播放库尚未就绪（按需加载，含备用源）：先给出明确提示，加载完成后用同一份流数据继续；
+    // 全部来源失败则标记放弃，退回下方原有降级路径（不会循环等待）。
+    const libName = (proto === 'flv' && streamObj.flv) ? 'mpegts' : (/\.m3u8/i.test(String(playUrl)) ? 'Hls' : '');
+    if (libName && !window[libName] && !this.libGaveUp[libName]) {
+      const pendingData = this.currentStreamData;
+      this.destroyPlayer();
+      this.setMask(true, '正在加载播放组件...', false, false);
+      loadLib(libName).then(ok => {
+        if (!ok) this.libGaveUp[libName] = true;
+        if (this.currentStreamData === pendingData) this.loadStreamSource();
+      });
+      return;
+    }
+
+    this.destroyPlayer();
+    this.setMask(true, '正在解码流媒体数据...', false, false);
+
+    if (proto === 'flv' && window.mpegts && window.mpegts.isSupported()) {
+      try {
+        const player = window.mpegts.createPlayer({
+          type: 'flv',
+          isLive: true,
+          url: playUrl
+        }, {
+          enableStashBuffer: false,
+          stashInitialSize: 128,
+          lazyLoad: false
+        });
+        player.attachMediaElement(this.video);
+        player.load();
+        this.playerInstance = player;
+        this.executeAutoPlay();
+        return;
+      } catch (err) {
+        console.warn('mpegts 初始化异常，降级到 HLS', err);
+      }
+    }
+
+    if (window.Hls && window.Hls.isSupported() && playUrl.includes('.m3u8')) {
+      const hls = new window.Hls({
+        enableWorker: true,
+        lowLatencyMode: true,
+        backBufferLength: 30
+      });
+      hls.loadSource(playUrl);
+      hls.attachMedia(this.video);
+      hls.on(window.Hls.Events.MANIFEST_PARSED, () => {
+        this.executeAutoPlay();
+      });
+      hls.on(window.Hls.Events.ERROR, (event, data) => {
+        if (data.fatal) {
+          switch (data.type) {
+            case window.Hls.ErrorTypes.NETWORK_ERROR:
+              hls.startLoad();
+              break;
+            case window.Hls.ErrorTypes.MEDIA_ERROR:
+              hls.recoverMediaError();
+              break;
+            default:
+              this.handlePlaybackFailure();
+              break;
+          }
+        }
+      });
+      this.playerInstance = hls;
+      return;
+    }
+
+    this.video.src = playUrl;
+    this.executeAutoPlay();
+  }
+
+  executeAutoPlay() {
+    this.unmuteBtn.hidden = true;
+    const playPromise = this.video.play();
+    if (playPromise !== undefined) {
+      playPromise.then(() => {
+        this.setMask(false);
+      }).catch(err => {
+        if (err.name === 'NotAllowedError') {
+          this.video.muted = true;
+          this.video.play().then(() => {
+            this.setMask(false);
+            this.unmuteBtn.hidden = false;
+          }).catch(() => {
+            this.handlePlaybackFailure();
+          });
+        } else {
+          this.handlePlaybackFailure();
+        }
+      });
+    }
+  }
+
+  handlePlaybackFailure() {
+    if (this.retryCount < this.maxRetry) {
+      this.retryCount++;
+      this.setMask(true, `信号波动，自愈重试 (${this.retryCount}/${this.maxRetry})...`, false, true);
+      clearTimeout(this.retryTimer);
+      this.retryTimer = setTimeout(() => this.loadStreamSource(), 1500);
+    } else {
+      this.dropCachedStream(this.activeRid);   // 流地址可能已过期，下次进入该频道重新取流
+      this.setMask(true, '视频播放中断，请切换协议或刷新重试', true, false);
+    }
+  }
+
+  sanitizeChannel(raw) {
+    if (!raw || typeof raw !== 'object') return null;
+
+    const cleanRid = String(raw.rid || raw.id || '').trim();
+    if (!/^\d{3,22}$/.test(cleanRid)) return null;
+
+    let cleanName = String(raw.name || ('房间 ' + cleanRid)).trim();
+    cleanName = cleanName.replace(/[\u0000-\u001F\u007F-\u009F]/g, '').slice(0, 50);
+
+    let cleanTitle = String(raw.title || '精彩直播').trim();
+    cleanTitle = cleanTitle.replace(/[\u0000-\u001F\u007F-\u009F]/g, '').slice(0, 100);
+
+    let cleanAvatar = '';
+    if (typeof raw.avatar === 'string' && raw.avatar.trim()) {
+      const av = raw.avatar.trim();
+      if (/^https?:\/\/[^\s"'<>`]+$/i.test(av) || /^data:image\/(?:png|jpe?g|gif|webp);base64,[A-Za-z0-9+/=]+$/i.test(av)) {
+        cleanAvatar = av.slice(0, 500);
+      }
+    }
+
+    const statusKnown = typeof raw.statusKnown === 'boolean'
+      ? raw.statusKnown
+      : !(this.isPlaceholderName(cleanName, cleanRid) || this.isPlaceholderTitle(cleanTitle));
+
+    const clean = {
+      rid: cleanRid,
+      name: cleanName,
+      title: cleanTitle,
+      avatar: cleanAvatar,
+      isLive: Boolean(raw.isLive),
+      statusKnown: statusKnown
+    };
+    // 一次性主播标记：仅在为 true 时写入，旧数据/普通频道的结构保持不变。
+    if (raw.ephemeral === true) clean.ephemeral = true;
+    return clean;
+  }
+
+  parseCsvRow(line) {
+    const fields = [];
+    let value = '';
+    let quoted = false;
+
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i];
+      if (ch === '"') {
+        if (quoted && line[i + 1] === '"') {
+          value += '"';
+          i++;
+        } else {
+          quoted = !quoted;
+        }
+      } else if (ch === ',' && !quoted) {
+        fields.push(value.trim());
+        value = '';
+      } else {
+        value += ch;
+      }
+    }
+    fields.push(value.trim());
+    return fields;
+  }
+
+  parseImportContent(rawText) {
+    const trimmed = String(rawText || '').replace(/^\uFEFF/, '').trim();
+    if (!trimmed) return [];
+
+    const result = [];
+
+    // 模式 1: JSON（继续兼容旧版数组及 {list: [...]} 包装结构）
+    if (trimmed.startsWith('[') || trimmed.startsWith('{')) {
+      try {
+        const parsed = JSON.parse(trimmed);
+        const arr = Array.isArray(parsed)
+          ? parsed
+          : (parsed && Array.isArray(parsed.list) ? parsed.list : (parsed && typeof parsed === 'object' ? Object.values(parsed) : []));
+        if (Array.isArray(arr)) {
+          arr.forEach(item => {
+            const s = this.sanitizeChannel(item);
+            if (s) result.push(s);
+          });
+        }
+        if (result.length > 0) return this.uniqueChannels(result);
+      } catch {}
+    }
+
+    // 模式 2: TXT / CSV。支持标准 CSV 引号、旧式两列 CSV 与每行一个房间号。
+    const lines = trimmed.split(/[\r\n]+/);
+    let csvColumns = null;
+    lines.forEach(line => {
+      const l = line.trim();
+      if (!l || l.startsWith('#')) return;
+
+      const parts = l.includes(',') ? this.parseCsvRow(l) : [l];
+      const first = String(parts[0] || '').replace(/^\uFEFF/, '').trim().toLowerCase();
+      if (parts.length > 1 && ['rid', 'id', 'room_id', '房间号'].includes(first)) {
+        csvColumns = {};
+        parts.forEach((part, index) => {
+          const key = String(part).trim().toLowerCase();
+          if (['rid', 'id', 'room_id', '房间号'].includes(key)) csvColumns.rid = index;
+          if (['name', 'title', '频道名', '名称'].includes(key) && csvColumns.name === undefined) csvColumns.name = index;
+          if (['title', '直播标题'].includes(key)) csvColumns.title = index;
+        });
+        return;
+      }
+
+      let rid = null;
+      let name = '';
+      let title = '已导入频道';
+
+      if (csvColumns && csvColumns.rid !== undefined) {
+        const candidate = String(parts[csvColumns.rid] || '').trim();
+        if (/^\d{3,22}$/.test(candidate)) rid = candidate;
+        if (csvColumns.name !== undefined) name = String(parts[csvColumns.name] || '').trim();
+        if (csvColumns.title !== undefined) title = String(parts[csvColumns.title] || title).trim() || title;
+      } else if (parts.length > 1) {
+        const p1 = String(parts[0] || '').trim();
+        const p2 = String(parts[1] || '').trim();
+        if (/^\d{3,22}$/.test(p1)) {
+          rid = p1; name = p2;
+        } else if (/^\d{3,22}$/.test(p2)) {
+          rid = p2; name = p1;
+        }
+        if (parts.length > 2 && parts[2]) title = String(parts[2]).trim() || title;
+      }
+
+      if (!rid) {
+        const numMatch = l.match(/\b(\d{3,22})\b/);
+        if (numMatch) rid = numMatch[1];
+      }
+
+      if (rid) {
+        const s = this.sanitizeChannel({
+          rid: rid,
+          name: name || ('频道 ' + rid),
+          title: title,
+          avatar: '',
+          isLive: false
+        });
+        if (s) result.push(s);
+      }
+    });
+
+    return this.uniqueChannels(result);
+  }
+
+  uniqueChannels(items) {
+    const seen = new Set();
+    return items.filter(item => {
+      if (!item || seen.has(item.rid)) return false;
+      seen.add(item.rid);
+      return true;
+    });
+  }
+
+  requestDeleteChannel(rid) {
+    const channel = this.channels.find(c => c.rid === rid);
+    if (!channel) return;
+
+    this.pendingDeleteRid = rid;
+    const status = channel.isLive ? '当前正在直播' : '当前未开播';
+    this.deleteMsg.textContent = `即将删除“${channel.name || ('房间 ' + rid)}”（${rid}）。${status}。删除后将从本机列表中移除，且不会影响远程直播间本身。`;
+    this.deleteDlg.returnValue = '';
+    this.deleteDlg.showModal();
+  }
+
+  deleteChannel(rid) {
+    const channel = this.channels.find(c => c.rid === rid);
+    if (!channel) return;
+
+    this.channels = this.channels.filter(c => c.rid !== rid);
+    this.saveChannels(true);
+    this.renderList();
+
+    this.dropCachedStream(rid);
+    this.snapDrop(rid);
+    if (this.activeRid === rid) {
+      this.playToken++;
+      clearTimeout(this.retryTimer);
+      this.activeRid = null;
+      this.currentStreamData = null;
+      this.destroyPlayer();
+      this.resetQualityOptions();
+      this.curName.textContent = '请选择直播间';
+      this.curTitle.textContent = '从列表中点击一个频道开始观看';
+      this.curAvatar.removeAttribute('src');
+      this.setMask(true, '请选择左侧频道', false, false);
+    }
+    this.toast(`已删除频道：${channel.name || ('房间 ' + rid)}`);
+  }
+
+  /* ===== 导出：保存位置说明 ===== */
+  canUseSavePicker() {
+    // 以特性检测为准（File System Access API）：支持的浏览器由用户在系统保存对话框中自选目录与文件名。
+    return typeof window.showSaveFilePicker === 'function'
+      && window.isSecureContext === true
+      && window === window.top;
+  }
+
+  getDownloadLocationHint() {
+    const ua = navigator.userAgent || '';
+    const platform = (navigator.userAgentData && navigator.userAgentData.platform) || navigator.platform || '';
+    const inApp = /MicroMessenger|MQQBrowser|\bQQ\/|DingTalk|Weibo|AlipayClient|Quark|UCBrowser/i.test(ua);
+    let path;
+    if (/iPhone|iPad|iPod/i.test(ua) || (/Macintosh/i.test(ua) && (navigator.maxTouchPoints || 0) > 1)) {
+      path = '系统默认「下载 (Downloads)」目录：「文件」App → 我的 iPhone/iPad（或 iCloud 云盘）→ 下载项';
+    } else if (/Android|HarmonyOS/i.test(ua)) {
+      path = '系统默认「下载 (Download)」目录：手机存储 → 下载 (Download) 文件夹；也可在浏览器的「下载管理」里点开文件';
+    } else if (/Win/i.test(platform) || /Windows/i.test(ua)) {
+      path = '系统默认「下载 (Downloads)」目录：C:\\Users\\<你的用户名>\\Downloads（即「此电脑 → 下载」）';
+    } else if (/Mac/i.test(platform) || /Macintosh/i.test(ua)) {
+      path = '系统默认「下载 (Downloads)」目录：~/Downloads（访达 → 下载）';
+    } else if (/Linux|X11|CrOS/i.test(platform + ua)) {
+      path = '系统默认「下载 (Downloads)」目录：~/Downloads（主目录下的“下载”文件夹）';
+    } else {
+      path = '系统默认「下载 (Downloads)」目录（浏览器默认下载目录）';
+    }
+    return { path, inApp };
+  }
+
+  releaseExportUrl() {
+    if (this.exportBlobUrl) {
+      try { URL.revokeObjectURL(this.exportBlobUrl); } catch {}
+      this.exportBlobUrl = '';
+    }
+    const link = document.getElementById('exportDoneRetry');
+    if (link) {
+      link.hidden = true;
+      link.removeAttribute('href');
+    }
+  }
+
+  // 增强型 Blob 下载：octet-stream 强制按附件处理（避免 iOS Safari / 内置浏览器把 JSON、CSV 当网页预览）；
+  // 不支持 download 属性的旧环境改为新窗口打开；URL 保持到导出面板关闭，供“重新下载”使用。
+  triggerBlobDownload(blob, fileName) {
+    this.releaseExportUrl();
+    const forced = new Blob([blob], { type: 'application/octet-stream' });
+    const url = URL.createObjectURL(forced);
+    this.exportBlobUrl = url;
+    const a = document.createElement('a');
+    a.rel = 'noopener';
+    a.style.display = 'none';
+    a.href = url;
+    if ('download' in a) {
+      a.download = fileName;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+    } else {
+      window.open(url, '_blank');
+    }
+    window.setTimeout(() => { if (this.exportBlobUrl === url) this.releaseExportUrl(); }, 10 * 60 * 1000);
+    return url;
+  }
+
+  showExportResult(info) {
+    if (!this.exportDoneDlg) return;
+    this.exportDoneName.textContent = info.name;
+    this.exportDonePath.textContent = info.location;
+    this.exportDoneMeta.textContent = info.meta;
+    this.exportDoneTip.textContent = info.tip;
+    const link = document.getElementById('exportDoneRetry');
+    if (link) {
+      if (info.url) {
+        link.href = info.url;
+        link.setAttribute('download', info.name);
+        if (!('download' in link)) link.target = '_blank';
+        link.hidden = false;
+      } else {
+        link.hidden = true;
+        link.removeAttribute('href');
+      }
+    }
+    this.exportDoneDlg.returnValue = '';
+    try {
+      if (!this.exportDoneDlg.open) this.exportDoneDlg.showModal();
+    } catch {}
+  }
+
+  async exportChannels(format = 'json') {
+    const stamp = Date.now();
+    let content = '';
+    let mime = 'application/json;charset=utf-8';
+    let extension = 'json';
+
+    if (format === 'txt') {
+      extension = 'txt';
+      mime = 'text/plain;charset=utf-8';
+      content = this.channels.map(channel => channel.rid).join('\n') + (this.channels.length ? '\n' : '');
+    } else if (format === 'csv') {
+      extension = 'csv';
+      mime = 'text/csv;charset=utf-8';
+      const quote = value => `"${String(value == null ? '' : value).replace(/"/g, '""')}"`;
+      content = ['rid,name,title', ...this.channels.map(channel => [channel.rid, channel.name, channel.title].map(quote).join(','))].join('\r\n');
+      content = '\uFEFF' + content;
+    } else {
+      format = 'json';
+      content = JSON.stringify(this.channels, null, 2);
+    }
+
+    const fileName = `douyin_live_channels_${stamp}.${extension}`;
+    const blob = new Blob([content], { type: mime });
+    const sizeText = blob.size >= 1024 ? `${(blob.size / 1024).toFixed(1)} KB` : `${blob.size} B`;
+    const meta = `${this.channels.length} 个频道 · ${extension.toUpperCase()} · ${sizeText}`;
+
+    // 方案 A：File System Access API —— 用户在系统保存对话框中自选目录与文件名，写入完成后回显。
+    let savedName = '';
+    if (this.canUseSavePicker()) {
+      try {
+        const handle = await window.showSaveFilePicker({
+          suggestedName: fileName,
+          id: 'dyLiveExport',          // 浏览器记住上次所选目录
+          startIn: 'downloads',        // 首次默认定位到系统「下载 (Downloads)」
+          types: [{ description: `${extension.toUpperCase()} 文件`, accept: { [mime.split(';')[0]]: ['.' + extension] } }]
+        });
+        const writable = await handle.createWritable();
+        await writable.write(blob);
+        await writable.close();
+        savedName = (handle && handle.name) || fileName;
+      } catch (err) {
+        if (err && err.name === 'AbortError') {
+          this.toast('已取消导出');
+          return false;
+        }
+        savedName = '';   // 其余异常（无手势授权、权限被拒等）回退到常规下载
+      }
+    }
+
+    if (savedName) {
+      this.updateCount(true);
+      this.toast(`已保存：${savedName}（${this.channels.length} 个频道）→ 位置为您在保存对话框中选择的文件夹`, 7000);
+      this.showExportResult({
+        name: savedName,
+        location: '您在系统保存对话框中选择的文件夹（对话框默认定位在系统「下载 (Downloads)」目录）',
+        meta,
+        tip: '出于隐私，浏览器不会向网页提供磁盘完整路径，此处回显的是您最终保存的文件名；具体目录以保存对话框中所选为准。'
+      });
+      return true;
+    }
+
+    // 方案 B：增强型 Blob 下载（手机、Safari、Firefox 及不支持保存对话框的环境）
+    const url = this.triggerBlobDownload(blob, fileName);
+    this.updateCount(true);
+    const hint = this.getDownloadLocationHint();
+    this.toast(`已导出：${fileName}（${this.channels.length} 个频道）→ 保存在系统默认「下载 (Downloads)」目录`, 7000);
+    this.showExportResult({
+      name: fileName,
+      location: hint.path,
+      meta,
+      url,
+      tip: hint.inApp
+        ? '检测到内置浏览器（如微信/QQ）：这类环境可能拦截下载，若未看到下载提示，请点击下方「重新下载」，或改用系统浏览器打开本页后再导出。'
+        : '实际位置取决于浏览器的下载设置；可在浏览器的「下载内容」列表中点开或定位文件。若未看到下载，请点击下方「重新下载」。'
+    });
+    return true;
+  }
+
+  bindEvents() {
+    // 关闭程序/窗口、重载、离开页面：把已下播的一次性主播从本地存储中移除（只写存储，不动当前界面）。
+    // pagehide 覆盖关闭/重载/导航；切到后台也同步一次，应对手机浏览器被系统直接结束而不触发 pagehide 的情况。
+    if (this.exportDoneDlg) this.exportDoneDlg.addEventListener('close', () => this.releaseExportUrl());
+    window.addEventListener('pagehide', () => this.persistWithoutEphemeralOffline());
+    window.addEventListener('beforeunload', () => this.persistWithoutEphemeralOffline());
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden) this.persistWithoutEphemeralOffline();
+    });
+
+    // 用户按压列表期间暂缓自动重排，松手 0.6 秒后统一应用（含 4 秒兜底，防止事件丢失导致卡住）
+    const holdList = () => {
+      this.listBusy = true;
+      clearTimeout(this.listBusyTimer);
+      this.listBusyTimer = setTimeout(releaseList, 4000);
+    };
+    const releaseList = () => {
+      clearTimeout(this.listBusyTimer);
+      this.listBusyTimer = setTimeout(() => {
+        this.listBusy = false;
+        if (this.listRenderPending) {
+          this.listRenderPending = false;
+          this.renderList();
+        }
+      }, 600);
+    };
+    this.list.addEventListener('pointerdown', holdList, { passive: true });
+    ['pointerup', 'pointercancel'].forEach(evt => this.list.addEventListener(evt, releaseList, { passive: true }));
+
+    this.list.addEventListener('click', e => {
+      const delBtn = e.target.closest('[data-del]');
+      if (delBtn) {
+        e.stopPropagation();
+        this.requestDeleteChannel(delBtn.dataset.del);
+        return;
+      }
+
+      const item = e.target.closest('[data-rid]');
+      if (item) {
+        const rid = item.dataset.rid;
+        if (rid !== this.activeRid) {
+          this.playChannel(rid);
+        }
+      }
+    });
+
+    this.addForm.addEventListener('submit', async e => {
+      e.preventDefault();
+      const text = this.q.value.trim();
+      if (!text) return;
+
+      this.setMask(true, '正在解析输入源并校验...', false, false);
+      try {
+        const d = await this.safeFetchJson(`live.php?text=${encodeURIComponent(text)}`);
+        if (d.code === 200 && d.web_rid) {
+          const exists = this.channels.find(c => c.rid === d.web_rid);
+          const oneTime = this.isOneTimeSource(text, d.web_rid);
+          // 已存在且为普通频道（用户先前自行保存）时不改动其属性，也不提示。
+          const noticeNeeded = oneTime && (!exists || exists.ephemeral === true);
+          if (!exists) {
+            const item = {
+              rid: d.web_rid,
+              name: d.anchor_name || ('房间 ' + d.web_rid),
+              title: d.title || '精彩直播',
+              avatar: d.avatar || '',
+              isLive: true,
+              statusKnown: true
+            };
+            if (oneTime) item.ephemeral = true;
+            this.channels.unshift(item);
+            this.saveChannels(true);
+            this.renderList();
+          }
+          this.q.value = '';
+          this.toast(noticeNeeded ? '已添加（一次性主播：下播后不可复用）' : '已成功添加入工作台');
+          this.playChannel(d.web_rid);
+          if (noticeNeeded) this.showOnceNotice(d.anchor_name || (exists && exists.name) || ('房间 ' + d.web_rid));
+        } else {
+          this.toast(d.msg || '无法解析该链接或口令');
+          this.setMask(false);
+        }
+      } catch (err) {
+        this.toast('解析请求异常: ' + err.message);
+        this.setMask(false);
+      }
+    });
+
+    this.reloadBtn.addEventListener('click', () => {
+      if (this.activeRid) this.playChannel(this.activeRid, true, { fresh: true });
+      this.probeAllChannels();
+    });
+    this.retryBtn.addEventListener('click', () => {
+      if (this.activeRid) this.playChannel(this.activeRid, true, { fresh: true });
+    });
+
+    this.unmuteBtn.addEventListener('click', () => {
+      this.video.muted = false;
+      this.unmuteBtn.hidden = true;
+    });
+
+    this.protoSel.addEventListener('change', () => {
+      this.prefs.proto = this.protoSel.value === 'flv' ? 'flv' : 'hls';
+      this.savePrefs();
+      this.loadStreamSource();
+    });
+    this.qualSel.addEventListener('change', () => {
+      if (this.currentStreamData && /^[A-Za-z0-9_-]{1,20}$/.test(this.qualSel.value || '')) {
+        this.prefs.quality = this.qualSel.value;
+        this.savePrefs();
+      }
+      this.loadStreamSource();
+    });
+
+    this.fsBtn.addEventListener('click', () => {
+      if (!document.fullscreenElement) {
+        this.stage.requestFullscreen().catch(() => this.video.requestFullscreen());
+      } else {
+        document.exitFullscreen();
+      }
+    });
+
+    this.pipBtn.addEventListener('click', async () => {
+      try {
+        if (document.pictureInPictureElement) {
+          await document.exitPictureInPicture();
+        } else if (document.pictureInPictureEnabled) {
+          await this.video.requestPictureInPicture();
+        }
+      } catch (err) {
+        this.toast('画中画启动失败');
+      }
+    });
+
+    this.video.addEventListener('playing', () => this.setMask(false));
+    this.video.addEventListener('waiting', () => this.setMask(true, '正在缓冲...', false, true));
+
+    // 本地导出：默认 JSON，也可选择远程导入器可识别的 TXT / CSV。
+    this.exportBtn.addEventListener('click', () => {
+      if (this.exportFormat) this.exportFormat.value = 'json';
+      this.exportDlg.returnValue = '';
+      this.exportDlg.showModal();
+    });
+
+    this.exportDlg.addEventListener('close', () => {
+      if (this.exportDlg.returnValue === 'export') {
+        Promise.resolve(this.exportChannels(this.exportFormat ? this.exportFormat.value : 'json'))
+          .catch(() => this.toast('导出失败，请重试'));
+      }
+    });
+
+    // 删除确认：取消或按 Esc 均不会改变列表。
+    this.deleteDlg.addEventListener('close', () => {
+      const rid = this.pendingDeleteRid;
+      const confirmed = this.deleteDlg.returnValue === 'confirm';
+      this.pendingDeleteRid = null;
+      if (confirmed && rid) this.deleteChannel(rid);
+    });
+
+    // 本地文件导入
+    this.importBtn.addEventListener('click', () => this.file.click());
+    this.file.addEventListener('change', e => {
+      const f = e.target.files[0];
+      if (!f) return;
+      if (f.size > 1048576) {
+        this.toast('导入文件超过 1MB 限制');
+        this.file.value = '';
+        return;
+      }
+      const reader = new FileReader();
+      reader.onload = evt => {
+        const text = evt.target.result;
+        const list = this.parseImportContent(text);
+        if (list.length === 0) {
+          this.toast('未能识别到有效的频道数据，请检查文件格式');
+          return;
+        }
+        this.promptImportMerge(list);
+      };
+      reader.readAsText(f);
+      this.file.value = '';
+    });
+
+    // 远程源安全导入
+    this.remoteImportBtn.addEventListener('click', () => {
+      this.remoteUrlInput.value = '';
+      this.remoteDlg.showModal();
+    });
+
+    this.remoteCancelBtn.addEventListener('click', () => {
+      this.remoteDlg.close();
+    });
+
+    this.remoteForm.addEventListener('submit', async e => {
+      e.preventDefault();
+      const targetUrl = this.remoteUrlInput.value.trim();
+      if (!targetUrl) return;
+
+      this.remoteDlg.close();
+      this.toast('正在对远程目标执行 SSRF 与数据安全核验...');
+
+      try {
+        const res = await this.safeFetchJson(`live.php?action=remote_import&remote_url=${encodeURIComponent(targetUrl)}`);
+        if (res.code === 200 && res.raw) {
+          const list = this.parseImportContent(res.raw);
+          if (list.length === 0) {
+            this.toast('已安全拉取，但未解析出合规格式的直播频道');
+            return;
+          }
+          this.promptImportMerge(list, `远程源（${res.size} 字节）核验通过`);
+        } else {
+          this.toast('远程安全拦截: ' + (res.msg || '无法解析此源'));
+        }
+      } catch (err) {
+        this.toast('远程导入失败: ' + err.message);
+      }
+    });
+
+    // 功能说明及指南交互
+    this.helpBtn.addEventListener('click', () => {
+      this.helpDlg.showModal();
+    });
+
+    this.helpCloseBtn.addEventListener('click', () => {
+      this.helpDlg.close();
+    });
+
+    this.helpOkBtn.addEventListener('click', () => {
+      this.helpDlg.close();
+    });
+
+    // 点击背景遮罩关闭说明
+    this.helpDlg.addEventListener('click', e => {
+      const rect = this.helpDlg.getBoundingClientRect();
+      const inDialog = (
+        rect.top <= e.clientY && e.clientY <= rect.top + rect.height &&
+        rect.left <= e.clientX && e.clientX <= rect.left + rect.width
+      );
+      if (!inDialog) {
+        this.helpDlg.close();
+      }
+    });
+  }
+
+  promptImportMerge(newItems, sourceTag = '导入数据') {
+    const preparedItems = this.uniqueChannels(newItems).map(item => ({ ...item, statusKnown: false }));
+    this.dlgMsg.textContent = `【${sourceTag}】成功捕获 ${preparedItems.length} 个频道，导入状态将自动重新核验，请选择合并方式：`;
+    this.dlg.returnValue = '';   // 防止上次的 merge/replace 残留，导致按 Esc 取消时误执行导入
+    this.dlg.showModal();
+    this.dlg.addEventListener('close', () => {
+      const ret = this.dlg.returnValue;
+      let affected = 0;
+      if (ret === 'replace') {
+        this.channels = preparedItems;
+        affected = this.channels.length;
+        this.saveChannels(true);
+        this.renderList();
+        this.toast(`已替换为最新导入的 ${preparedItems.length} 个频道，正在自动核验名称和状态`);
+        if (this.channels.length > 0) this.playChannel(this.channels[0].rid);
+      } else if (ret === 'merge') {
+        const ridMap = new Map(this.channels.map(channel => [String(channel.rid), channel]));
+        let addedCount = 0;
+        preparedItems.forEach(item => {
+          const existing = ridMap.get(String(item.rid));
+          if (!existing) {
+            this.channels.push(item);
+            ridMap.set(String(item.rid), item);
+            addedCount++;
+            affected++;
+          } else {
+            // 同一房间再次导入时不覆盖已有有效资料，只让其状态重新核验。
+            existing.statusKnown = false;
+            affected++;
+          }
+        });
+        this.saveChannels(true);
+        this.renderList();
+        this.toast(`合并完成：新增 ${addedCount} 个，${affected - addedCount} 个已有频道重新核验；正在更新资料`);
+      } else {
+        return;
+      }
+      // 导入确认完成后立即触发全量分批探活，不等待 25 秒定时器。
+      this.probeAllChannels();
+    }, { once: true });
+  }
+
+  bindKeyboardShortcuts() {
+    window.addEventListener('keydown', e => {
+      if (['INPUT', 'SELECT', 'TEXTAREA'].includes(document.activeElement?.tagName)) {
+        return;
+      }
+      // 不拦截浏览器组合键（Ctrl/⌘+R 刷新、Ctrl/⌘+F 查找、Ctrl/⌘+P 打印等）
+      if (e.ctrlKey || e.metaKey || e.altKey) return;
+      const key = String(e.key || '').toLowerCase();
+      // 任何模态对话框打开时，仅允许 H/? 开关说明，其余快捷键不穿透到后面的播放器与列表
+      if (document.querySelector('dialog[open]') && !(this.helpDlg.open && (key === 'h' || key === '?'))) {
+        return;
+      }
+
+      switch (key) {
+        case 'h': // H 或 ? 键唤出帮助说明
+        case '?':
+          e.preventDefault();
+          if (this.helpDlg.open) {
+            this.helpDlg.close();
+          } else {
+            this.helpDlg.showModal();
+          }
+          break;
+        case ' ':
+          e.preventDefault();
+          this.video.paused ? this.video.play() : this.video.pause();
+          break;
+        case 'f':
+          e.preventDefault();
+          this.fsBtn.click();
+          break;
+        case 'm':
+          e.preventDefault();
+          this.video.muted = !this.video.muted;
+          this.unmuteBtn.hidden = !this.video.muted;
+          this.toast(this.video.muted ? '已静音' : '已开启声音');
+          break;
+        case 'r':
+          e.preventDefault();
+          this.reloadBtn.click();
+          break;
+        case 'p':
+          e.preventDefault();
+          this.pipBtn.click();
+          break;
+        case 'arrowup':
+          e.preventDefault();
+          this.navigateChannel(-1);
+          break;
+        case 'arrowdown':
+          e.preventDefault();
+          this.navigateChannel(1);
+          break;
+      }
+    });
+  }
+
+  navigateChannel(offset) {
+    if (this.channels.length <= 1) return;
+    const view = this.getSortedChannels();   // 与列表所见顺序一致
+    const curIdx = view.findIndex(c => c.rid === this.activeRid);
+    let targetIdx = curIdx + offset;
+    if (targetIdx < 0) targetIdx = view.length - 1;
+    if (targetIdx >= view.length) targetIdx = 0;
+    this.playChannel(view[targetIdx].rid);
+  }
+}
+
+window.addEventListener('DOMContentLoaded', () => {
+  window.app = new LiveWorkbench();
+});

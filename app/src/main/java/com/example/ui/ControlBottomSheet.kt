@@ -35,14 +35,15 @@ fun ControlBottomSheet(
     onDesktopUaToggle: (Boolean) -> Unit,
     onOrientationToggle: () -> Unit,
     onOpenUrlDialog: () -> Unit,
-    onOpenQuickRoomDialog: () -> Unit,
+    onOpenQuickRoomDialog: () -> Unit = {},
     onClearCache: () -> Unit,
     fullscreenOrientationMode: Int = 0,
     onOrientationModeSelect: (Int) -> Unit = {},
     onHealAudioStream: () -> Unit = {},
     onLaunchNativePlayer: () -> Unit = {},
     onEnterPip: () -> Unit = {},
-    onCheckUpdate: () -> Unit = {}
+    onCheckUpdate: () -> Unit = {},
+    onSwitchLine: (String) -> Unit = {}
 ) {
     ModalBottomSheet(
         onDismissRequest = onDismissRequest,
@@ -168,6 +169,39 @@ fun ControlBottomSheet(
                         overflow = TextOverflow.Ellipsis,
                         fontWeight = FontWeight.Medium
                     )
+
+                    // 线路一与线路二一键直达
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        val isLine1 = currentUrl.startsWith("https://tv.fuxiaoya.com")
+                        val isLine2 = currentUrl.startsWith("https://www.whomao.com")
+                        SuggestionChip(
+                            onClick = { onSwitchLine("https://tv.fuxiaoya.com/") },
+                            label = { Text("线路一 (主线)", fontSize = 11.sp) },
+                            colors = SuggestionChipDefaults.suggestionChipColors(
+                                containerColor = if (isLine1) DouyinCyan.copy(alpha = 0.2f) else DarkSurface,
+                                labelColor = if (isLine1) DouyinCyan else TextSecondary
+                            ),
+                            border = SuggestionChipDefaults.suggestionChipBorder(
+                                enabled = true,
+                                borderColor = if (isLine1) DouyinCyan else DarkSurfaceBorder
+                            )
+                        )
+                        SuggestionChip(
+                            onClick = { onSwitchLine("https://www.whomao.com") },
+                            label = { Text("线路二 (备用)", fontSize = 11.sp) },
+                            colors = SuggestionChipDefaults.suggestionChipColors(
+                                containerColor = if (isLine2) DouyinRed.copy(alpha = 0.2f) else DarkSurface,
+                                labelColor = if (isLine2) DouyinRed else TextSecondary
+                            ),
+                            border = SuggestionChipDefaults.suggestionChipBorder(
+                                enabled = true,
+                                borderColor = if (isLine2) DouyinRed else DarkSurfaceBorder
+                            )
+                        )
+                    }
                 }
             }
 

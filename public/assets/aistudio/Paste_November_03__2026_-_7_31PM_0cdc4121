@@ -1,0 +1,984 @@
+<?php
+// 1. 全局缓冲区净化，拦截一切意外输出
+if (!ob_get_level()) {
+    ob_start();
+}
+
+// 2. 彻底关闭错误直接输出
+ini_set('display_errors', '0');
+ini_set('html_errors', '0');
+error_reporting(0);
+
+/**
+ * 抖音直播全版本通用取流网关 (内置 SSRF 免疫远程导入检测)
+ * v1.0.2：批量探活同时解析离线资料；未知状态不再误报离线。
+ * v1.0.3：缓存原子写入 + 过期清理 + 缓存目录禁止外部直链访问；JSON 编码容错；批量探活超时保护。
+ *         （接口参数、返回结构、缓存键与 TTL 全部保持不变）
+ * v1.0.5：批量探活接口（?batch=）增加 ETag + 304 条件请求；其余路由与响应头保持不变。
+ * v1.0.6：缓存目录定期治理——按时间调度（不再依赖随机概率）、房间探活缓存 10 分钟即清、
+ *         ttwid/短链缓存 48 小时清、文件数硬上限、响应送出后再清理；另支持 cron：php live.php --gc
+ */
+
+register_shutdown_function(function() {
+    $error = error_get_last();
+    if ($error !== null && in_array($error['type'], array(E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR))) {
+        if (ob_get_length()) {
+            ob_clean();
+        }
+        if (!headers_sent()) {
+            header('Content-Type: application/json; charset=utf-8');
+            http_response_code(200);
+        }
+        // 详细错误只写入服务器日志，避免向远端请求方泄露路径、参数或内部信息。
+        error_log('[DouyinLiveWorkbench] Fatal PHP error: ' . $error['message'] . ' at line ' . $error['line']);
+        echo json_encode(array(
+            'code' => 500,
+            'msg'  => '服务暂时发生内部错误，请稍后重试'
+        ), JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+    }
+});
+
+define('TTL_LIVE', 20);
+define('TTL_OFF', 10);
+define('TTL_TTWID', 3600);
+define('TTL_SHORTURL', 86400);
+define('CACHE_GC_INTERVAL', 900);       // 两次定期清理之间的最小间隔（秒）
+define('CACHE_ROOM_MAX_AGE', 600);      // 房间探活缓存（TTL 仅 10~20 秒）超过 10 分钟即无用，直接删除
+define('CACHE_OTHER_MAX_AGE', 172800);  // ttwid / 短链解析缓存保留 48 小时
+define('CACHE_TMP_MAX_AGE', 3600);      // 写入中断遗留的临时文件
+define('CACHE_MAX_FILES', 3000);        // 兜底：缓存文件数硬上限，超出时优先删除最旧的
+define('CACHE_GC_BUDGET', 3.0);         // 单次清理最长耗时（秒）
+define('VERIFY_SSL', true);
+define('ALLOW_ORIGIN', ''); // 同源前端无需开放通配 CORS
+define('UA_PC', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36');
+define('UA_MOBILE', 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148');
+
+header('Content-Type: application/json; charset=utf-8');
+header('Cache-Control: no-store, no-cache, must-revalidate');
+header('X-Content-Type-Options: nosniff');
+header('X-Frame-Options: SAMEORIGIN');
+
+if (ALLOW_ORIGIN !== '') {
+    header('Access-Control-Allow-Origin: ' . ALLOW_ORIGIN);
+    header('Access-Control-Allow-Methods: GET, POST, OPTIONS');
+    header('Access-Control-Allow-Headers: Content-Type, X-Requested-With');
+}
+
+$reqMethod = isset($_SERVER['REQUEST_METHOD']) ? $_SERVER['REQUEST_METHOD'] : 'GET';
+if ($reqMethod === 'OPTIONS') {
+    if (ob_get_length()) ob_clean();
+    http_response_code(204);
+    exit;
+}
+
+function respond($code, $d) {
+    if (ob_get_length()) {
+        ob_clean();
+    }
+    if (!headers_sent()) {
+        http_response_code(200);
+        header('Content-Type: application/json; charset=utf-8');
+    }
+    $d['code'] = $code;
+    $flags = JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE;
+    if (defined('JSON_INVALID_UTF8_SUBSTITUTE')) {
+        $flags |= JSON_INVALID_UTF8_SUBSTITUTE; // 远程文件含非 UTF-8 字节时不再整体编码失败
+    }
+    $json = json_encode($d, $flags);
+    if ($json === false) {
+        $json = json_encode(array('code' => 500, 'msg' => '响应编码失败，远程内容可能不是 UTF-8 文本'), JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+    }
+    echo $json;
+    exit;
+}
+
+/**
+ * 批量探活专用：输出与 respond(200, array('batch' => ...)) 完全一致的 JSON，并附加 ETag。
+ * 客户端携带 If-None-Match 且内容未变化时直接返回 304（无响应体），降低弱网轮询的带宽消耗。
+ * Cache-Control 仅对本接口由 no-store 调整为 private, no-cache：允许浏览器保存副本，但每次必须向服务器校验。
+ */
+function respondBatchConditional($result) {
+    $d = array('batch' => $result);
+    $d['code'] = 200;
+    $flags = JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE;
+    if (defined('JSON_INVALID_UTF8_SUBSTITUTE')) {
+        $flags |= JSON_INVALID_UTF8_SUBSTITUTE;
+    }
+    $json = json_encode($d, $flags);
+    if ($json === false) {
+        respond(200, array('batch' => $result)); // 编码失败：退回原有输出路径（含兜底），行为不变
+    }
+
+    $etag = '"' . md5($json) . '"';
+    if (ob_get_length()) {
+        ob_clean();
+    }
+    if (!headers_sent()) {
+        header('Content-Type: application/json; charset=utf-8');
+        header('Cache-Control: private, no-cache, must-revalidate');
+        header('ETag: ' . $etag);
+    }
+
+    $inm = isset($_SERVER['HTTP_IF_NONE_MATCH']) ? trim((string)$_SERVER['HTTP_IF_NONE_MATCH']) : '';
+    if ($inm !== '') {
+        foreach (explode(',', $inm) as $tag) {
+            $tag = trim($tag);
+            if ($tag === '*') {
+                http_response_code(304);
+                exit;
+            }
+            if (strncmp($tag, 'W/', 2) === 0) {
+                $tag = substr($tag, 2);
+            }
+            if ($tag === $etag) {
+                http_response_code(304);
+                exit;
+            }
+        }
+    }
+
+    http_response_code(200);
+    echo $json;
+    exit;
+}
+
+function fixUrl($u) {
+    return ($u && is_string($u)) ? preg_replace('/^http:\/\//i', 'https://', trim($u)) : null;
+}
+
+function getFirstUrl($source) {
+    if (is_string($source) && $source !== '') {
+        return fixUrl($source);
+    }
+    if (is_array($source) && !empty($source)) {
+        foreach ($source as $val) {
+            if (is_string($val) && $val !== '') {
+                return fixUrl($val);
+            }
+        }
+    }
+    return null;
+}
+
+function getCacheDir() {
+    static $dir = null;
+    if ($dir !== null) return $dir;
+
+    $local = dirname(__FILE__) . '/.cache';
+    if (!is_dir($local)) {
+        @mkdir($local, 0755, true);
+    }
+    if (is_dir($local) && is_writable($local)) {
+        // 禁止通过 URL 直接读取缓存文件（Apache；Nginx 请见部署说明在站点配置中 deny）。
+        if (!@is_file($local . '/.htaccess')) {
+            @file_put_contents($local . '/.htaccess', "<IfModule mod_authz_core.c>\nRequire all denied\n</IfModule>\n<IfModule !mod_authz_core.c>\nOrder allow,deny\nDeny from all\n</IfModule>\n");
+        }
+        if (!@is_file($local . '/index.html')) {
+            @file_put_contents($local . '/index.html', '');
+        }
+        $dir = $local;
+        return $dir;
+    }
+
+    $tmp = sys_get_temp_dir();
+    if (@is_writable($tmp)) {
+        $dir = $tmp;
+        return $dir;
+    }
+
+    $dir = dirname(__FILE__);
+    return $dir;
+}
+
+function cacheFile($k) {
+    // 房间探活缓存使用独立前缀 dylive_r_，便于清理时无需读取内容即可区分（其余类型文件名保持不变）。
+    $prefix = (strncmp($k, 'room_ok_', 8) === 0 || strncmp($k, 'room_off_', 9) === 0) ? 'dylive_r_' : 'dylive_';
+    return getCacheDir() . '/' . $prefix . md5($k) . '.cache';
+}
+
+function cacheRead($k, $ttl) {
+    $f = cacheFile($k);
+    if (!@is_file($f)) return null;
+    $mtime = @filemtime($f);
+    if ($mtime === false || (time() - $mtime) >= $ttl) return null;
+    $v = @file_get_contents($f);
+    return ($v === false || $v === '') ? null : $v;
+}
+
+function cacheWrite($k, $v) {
+    // 先写临时文件再 rename：读取方永远不会读到写了一半的 JSON。
+    $f = cacheFile($k);
+    $tmp = $f . '.' . getmypid() . '.' . mt_rand(100000, 999999) . '.tmp';
+    if (@file_put_contents($tmp, $v, LOCK_EX) === false) {
+        @unlink($tmp);
+        return;
+    }
+    if (!@rename($tmp, $f)) {
+        @unlink($tmp);
+        @file_put_contents($f, $v, LOCK_EX); // 个别 Windows/旧版 PHP 下 rename 覆盖失败时的兜底
+    }
+}
+
+/**
+ * 缓存清理（只处理本程序的 dylive_* 文件，不触碰 .htaccess / index.html / 其他应用文件）：
+ *   dylive_r_*   房间探活缓存      > CACHE_ROOM_MAX_AGE  删除
+ *   *.tmp        写入遗留临时文件  > CACHE_TMP_MAX_AGE   删除
+ *   其余 dylive_*                  > CACHE_OTHER_MAX_AGE 删除
+ *   存活文件数 > CACHE_MAX_FILES 时，再按修改时间从旧到新删除超出部分。
+ */
+function cacheGcRun() {
+    @ignore_user_abort(true);
+    @set_time_limit(20);
+    $dir = getCacheDir();
+    $h = @opendir($dir);
+    if (!$h) return;
+
+    $t0 = microtime(true);
+    $now = time();
+    $alive = array();
+    $seen = 0;
+    while (($name = readdir($h)) !== false) {
+        if (strncmp($name, 'dylive_', 7) !== 0 || $name === 'dylive_gc.stamp') continue;
+        if (++$seen > 20000 || (microtime(true) - $t0) > CACHE_GC_BUDGET) break;
+
+        $f = $dir . '/' . $name;
+        if (!@is_file($f)) continue;
+        $mt = @filemtime($f);
+        if ($mt === false) continue;
+
+        if (substr($name, -4) === '.tmp') {
+            $max = CACHE_TMP_MAX_AGE;
+        } elseif (strncmp($name, 'dylive_r_', 9) === 0) {
+            $max = CACHE_ROOM_MAX_AGE;
+        } else {
+            $max = CACHE_OTHER_MAX_AGE;
+        }
+
+        if (($now - $mt) > $max) {
+            @unlink($f);
+        } else {
+            $alive[$f] = $mt;
+        }
+    }
+    closedir($h);
+
+    if (count($alive) > CACHE_MAX_FILES) {
+        asort($alive); // 修改时间最早的排在前面
+        $excess = count($alive) - CACHE_MAX_FILES;
+        foreach ($alive as $f => $mt) {
+            if ($excess-- <= 0) break;
+            @unlink($f);
+        }
+    }
+}
+
+// 按时间调度：距上次清理超过 CACHE_GC_INTERVAL 才执行；先占位再登记，避免并发请求重复清理。
+// 清理放在响应送出之后（FPM 下用户无感；其他 SAPI 单次最多占用 CACHE_GC_BUDGET 秒，且每个间隔仅一次）。
+function cacheGcMaybe() {
+    $stamp = getCacheDir() . '/dylive_gc.stamp';
+    $mt = @filemtime($stamp);
+    if ($mt !== false && (time() - $mt) < CACHE_GC_INTERVAL) return;
+    if (!@touch($stamp)) return; // 目录不可写：不登记，避免每个请求都尝试
+    register_shutdown_function(function () {
+        if (function_exists('fastcgi_finish_request')) {
+            while (ob_get_level() > 0) {
+                @ob_end_flush();
+            }
+            @fastcgi_finish_request();
+        }
+        cacheGcRun();
+    });
+}
+
+// 命令行定时任务：php /path/to/live.php --gc （不受间隔限制，立即清理一次）
+if (PHP_SAPI === 'cli') {
+    global $argv;
+    if (isset($argv) && is_array($argv) && in_array('--gc', $argv, true)) {
+        cacheGcRun();
+        echo "cache gc done\n";
+        exit;
+    }
+} else {
+    cacheGcMaybe();
+}
+
+function httpRequest($url, $headers = array(), $body = null, $withHeader = false, $ua = UA_PC) {
+    if (!function_exists('curl_init')) return '';
+
+    $ch = curl_init($url);
+    $opt = array(
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_HTTPHEADER     => $headers,
+        CURLOPT_HEADER         => $withHeader,
+        CURLOPT_CONNECTTIMEOUT => 4,
+        CURLOPT_TIMEOUT        => 8,
+        CURLOPT_ENCODING       => 'gzip,deflate',
+        CURLOPT_USERAGENT      => $ua,
+        CURLOPT_SSL_VERIFYPEER => VERIFY_SSL,
+        CURLOPT_SSL_VERIFYHOST => 2,
+        CURLOPT_TCP_NODELAY    => 1,
+    );
+    if ($body !== null) {
+        $opt[CURLOPT_POST] = true;
+        $opt[CURLOPT_POSTFIELDS] = $body;
+    }
+    curl_setopt_array($ch, $opt);
+    $res = curl_exec($ch);
+    curl_close($ch);
+    return is_string($res) ? $res : '';
+}
+
+function getTtwid() {
+    $c = cacheRead('ttwid_token', TTL_TTWID);
+    if ($c !== null) {
+        return $c;
+    }
+    $postData = json_encode(array(
+        'region'        => 'cn',
+        'aid'           => 1768,
+        'needFid'       => false,
+        'service'       => 'www.ixigua.com',
+        'migrate_info'  => array('ticket' => '', 'source' => 'node'),
+        'cbUrlProtocol' => 'https',
+        'union'         => true,
+    ));
+    $res = httpRequest('https://ttwid.bytedance.com/ttwid/union/register/', array('Content-Type: application/json'), $postData, true);
+    $t = (preg_match('/ttwid=([^;\s]+)/i', $res, $m) && !empty($m[1])) ? $m[1] : '';
+    if ($t !== '') {
+        cacheWrite('ttwid_token', $t);
+    }
+    return $t;
+}
+
+function resolveDouyinShortUrl($url) {
+    if (!preg_match('/^https?:\/\/v\.douyin\.com\/[A-Za-z0-9_-]+\/?$/i', $url)) {
+        return null;
+    }
+    $cacheKey = 'surl_' . md5($url);
+    $hit = cacheRead($cacheKey, TTL_SHORTURL);
+    if ($hit !== null) {
+        return $hit;
+    }
+
+    if (!function_exists('curl_init')) return null;
+
+    $ch = curl_init($url);
+    curl_setopt_array($ch, array(
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_HEADER         => true,
+        CURLOPT_NOBODY         => true,
+        CURLOPT_FOLLOWLOCATION => false,
+        CURLOPT_TIMEOUT        => 5,
+        CURLOPT_USERAGENT      => UA_MOBILE,
+        CURLOPT_SSL_VERIFYPEER => VERIFY_SSL,
+        CURLOPT_SSL_VERIFYHOST => 2,
+    ));
+    $headerRaw = (string)curl_exec($ch);
+    curl_close($ch);
+
+    if (preg_match('/Location:\s*([^\r\n]+)/i', $headerRaw, $lm)) {
+        $loc = trim($lm[1]);
+        if (preg_match('/(?:reflow\/|room_id=)(\d{15,22})/', $loc, $m)) {
+            cacheWrite($cacheKey, $m[1]);
+            return $m[1];
+        }
+        if (preg_match('/live\.douyin\.com\/(\d+)/', $loc, $m)) {
+            cacheWrite($cacheKey, $m[1]);
+            return $m[1];
+        }
+    }
+    return null;
+}
+
+/* ========================================================
+   军工级远程安全检测模块：防 SSRF、防重绑定、防超限 DoS
+   ======================================================== */
+
+function isPublicIp($ip) {
+    if (!filter_var($ip, FILTER_VALIDATE_IP)) {
+        return false;
+    }
+    // 过滤私有与保留地址
+    $flags = FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE;
+    if (filter_var($ip, FILTER_VALIDATE_IP, $flags) === false) {
+        return false;
+    }
+    $long = ip2long($ip);
+    if ($long !== false) {
+        // 0.0.0.0/8
+        if (($long & 0xFF000000) === 0) return false;
+        // 100.64.0.0/10 (运营商级 NAT)
+        if (($long & 0xFFC00000) === 0x64400000) return false;
+        // 127.0.0.0/8 (环回)
+        if (($long & 0xFF000000) === 0x7F000000) return false;
+        // 169.254.0.0/16 (链路本地 / 云主机元数据)
+        if (($long & 0xFFFF0000) === 0xA9FE0000) return false;
+        // 224.0.0.0/4 (组播与广播)
+        if (($long & 0xF0000000) === 0xE0000000) return false;
+        if (($long & 0xF0000000) === 0xF0000000) return false;
+    }
+    return true;
+}
+
+function resolveRemoteRedirect($baseUrl, $location) {
+    $location = trim($location);
+    if ($location === '') return null;
+    if (preg_match('/^https?:\/\//i', $location)) return $location;
+
+    $base = parse_url($baseUrl);
+    if (!$base || !isset($base['scheme'], $base['host'])) return null;
+    $scheme = strtolower($base['scheme']);
+    $host = $base['host'];
+    $port = isset($base['port']) ? (int)$base['port'] : null;
+    $authority = $scheme . '://' . $host;
+    if ($port !== null && !(($scheme === 'http' && $port === 80) || ($scheme === 'https' && $port === 443))) {
+        $authority .= ':' . $port;
+    }
+
+    if (strpos($location, '//') === 0) return $scheme . ':' . $location;
+    if (isset($location[0]) && $location[0] === '/') return $authority . $location;
+
+    $basePath = isset($base['path']) ? $base['path'] : '/';
+    if (isset($location[0]) && $location[0] === '?') {
+        return $authority . $basePath . $location;
+    }
+    $directory = preg_replace('~/[^/]*$~', '/', $basePath);
+    if ($directory === null || $directory === '') $directory = '/';
+    return $authority . $directory . $location;
+}
+
+function fetchRemoteSafe($url, $hop = 0) {
+    if ($hop > 3) {
+        respond(400, array('msg' => '重定向跳转次数过多，已终止拉取'));
+    }
+    if (!is_string($url) || strlen($url) > 2048 || preg_match('/[\x00-\x20\x7f]/', $url)) {
+        respond(400, array('msg' => '远程链接格式非法或长度超限'));
+    }
+
+    $parsed = parse_url($url);
+    if (!$parsed || !isset($parsed['scheme'], $parsed['host']) || isset($parsed['user']) || isset($parsed['pass'])) {
+        respond(400, array('msg' => '非法或无法解析的远程链接'));
+    }
+    $scheme = strtolower($parsed['scheme']);
+    if ($scheme !== 'http' && $scheme !== 'https') {
+        respond(400, array('msg' => '安全策略拦截：仅支持 HTTP 与 HTTPS 协议'));
+    }
+    $port = isset($parsed['port']) ? (int)$parsed['port'] : ($scheme === 'https' ? 443 : 80);
+    $allowedPorts = array(80, 443, 8080, 8443);
+    if (!in_array($port, $allowedPorts, true)) {
+        respond(400, array('msg' => '安全策略拦截：目标端口不在安全放行列表中'));
+    }
+
+    $host = trim($parsed['host'], '[]');
+    if ($host === '' || preg_match('/[^a-zA-Z0-9.:-]/', $host)) {
+        respond(400, array('msg' => '远程主机名格式非法'));
+    }
+
+    // 当前锁定策略使用 IPv4 CURLOPT_RESOLVE；IPv6 字面量不走未经锁定的请求。
+    if (filter_var($host, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6)) {
+        respond(400, array('msg' => '当前远程导入安全策略暂不支持 IPv6 字面量地址'));
+    }
+
+    if (filter_var($host, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
+        $ipList = array($host);
+    } else {
+        $ipList = @gethostbynamel($host);
+        $recordsAaaa = @dns_get_record($host, DNS_AAAA);
+        if (is_array($recordsAaaa)) {
+            foreach ($recordsAaaa as $record) {
+                if (isset($record['ipv6']) && !isPublicIp($record['ipv6'])) {
+                    respond(403, array('msg' => '安全策略拦截：远程主机同时解析到内网或保留 IPv6 地址'));
+                }
+            }
+        }
+        if (!$ipList) {
+            $recordsA = @dns_get_record($host, DNS_A);
+            if (is_array($recordsA)) {
+                $ipList = array();
+                foreach ($recordsA as $record) {
+                    if (isset($record['ip'])) $ipList[] = $record['ip'];
+                }
+            }
+        }
+    }
+
+    if (empty($ipList)) {
+        respond(400, array('msg' => '远程主机解析失败或未提供可锁定的 IPv4 地址'));
+    }
+
+    $ipList = array_values(array_unique($ipList));
+    foreach ($ipList as $ip) {
+        if (!isPublicIp($ip)) {
+            respond(403, array('msg' => '安全策略拦截：禁止访问内网或保留私有地址 (' . htmlspecialchars($ip, ENT_QUOTES, 'UTF-8') . ')'));
+        }
+    }
+
+    if (!function_exists('curl_init')) {
+        respond(503, array('msg' => '服务器未启用 PHP cURL 扩展，无法执行远程导入'));
+    }
+
+    // 非标准数字主机写法可能被不同网络栈解释为特殊 IPv4 表达式，直接拒绝。
+    if (preg_match('/^[0-9.]+$/', $host) && !filter_var($host, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
+        respond(400, array('msg' => '安全策略拦截：不支持非标准 IPv4 主机写法'));
+    }
+
+    $targetIp = $ipList[0];
+    $ch = curl_init();
+    $header = '';
+    $headerTooLarge = false;
+    $body = '';
+    $tooLarge = false;
+    $maxBodyBytes = 1048576;
+    $opt = array(
+        CURLOPT_URL            => $url,
+        CURLOPT_RETURNTRANSFER => false,
+        CURLOPT_HEADER         => false,
+        CURLOPT_HEADERFUNCTION => function($curl, $line) use (&$header, &$headerTooLarge) {
+            if (strlen($header) + strlen($line) > 65536) {
+                $headerTooLarge = true;
+                return 0;
+            }
+            $header .= $line;
+            return strlen($line);
+        },
+        CURLOPT_WRITEFUNCTION  => function($curl, $chunk) use (&$body, &$tooLarge, $maxBodyBytes) {
+            $length = strlen($chunk);
+            if (strlen($body) + $length > $maxBodyBytes) {
+                $tooLarge = true;
+                return 0;
+            }
+            $body .= $chunk;
+            return $length;
+        },
+        CURLOPT_CONNECTTIMEOUT => 3,
+        CURLOPT_TIMEOUT        => 6,
+        CURLOPT_PROXY          => '', // 禁止继承环境代理，避免 DNS 锁定被代理链绕过
+        CURLOPT_IPRESOLVE      => CURL_IPRESOLVE_V4,
+        CURLOPT_ENCODING       => '',
+        CURLOPT_USERAGENT      => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) DouyinLiveWorkbench/3.2',
+        CURLOPT_SSL_VERIFYPEER => true,
+        CURLOPT_SSL_VERIFYHOST => 2,
+        CURLOPT_FOLLOWLOCATION => false, // 禁用盲目跳转，逐跳重新解析并锁定 DNS
+    );
+    // 域名请求强制固定 DNS 结果；IP 字面量已直接完成地址校验，无需 DNS 映射。
+    if (!filter_var($host, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
+        $opt[CURLOPT_RESOLVE] = array("{$host}:{$port}:{$targetIp}");
+    }
+    curl_setopt_array($ch, $opt);
+    $rawResult = curl_exec($ch);
+    $httpCode = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $curlError = curl_errno($ch);
+    curl_close($ch);
+
+    if ($tooLarge) {
+        respond(413, array('msg' => '远程源文件体积过大（单次上限 1MB）'));
+    }
+    if ($headerTooLarge) {
+        respond(502, array('msg' => '远程服务器响应头超出安全限制'));
+    }
+    if ($rawResult === false) {
+        // 证书错误与网络错误均不向外暴露底层细节。
+        error_log('[DouyinLiveWorkbench] Remote import cURL error: ' . $curlError);
+        respond(504, array('msg' => '远程拉取失败、证书校验未通过或连接超时'));
+    }
+
+    // 受控重定向校验，每一跳都会重新执行协议、端口、DNS 与 IP 检查。
+    if (in_array($httpCode, array(301, 302, 303, 307, 308), true)) {
+        if (preg_match_all('/^Location:\s*([^\r\n]+)/im', $header, $matches) && !empty($matches[1])) {
+            $nextUrl = resolveRemoteRedirect($url, trim(end($matches[1])));
+            if (!$nextUrl) respond(400, array('msg' => '远程重定向地址无效'));
+            $nextParsed = parse_url($nextUrl);
+            if ($scheme === 'https' && isset($nextParsed['scheme']) && strtolower($nextParsed['scheme']) !== 'https') {
+                respond(403, array('msg' => '安全策略拦截：禁止 HTTPS 重定向降级到 HTTP'));
+            }
+            return fetchRemoteSafe($nextUrl, $hop + 1);
+        }
+    }
+
+    if ($httpCode < 200 || $httpCode >= 400) {
+        respond($httpCode, array('msg' => '远程服务器响应错误，HTTP 状态码: ' . $httpCode));
+    }
+
+    respond(200, array(
+        'code'   => 200,
+        'source' => $url,
+        'size'   => strlen($body),
+        'raw'    => $body
+    ));
+}
+
+/* ===== 路由 1：远程源安全导入处理 ===== */
+if (isset($_REQUEST['remote_url']) || (isset($_REQUEST['action']) && $_REQUEST['action'] === 'remote_import')) {
+    $rUrl = trim((string)(isset($_REQUEST['remote_url']) ? $_REQUEST['remote_url'] : ''));
+    if ($rUrl === '') {
+        respond(400, array('msg' => '请传入合法的远程订阅链接 (remote_url)'));
+    }
+    fetchRemoteSafe($rUrl);
+}
+
+function firstNonEmptyString($values) {
+    foreach ($values as $value) {
+        if (is_string($value) && trim($value) !== '') return trim($value);
+        if (is_numeric($value) && (string)$value !== '0') return (string)$value;
+    }
+    return '';
+}
+
+function safeTextLimit($value, $limit) {
+    $value = (string)$value;
+    if (function_exists('mb_substr')) return mb_substr($value, 0, $limit, 'UTF-8');
+    if (preg_match_all('/./us', $value, $matches)) return implode('', array_slice($matches[0], 0, $limit));
+    return substr($value, 0, $limit);
+}
+
+function extractAvatarUrl($owner) {
+    if (!is_array($owner)) return '';
+    $avatar = isset($owner['avatar_thumb']) ? $owner['avatar_thumb'] : (isset($owner['avatar_medium']) ? $owner['avatar_medium'] : (isset($owner['avatar']) ? $owner['avatar'] : array()));
+    if (is_string($avatar)) return fixUrl($avatar);
+    if (is_array($avatar)) {
+        if (isset($avatar['url_list']) && is_array($avatar['url_list'])) return getFirstUrl($avatar['url_list']);
+        if (isset($avatar['url']) && is_string($avatar['url'])) return fixUrl($avatar['url']);
+    }
+    return '';
+}
+
+function extractStreamSet($room, $qualityMap) {
+    if (!is_array($room)) return array();
+    $streams = array();
+    $su = isset($room['stream_url']) && is_array($room['stream_url']) ? $room['stream_url'] : array();
+    $streamTreeRaw = isset($su['live_core_sdk_data']['pull_data']['stream_data']) ? (string)$su['live_core_sdk_data']['pull_data']['stream_data'] : '';
+    $streamTree = $streamTreeRaw !== '' ? json_decode($streamTreeRaw, true) : null;
+    if (is_array($streamTree) && !empty($streamTree['data'])) {
+        foreach ($qualityMap as $key => $label) {
+            $main = isset($streamTree['data'][$key]['main']) && is_array($streamTree['data'][$key]['main']) ? $streamTree['data'][$key]['main'] : null;
+            if ($main) {
+                $streams[$key] = array(
+                    'name' => $label,
+                    'flv' => fixUrl(isset($main['flv']) ? $main['flv'] : null),
+                    'hls' => fixUrl(isset($main['hls']) ? $main['hls'] : null)
+                );
+            }
+        }
+    }
+    if (empty($streams)) {
+        $flvList = isset($su['flv_pull_url']) ? $su['flv_pull_url'] : null;
+        $flv = isset($su['rtmp_pull_url']) ? fixUrl($su['rtmp_pull_url']) : getFirstUrl($flvList);
+        $hls = isset($su['hls_pull_url']) ? fixUrl($su['hls_pull_url']) : null;
+        if ($flv || $hls) {
+            $streams['default'] = array('name' => '高清 (推荐)', 'flv' => $flv, 'hls' => $hls);
+        }
+    }
+    return $streams;
+}
+
+/**
+ * 从不同版本的抖音响应结构提取房间公开资料。
+ * 只在上游明确返回数值 status 时认定状态已核验，网络错误/风控响应保持 unknown。
+ */
+function mergeRoomSnapshot($room, &$info, $qualityMap) {
+    if (!is_array($room)) return false;
+
+    $owner = array();
+    foreach (array('owner', 'user', 'anchor', 'owner_info', 'user_info') as $ownerKey) {
+        if (isset($room[$ownerKey]) && is_array($room[$ownerKey])) {
+            $owner = $room[$ownerKey];
+            break;
+        }
+    }
+
+    $nickname = firstNonEmptyString(array(
+        isset($owner['nickname']) ? $owner['nickname'] : '',
+        isset($owner['nick_name']) ? $owner['nick_name'] : '',
+        isset($owner['display_id']) ? $owner['display_id'] : '',
+        isset($room['nickname']) ? $room['nickname'] : '',
+        isset($room['anchor_name']) ? $room['anchor_name'] : ''
+    ));
+    if ($nickname !== '') $info['anchor_name'] = safeTextLimit($nickname, 50);
+
+    $roomTitle = firstNonEmptyString(array(
+        isset($room['title']) ? $room['title'] : '',
+        isset($room['room_title']) ? $room['room_title'] : '',
+        isset($room['live_title']) ? $room['live_title'] : ''
+    ));
+    if ($roomTitle !== '') $info['title'] = safeTextLimit($roomTitle, 100);
+
+    $avatar = extractAvatarUrl($owner);
+    if ($avatar !== '') $info['avatar'] = $avatar;
+
+    if (array_key_exists('status', $room) && is_numeric($room['status'])) {
+        $info['status_known'] = true;
+        if ((int)$room['status'] === 2) $info['is_live'] = true;
+        elseif (!$info['is_live']) $info['is_live'] = false;
+    }
+
+    if ($info['is_live']) {
+        $streams = extractStreamSet($room, $qualityMap);
+        if (!empty($streams)) $info['streams'] = $streams;
+    }
+
+    return ($nickname !== '' || $roomTitle !== '' || $avatar !== '' || array_key_exists('status', $room));
+}
+
+function collectRoomCandidates($payload) {
+    if (!is_array($payload)) return array();
+    $candidates = array();
+    $paths = array(
+        array('data', 'room'),
+        array('data', 'data', 0),
+        array('data', 'data', 0, 'room'),
+        array('data', 'data', 0, 'room_info'),
+        array('data', 'room_info'),
+        array('data', 'data', 'room'),
+        array('room'),
+        array('room_info')
+    );
+    foreach ($paths as $path) {
+        $value = $payload;
+        foreach ($path as $part) {
+            if (is_array($value) && array_key_exists($part, $value)) $value = $value[$part];
+            else { $value = null; break; }
+        }
+        if (is_array($value)) $candidates[] = $value;
+    }
+    return $candidates;
+}
+
+function fetchRoomInfo($rid) {
+    $qualityMap = array(
+        'origin' => '原画 (1080P60)',
+        'uhd'    => '超清 (1080P)',
+        'hd'     => '高清 (720P)',
+        'sd'     => '标清 (540P)'
+    );
+    $info = array(
+        'is_live' => false,
+        'status_known' => false,
+        'anchor_name' => '',
+        'title' => '',
+        'avatar' => '',
+        'streams' => array()
+    );
+
+    // 1) 优先查询 room_id 信息。即使已结束，也尝试保留 owner/title/avatar。
+    if (strlen($rid) >= 15) {
+        $reflowApi = 'https://webcast.amemv.com/webcast/room/reflow/info/?room_id=' . rawurlencode($rid) . '&live_id=1&app_id=1128';
+        $rfRaw = httpRequest($reflowApi, array('Accept: application/json'), null, false, UA_MOBILE);
+        $rfJson = json_decode($rfRaw, true);
+        foreach (collectRoomCandidates($rfJson) as $roomCandidate) {
+            mergeRoomSnapshot($roomCandidate, $info, $qualityMap);
+        }
+    }
+
+    // 2) 若资料不完整、状态未验证或在线但缺少流地址，再走 web_rid 入口补全。
+    $needWebEnter = (!$info['status_known'] || $info['anchor_name'] === '' || $info['avatar'] === '' || ($info['is_live'] && empty($info['streams'])));
+    if ($needWebEnter) {
+        $queryParams = array(
+            'aid'              => 6383,
+            'app_name'         => 'douyin_web',
+            'live_id'          => 1,
+            'device_platform'  => 'web',
+            'language'         => 'zh-CN',
+            'enter_from'       => 'web_live',
+            'cookie_enabled'   => 'true',
+            'screen_width'     => 1920,
+            'screen_height'    => 1080,
+            'browser_language' => 'zh-CN',
+            'browser_platform' => 'Win32',
+            'browser_name'     => 'Chrome',
+            'browser_version'  => '124.0.0.0',
+            'web_rid'          => $rid,
+        );
+        $api = 'https://live.douyin.com/webcast/room/web/enter/?' . http_build_query($queryParams);
+        $headers = array(
+            'Accept: application/json, text/plain, */*',
+            'Accept-Language: zh-CN,zh;q=0.9',
+            'Referer: https://live.douyin.com/' . $rid,
+            'User-Agent: ' . UA_PC
+        );
+        $ttwid = getTtwid();
+        if ($ttwid !== '') $headers[] = 'Cookie: ttwid=' . $ttwid;
+
+        $raw = httpRequest($api, $headers, null, false, UA_PC);
+        $data = json_decode($raw, true);
+        foreach (collectRoomCandidates($data) as $roomCandidate) {
+            mergeRoomSnapshot($roomCandidate, $info, $qualityMap);
+        }
+    }
+
+    return $info;
+}
+
+/* ===== 路由 2：批量探活接口 ===== */
+if (isset($_GET['batch'])) {
+    @set_time_limit(60);
+    $deadline = microtime(true) + 18; // 超过后未缓存的房间返回 unknown，由前端下一轮继续，避免触发 PHP 超时致命错误
+    $rawList = explode(',', (string)$_GET['batch']);
+    $result = array();
+    $count = 0;
+    foreach ($rawList as $item) {
+        $cleanId = trim($item);
+        if (!preg_match('/^\d{3,22}$/', $cleanId) || ++$count > 20) continue;
+
+        $c = cacheRead('room_ok_' . $cleanId, TTL_LIVE);
+        if ($c !== null) {
+            $dec = json_decode($c, true);
+            if (is_array($dec)) {
+                $result[$cleanId] = array(
+                    'status' => 'live',
+                    'title'  => isset($dec['title']) ? $dec['title'] : '',
+                    'avatar' => isset($dec['avatar']) ? $dec['avatar'] : '',
+                    'name'   => isset($dec['anchor_name']) ? $dec['anchor_name'] : ''
+                );
+                continue;
+            }
+        }
+
+        $cOff = cacheRead('room_off_' . $cleanId, TTL_OFF);
+        if ($cOff !== null) {
+            $decOff = json_decode($cOff, true);
+            // 仅复用新版带元数据的离线缓存；旧版只有 msg 的缓存允许自然失效后重查。
+            if (is_array($decOff) && isset($decOff['probe_version']) && (int)$decOff['probe_version'] >= 2) {
+                $result[$cleanId] = array(
+                    'status' => 'offline',
+                    'title'  => isset($decOff['title']) ? $decOff['title'] : '',
+                    'avatar' => isset($decOff['avatar']) ? $decOff['avatar'] : '',
+                    'name'   => isset($decOff['anchor_name']) ? $decOff['anchor_name'] : ''
+                );
+                continue;
+            }
+        }
+
+        if (microtime(true) > $deadline) {
+            $result[$cleanId] = array('status' => 'unknown', 'title' => '', 'avatar' => '', 'name' => '');
+            continue;
+        }
+
+        $info = fetchRoomInfo($cleanId);
+        if (!empty($info['status_known'])) {
+            $status = !empty($info['is_live']) ? 'live' : 'offline';
+            $cachePayload = json_encode(array(
+                'probe_version' => 2,
+                'code' => $status === 'live' ? 200 : 404,
+                'web_rid' => $cleanId,
+                'anchor_name' => $info['anchor_name'],
+                'title' => $info['title'],
+                'avatar' => $info['avatar'],
+                'streams' => $info['streams']
+            ), JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+            if ($status === 'live') cacheWrite('room_ok_' . $cleanId, $cachePayload);
+            else cacheWrite('room_off_' . $cleanId, $cachePayload);
+
+            $result[$cleanId] = array(
+                'status' => $status,
+                'title'  => $info['title'],
+                'avatar' => $info['avatar'],
+                'name'   => $info['anchor_name']
+            );
+        } else {
+            // 上游超时、风控、响应结构改变时保持 unknown，前端不得据此改成离线。
+            $result[$cleanId] = array(
+                'status' => 'unknown',
+                'title'  => isset($info['title']) ? $info['title'] : '',
+                'avatar' => isset($info['avatar']) ? $info['avatar'] : '',
+                'name'   => isset($info['anchor_name']) ? $info['anchor_name'] : ''
+            );
+        }
+    }
+
+    respondBatchConditional($result);
+}
+
+/* ===== 路由 3：单房解析与拉流 ===== */
+$input = '';
+if (isset($_REQUEST['rid']) && $_REQUEST['rid'] !== '') {
+    $input = (string)$_REQUEST['rid'];
+} elseif (isset($_REQUEST['url']) && $_REQUEST['url'] !== '') {
+    $input = (string)$_REQUEST['url'];
+} elseif (isset($_REQUEST['text']) && $_REQUEST['text'] !== '') {
+    $input = (string)$_REQUEST['text'];
+}
+$input = trim($input);
+
+if (function_exists('get_magic_quotes_gpc') && @get_magic_quotes_gpc()) {
+    $input = stripslashes($input);
+}
+
+$rid = null;
+if (preg_match('/https?:\/\/v\.douyin\.com\/[A-Za-z0-9_-]+\/?/', $input, $sm)) {
+    $rid = resolveDouyinShortUrl($sm[0]);
+}
+if (!$rid && preg_match('/(?:live\.douyin\.com\/|follow\/live\/)(\d{3,22})/', $input, $m)) {
+    $rid = $m[1];
+}
+if (!$rid && preg_match('/\b(\d{3,22})\b/', $input, $m)) {
+    $rid = $m[1];
+}
+
+if (!$rid) {
+    respond(400, array('msg' => '请输入有效的房间号或分享链接'));
+}
+
+$c = cacheRead("room_ok_" . $rid, TTL_LIVE);
+if ($c !== null) {
+    if (ob_get_length()) ob_clean();
+    echo $c;
+    exit;
+}
+$cOff = cacheRead("room_off_" . $rid, TTL_OFF);
+if ($cOff !== null) {
+    if (ob_get_length()) ob_clean();
+    echo $cOff;
+    exit;
+}
+
+$info = fetchRoomInfo($rid);
+
+if (empty($info['status_known'])) {
+    respond(503, array(
+        'msg' => '暂时无法核验直播间状态，可能是上游超时或访问受限，请稍后重试',
+        'web_rid' => $rid,
+        'anchor_name' => isset($info['anchor_name']) ? $info['anchor_name'] : '',
+        'title' => isset($info['title']) ? $info['title'] : '',
+        'avatar' => isset($info['avatar']) ? $info['avatar'] : ''
+    ));
+}
+
+if (empty($info['is_live'])) {
+    $off = json_encode(array(
+        'probe_version' => 2,
+        'code' => 404,
+        'msg' => '主播当前未开播或房间号不存在',
+        'web_rid' => $rid,
+        'anchor_name' => $info['anchor_name'],
+        'title' => $info['title'],
+        'avatar' => $info['avatar'],
+        'streams' => array()
+    ), JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+    cacheWrite('room_off_' . $rid, $off);
+    if (ob_get_length()) ob_clean();
+    echo $off;
+    exit;
+}
+
+if (empty($info['streams'])) {
+    respond(503, array(
+        'msg' => '直播间已确认开播，但上游暂未返回可播放流地址，请稍后重试',
+        'web_rid' => $rid,
+        'anchor_name' => $info['anchor_name'],
+        'title' => $info['title'],
+        'avatar' => $info['avatar']
+    ));
+}
+
+$out = json_encode(array(
+    'code'        => 200,
+    'web_rid'     => $rid,
+    'anchor_name' => $info['anchor_name'],
+    'title'       => $info['title'],
+    'avatar'      => $info['avatar'],
+    'streams'     => $info['streams'],
+), JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+
+cacheWrite("room_ok_" . $rid, $out);
+if (ob_get_length()) ob_clean();
+echo $out;

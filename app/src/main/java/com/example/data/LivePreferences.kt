@@ -9,6 +9,7 @@ class LivePreferences(context: Context) {
 
     companion object {
         const val DEFAULT_URL = "https://tv.fuxiaoya.com/"
+        const val LINE_TWO_URL = "https://www.whomao.com"
         const val API_ENDPOINT_URL = "https://tv.fuxiaoya.com/live.php"
         private const val KEY_TARGET_URL = "target_url"
         private const val KEY_KEEP_SCREEN_ON = "keep_screen_on"

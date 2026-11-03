@@ -7,6 +7,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.ActivityInfo
 import android.content.res.Configuration
+import android.graphics.Rect
 import android.media.AudioAttributes
 import android.media.AudioFocusRequest
 import android.media.AudioManager
@@ -53,14 +54,9 @@ import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.lifecycle.lifecycleScope
 import com.example.data.LivePreferences
-import com.example.data.db.StreamRecordRepository
-import com.example.engine.DouyinStreamResolver
-import com.example.engine.LivePlayerEngine
 import com.example.ui.ChangeUrlDialog
 import com.example.ui.ClearCacheConfirmDialog
 import com.example.ui.ControlBottomSheet
-import com.example.ui.NativeLivePlayerOverlay
-import com.example.ui.QuickRoomDialog
 import com.example.ui.UpdateDialog
 import com.example.ui.theme.*
 import com.example.util.UpdateManager
@@ -80,16 +76,13 @@ class MainActivity : ComponentActivity() {
     private var audioManager: AudioManager? = null
     private var audioFocusRequest: AudioFocusRequest? = null
 
-    // 原生 Media3 ExoPlayer 直播引擎
-    private lateinit var livePlayerEngine: LivePlayerEngine
-    private lateinit var recordRepository: StreamRecordRepository
-
     private val desktopUserAgent =
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
     private var defaultMobileUserAgent: String = ""
 
-    // 实时直播流横竖比标记
+    // 实时直播流横竖比标记与视频位置探测 (用于画中画无缝贴合裁剪)
     private var isStreamPortrait: Boolean = true
+    private var videoSourceRect: Rect? = null
     // 画中画模式状态
     private val pipModeState = mutableStateOf(false)
     // 电视遥控器菜单键回调
@@ -101,67 +94,29 @@ class MainActivity : ComponentActivity() {
     ) {
         super.onPictureInPictureModeChanged(isInPictureInPictureMode, newConfig)
         pipModeState.value = isInPictureInPictureMode
-        val js = if (isInPictureInPictureMode) {
-            """
-            (function() {
-                var style = document.getElementById('__pip_pure_video_style');
-                if (!style) {
-                    style = document.createElement('style');
-                    style.id = '__pip_pure_video_style';
-                    style.innerHTML = `
-                        body.android-pip-mode {
-                            background: #000000 !important;
-                            overflow: hidden !important;
-                            margin: 0 !important;
-                            padding: 0 !important;
-                        }
-                        body.android-pip-mode * {
-                            visibility: hidden !important;
-                            opacity: 0 !important;
-                            pointer-events: none !important;
-                        }
-                        body.android-pip-mode video,
-                        body.android-pip-mode video * {
-                            visibility: visible !important;
-                            opacity: 1 !important;
-                            pointer-events: auto !important;
-                            position: fixed !important;
-                            top: 0 !important;
-                            left: 0 !important;
-                            width: 100vw !important;
-                            height: 100vh !important;
-                            z-index: 2147483647 !important;
-                            object-fit: contain !important;
-                            background: #000000 !important;
-                        }
-                    `;
-                    document.head.appendChild(style);
-                }
-                document.body.classList.add('android-pip-mode');
-                var v = document.getElementById('video') || document.querySelector('video');
-                if (v) {
-                    v.play().catch(function(){});
-                }
-            })();
+        if (isInPictureInPictureMode) {
+            webView?.onResume()
+            val js = """
+                (function() {
+                    if (window.__enterPipIsolation) window.__enterPipIsolation();
+                    var v = document.getElementById('video') || document.querySelector('video');
+                    if (v && v.paused) v.play().catch(function(){});
+                })();
             """.trimIndent()
+            webView?.evaluateJavascript(js, null)
         } else {
-            """
-            (function() {
-                document.body.classList.remove('android-pip-mode');
-                var style = document.getElementById('__pip_pure_video_style');
-                if (style && style.parentNode) {
-                    style.parentNode.removeChild(style);
-                }
-                var v = document.getElementById('video') || document.querySelector('video');
-                if (v) {
-                    v.style.width = '';
-                    v.style.height = '';
-                    v.style.objectFit = '';
-                }
-            })();
+            val js = """
+                (function() {
+                    if (window.__exitPipIsolation) window.__exitPipIsolation();
+                    var v = document.getElementById('video') || document.querySelector('video');
+                    if (v && v.paused) v.play().catch(function(){});
+                })();
             """.trimIndent()
+            webView?.evaluateJavascript(js, null)
+            webView?.postDelayed({
+                updatePipParams()
+            }, 300)
         }
-        webView?.evaluateJavascript(js, null)
     }
 
     override fun onUserLeaveHint() {
@@ -169,23 +124,62 @@ class MainActivity : ComponentActivity() {
         enterPipModeSafely()
     }
 
-    fun enterPipModeSafely(): Boolean {
+    fun updatePipParams() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            return try {
-                val ratio = if (isStreamPortrait) {
-                    Rational(9, 16)
-                } else {
-                    Rational(16, 9)
-                }
+            try {
+                val ratio = if (isStreamPortrait) Rational(9, 16) else Rational(16, 9)
                 val builder = PictureInPictureParams.Builder()
                     .setAspectRatio(ratio)
+                videoSourceRect?.let { r ->
+                    if (r.width() > 10 && r.height() > 10) {
+                        builder.setSourceRectHint(r)
+                    }
+                }
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
                     builder.setAutoEnterEnabled(true)
                     builder.setSeamlessResizeEnabled(true)
                 }
-                enterPictureInPictureMode(builder.build())
+                setPictureInPictureParams(builder.build())
             } catch (e: Exception) {
                 e.printStackTrace()
+            }
+        }
+    }
+
+    fun enterPipModeSafely(): Boolean {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            // 军工级无缝画中画：在进入前立即触发网页端纯视频隔离，确保捕捉帧和视口仅包含直播视频
+            webView?.evaluateJavascript(
+                "(function() { if (window.__enterPipIsolation) window.__enterPipIsolation(); })();",
+                null
+            )
+            return try {
+                val ratio = if (isStreamPortrait) Rational(9, 16) else Rational(16, 9)
+                val builder = PictureInPictureParams.Builder()
+                    .setAspectRatio(ratio)
+                videoSourceRect?.let { r ->
+                    if (r.width() > 10 && r.height() > 10) {
+                        builder.setSourceRectHint(r)
+                    }
+                }
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                    builder.setAutoEnterEnabled(true)
+                    builder.setSeamlessResizeEnabled(true)
+                }
+                val entered = enterPictureInPictureMode(builder.build())
+                if (!entered) {
+                    webView?.evaluateJavascript(
+                        "(function() { if (window.__exitPipIsolation) window.__exitPipIsolation(); })();",
+                        null
+                    )
+                }
+                entered
+            } catch (e: Exception) {
+                e.printStackTrace()
+                webView?.evaluateJavascript(
+                    "(function() { if (window.__exitPipIsolation) window.__exitPipIsolation(); })();",
+                    null
+                )
                 false
             }
         }
@@ -202,8 +196,6 @@ class MainActivity : ComponentActivity() {
         insetsController.isAppearanceLightNavigationBars = false
 
         preferences = LivePreferences(this)
-        recordRepository = StreamRecordRepository.getInstance(this)
-        livePlayerEngine = LivePlayerEngine(this)
         defaultMobileUserAgent = WebSettings.getDefaultUserAgent(this)
         audioManager = getSystemService(Context.AUDIO_SERVICE) as? AudioManager
 
@@ -289,7 +281,6 @@ class MainActivity : ComponentActivity() {
         var fullscreenMode by remember { mutableStateOf(preferences.fullscreenOrientationMode) }
 
         var isCustomViewActive by remember { mutableStateOf(false) }
-        var activeNativeRoomInfo by remember { mutableStateOf<DouyinStreamResolver.LiveRoomInfo?>(null) }
 
         var showBottomSheet by remember { mutableStateOf(false) }
         var showUrlDialog by remember { mutableStateOf(false) }
@@ -303,10 +294,6 @@ class MainActivity : ComponentActivity() {
         // Back button handler
         BackHandler {
             when {
-                activeNativeRoomInfo != null -> {
-                    activeNativeRoomInfo = null
-                    requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
-                }
                 customView != null -> {
                     hideCustomViewInternal()
                     isCustomViewActive = false
@@ -361,16 +348,50 @@ class MainActivity : ComponentActivity() {
                         // 注入原生与前端通信桥梁，用于实时监测视频宽高比、换线自愈与画中画联动接洽
                         addJavascriptInterface(object {
                             @JavascriptInterface
+                            fun onVideoMetricsReported(left: Float, top: Float, right: Float, bottom: Float, vw: Int, vh: Int) {
+                                runOnUiThread {
+                                    val wv = webView ?: return@runOnUiThread
+                                    if (pipModeState.value) return@runOnUiThread
+                                    val loc = IntArray(2)
+                                    wv.getLocationInWindow(loc)
+                                    val density = resources.displayMetrics.density
+
+                                    val l = loc[0] + (left * density).toInt()
+                                    val t = loc[1] + (top * density).toInt()
+                                    val r = loc[0] + (right * density).toInt()
+                                    val b = loc[1] + (bottom * density).toInt()
+
+                                    val winW = window.decorView.width
+                                    val winH = window.decorView.height
+
+                                    if (r > l && b > t && winW > 0 && winH > 0) {
+                                        val clampedRect = Rect(
+                                            l.coerceIn(0, winW),
+                                            t.coerceIn(0, winH),
+                                            r.coerceIn(0, winW),
+                                            b.coerceIn(0, winH)
+                                        )
+                                        if (clampedRect.width() > 10 && clampedRect.height() > 10) {
+                                            videoSourceRect = clampedRect
+                                            if (vh > 0 && vw > 0) {
+                                                isStreamPortrait = (vh > vw)
+                                            }
+                                            updatePipParams()
+                                        }
+                                    }
+                                }
+                            }
+
+                            @JavascriptInterface
+                            fun onVideoBoundsDetected(left: Float, top: Float, right: Float, bottom: Float) {
+                                onVideoMetricsReported(left, top, right, bottom, 0, 0)
+                            }
+
+                            @JavascriptInterface
                             fun onVideoRatioDetected(portrait: Boolean) {
                                 isStreamPortrait = portrait
-                                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && isInPictureInPictureMode) {
-                                    try {
-                                        val ratio = if (portrait) Rational(9, 16) else Rational(16, 9)
-                                        val params = PictureInPictureParams.Builder()
-                                            .setAspectRatio(ratio)
-                                            .build()
-                                        setPictureInPictureParams(params)
-                                    } catch (e: Exception) {}
+                                runOnUiThread {
+                                    updatePipParams()
                                 }
                             }
 
@@ -513,11 +534,11 @@ class MainActivity : ComponentActivity() {
                 }
             )
 
-            // 防黑屏优雅过渡层 (在直播控制台加载完成前提供视觉过渡，杜绝黑屏)
+            // 极速防黑屏优雅过渡层 (在直播控制台加载完成前提供视觉过渡，杜绝黑屏)
             AnimatedVisibility(
-                visible = isLoading && loadProgress < 90 && !isCustomViewActive && activeNativeRoomInfo == null && !isInPip,
+                visible = isLoading && loadProgress < 90 && !isCustomViewActive && !isInPip,
                 enter = fadeIn(),
-                exit = fadeOut(animationSpec = tween(400))
+                exit = fadeOut(animationSpec = tween(350))
             ) {
                 Box(
                     modifier = Modifier
@@ -525,8 +546,8 @@ class MainActivity : ComponentActivity() {
                         .background(
                             androidx.compose.ui.graphics.Brush.verticalGradient(
                                 colors = listOf(
-                                    Color(0xFF0C0D14),
-                                    Color(0xFF07080B)
+                                    Color(0xFF090A10),
+                                    Color(0xFF050508)
                                 )
                             )
                         ),
@@ -538,25 +559,25 @@ class MainActivity : ComponentActivity() {
                     ) {
                         Box(
                             modifier = Modifier
-                                .size(68.dp)
+                                .size(64.dp)
                                 .clip(CircleShape)
                                 .background(
                                     androidx.compose.ui.graphics.Brush.radialGradient(
                                         colors = listOf(
-                                            DouyinCyan.copy(alpha = 0.22f),
+                                            DouyinCyan.copy(alpha = 0.25f),
                                             DouyinRed.copy(alpha = 0.08f),
                                             Color.Transparent
                                         )
                                     )
                                 )
-                                .border(1.dp, DouyinCyan.copy(alpha = 0.35f), CircleShape),
+                                .border(1.2.dp, DouyinCyan.copy(alpha = 0.4f), CircleShape),
                             contentAlignment = Alignment.Center
                         ) {
                             Icon(
                                 imageVector = Icons.Default.Tv,
                                 contentDescription = null,
                                 tint = DouyinCyan,
-                                modifier = Modifier.size(32.dp)
+                                modifier = Modifier.size(30.dp)
                             )
                         }
 
@@ -600,7 +621,7 @@ class MainActivity : ComponentActivity() {
             }
 
             // Top Linear Progress Bar
-            if (isLoading && loadProgress in 1..99 && !isCustomViewActive && activeNativeRoomInfo == null && !isInPip) {
+            if (isLoading && loadProgress in 1..99 && !isCustomViewActive && !isInPip) {
                 LinearProgressIndicator(
                     progress = { loadProgress / 100f },
                     modifier = Modifier
@@ -613,7 +634,7 @@ class MainActivity : ComponentActivity() {
             }
 
             // Error Overlay
-            if (isPageError && !isCustomViewActive && activeNativeRoomInfo == null && !isInPip) {
+            if (isPageError && !isCustomViewActive && !isInPip) {
                 Card(
                     modifier = Modifier
                         .align(Alignment.Center)
@@ -686,7 +707,7 @@ class MainActivity : ComponentActivity() {
             }
 
             // Top Status Bar Protective Scrim
-            if (!isCustomViewActive && activeNativeRoomInfo == null && !isInPip) {
+            if (!isCustomViewActive && !isInPip) {
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -697,7 +718,7 @@ class MainActivity : ComponentActivity() {
             }
 
             // Floating Control Pill (Normal Mode)
-            if (!isCustomViewActive && activeNativeRoomInfo == null && !isInPip) {
+            if (!isCustomViewActive && !isInPip) {
                 Surface(
                     onClick = { showBottomSheet = true },
                     shape = RoundedCornerShape(24.dp),
@@ -870,7 +891,9 @@ class MainActivity : ComponentActivity() {
                 },
                 onEnterPip = {
                     showBottomSheet = false
-                    enterPipModeSafely()
+                    webView?.postDelayed({
+                        enterPipModeSafely()
+                    }, 120)
                 },
                 onOpenUrlDialog = {
                     showBottomSheet = false
@@ -887,6 +910,12 @@ class MainActivity : ComponentActivity() {
                 onCheckUpdate = {
                     showBottomSheet = false
                     showUpdateDialog = true
+                },
+                onSwitchLine = { newUrl ->
+                    preferences.targetUrl = newUrl
+                    currentUrl = newUrl
+                    showBottomSheet = false
+                    webView?.loadUrl(newUrl)
                 }
             )
         }
@@ -972,7 +1001,107 @@ class MainActivity : ComponentActivity() {
     private fun injectLiveStabilizerScript(wv: WebView?) {
         val script = """
             (function() {
-                // 1. 网页端原生与前端画中画接洽融合
+                // 1. 网页端原生与前端画中画接洽融合（保障画中画只展示纯净直播视频，杜绝网页背景干扰）
+                try {
+                    document.pictureInPictureEnabled = true;
+                } catch(e) {}
+
+                window.__enterPipIsolation = function() {
+                    var style = document.getElementById('__pip_pure_video_style');
+                    if (!style) {
+                        style = document.createElement('style');
+                        style.id = '__pip_pure_video_style';
+                        style.innerHTML = `
+                            html.android-pip-mode,
+                            body.android-pip-mode {
+                                background: #000000 !important;
+                                overflow: hidden !important;
+                                margin: 0 !important;
+                                padding: 0 !important;
+                                width: 100vw !important;
+                                height: 100vh !important;
+                            }
+                            body.android-pip-mode .banner,
+                            body.android-pip-mode .controls,
+                            body.android-pip-mode .playlist,
+                            body.android-pip-mode .toasts,
+                            body.android-pip-mode .mask,
+                            body.android-pip-mode .unmute,
+                            body.android-pip-mode dialog,
+                            body.android-pip-mode header,
+                            body.android-pip-mode aside,
+                            body.android-pip-mode noscript,
+                            body.android-pip-mode .stage::before {
+                                display: none !important;
+                                opacity: 0 !important;
+                                visibility: hidden !important;
+                                pointer-events: none !important;
+                            }
+                            body.android-pip-mode .workspace,
+                            body.android-pip-mode .player-col,
+                            body.android-pip-mode .stage,
+                            body.android-pip-mode #stage {
+                                position: fixed !important;
+                                top: 0 !important;
+                                left: 0 !important;
+                                right: 0 !important;
+                                bottom: 0 !important;
+                                width: 100vw !important;
+                                height: 100vh !important;
+                                max-width: 100vw !important;
+                                max-height: 100vh !important;
+                                margin: 0 !important;
+                                padding: 0 !important;
+                                border: none !important;
+                                border-radius: 0 !important;
+                                box-shadow: none !important;
+                                background: #000000 !important;
+                                overflow: hidden !important;
+                                aspect-ratio: auto !important;
+                                z-index: 99999 !important;
+                            }
+                            body.android-pip-mode video,
+                            body.android-pip-mode #video {
+                                display: block !important;
+                                visibility: visible !important;
+                                opacity: 1 !important;
+                                position: absolute !important;
+                                top: 0 !important;
+                                left: 0 !important;
+                                width: 100% !important;
+                                height: 100% !important;
+                                max-width: 100% !important;
+                                max-height: 100% !important;
+                                margin: 0 !important;
+                                padding: 0 !important;
+                                object-fit: contain !important;
+                                background: #000000 !important;
+                                z-index: 100000 !important;
+                            }
+                        `;
+                        document.head.appendChild(style);
+                    }
+                    document.documentElement.classList.add('android-pip-mode');
+                    document.body.classList.add('android-pip-mode');
+                    var v = document.getElementById('video') || document.querySelector('video');
+                    if (v) {
+                        v.muted = false;
+                        v.volume = 1.0;
+                        if (v.paused) v.play().catch(function(){});
+                    }
+                };
+
+                window.__exitPipIsolation = function() {
+                    document.documentElement.classList.remove('android-pip-mode');
+                    document.body.classList.remove('android-pip-mode');
+                    var style = document.getElementById('__pip_pure_video_style');
+                    if (style && style.parentNode) {
+                        style.parentNode.removeChild(style);
+                    }
+                    var v = document.getElementById('video') || document.querySelector('video');
+                    if (v && v.paused) v.play().catch(function(){});
+                };
+
                 if (window.HTMLVideoElement && HTMLVideoElement.prototype && !HTMLVideoElement.prototype.__douyin_pip_hooked) {
                     HTMLVideoElement.prototype.__douyin_pip_hooked = true;
                     var origRequestPip = HTMLVideoElement.prototype.requestPictureInPicture;
@@ -986,16 +1115,17 @@ class MainActivity : ComponentActivity() {
                     };
                 }
 
-                // 全局事件拦截：页面内任意画中画按钮点击无缝接洽原生系统画中画
+                // 全局事件拦截：页面内任意画中画按钮点击及快捷键无缝接洽原生系统画中画
                 if (!window.__douyin_pip_listener_added) {
                     window.__douyin_pip_listener_added = true;
                     document.addEventListener('click', function(e) {
                         var target = e.target;
                         while (target && target !== document.body) {
+                            var id = target.id || '';
                             var title = (target.getAttribute && target.getAttribute('title')) || '';
                             var aria = (target.getAttribute && target.getAttribute('aria-label')) || '';
                             var cls = target.className || '';
-                            var str = (title + ' ' + aria + ' ' + cls).toLowerCase();
+                            var str = (id + ' ' + title + ' ' + aria + ' ' + cls).toLowerCase();
                             if (str.indexOf('pip') !== -1 || str.indexOf('画中画') !== -1 || str.indexOf('picture-in-picture') !== -1) {
                                 if (window.AndroidLiveBridge && window.AndroidLiveBridge.requestPictureInPicture) {
                                     window.AndroidLiveBridge.requestPictureInPicture();
@@ -1007,14 +1137,43 @@ class MainActivity : ComponentActivity() {
                             target = target.parentElement;
                         }
                     }, true);
+
+                    window.addEventListener('keydown', function(e) {
+                        if (e.key === 'p' || e.key === 'P') {
+                            if (['INPUT', 'SELECT', 'TEXTAREA'].indexOf(document.activeElement?.tagName) === -1) {
+                                if (window.AndroidLiveBridge && window.AndroidLiveBridge.requestPictureInPicture) {
+                                    window.AndroidLiveBridge.requestPictureInPicture();
+                                    e.preventDefault();
+                                    e.stopPropagation();
+                                }
+                            }
+                        }
+                    }, true);
                 }
 
                 function notifyDimensions() {
+                    if (document.body && document.body.classList.contains('android-pip-mode')) {
+                        return;
+                    }
                     var v = document.getElementById('video') || document.querySelector('video');
                     if (v && v.videoWidth > 0 && v.videoHeight > 0) {
-                        var isPortrait = (v.videoHeight >= v.videoWidth);
+                        var vw = v.videoWidth;
+                        var vh = v.videoHeight;
+                        var isPortrait = (vh > vw);
                         if (window.AndroidLiveBridge && window.AndroidLiveBridge.onVideoRatioDetected) {
                             window.AndroidLiveBridge.onVideoRatioDetected(isPortrait);
+                        }
+                        var stage = document.getElementById('stage') || v;
+                        var rect = stage.getBoundingClientRect();
+                        if (window.AndroidLiveBridge && window.AndroidLiveBridge.onVideoMetricsReported) {
+                            window.AndroidLiveBridge.onVideoMetricsReported(
+                                rect.left,
+                                rect.top,
+                                rect.right,
+                                rect.bottom,
+                                vw,
+                                vh
+                            );
                         }
                     }
                 }
@@ -1199,9 +1358,6 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun injectRoomToWeb(roomInput: String) {
-        lifecycleScope.launch(Dispatchers.IO) {
-            recordRepository.recordAccess(roomId = roomInput)
-        }
         val sanitized = roomInput.replace("\\", "\\\\").replace("'", "\\'").replace("\"", "\\\"").replace("\n", " ")
         val js = """
             (function() {
@@ -1275,17 +1431,19 @@ class MainActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         webView?.onResume()
-        livePlayerEngine.resumeOnScreenOn()
         resumeLiveStreamOnScreenOn()
     }
 
     override fun onPause() {
         super.onPause()
-        webView?.onPause()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N && isInPictureInPictureMode) {
+            // 画中画模式保持活动运行，绝不挂起 WebView，避免视频黑屏与音频中断
+        } else {
+            webView?.onPause()
+        }
     }
 
     override fun onDestroy() {
-        livePlayerEngine.release()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             audioFocusRequest?.let { audioManager?.abandonAudioFocusRequest(it) }
         } else {
