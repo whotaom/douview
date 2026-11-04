@@ -12,9 +12,12 @@ import android.media.AudioAttributes
 import android.media.AudioFocusRequest
 import android.media.AudioManager
 import android.net.Uri
+import android.app.UiModeManager
+import android.content.pm.PackageManager
 import android.net.http.SslError
 import android.os.Build
 import android.os.Bundle
+import android.os.Environment
 import android.util.Rational
 import android.view.KeyEvent
 import android.view.View
@@ -30,7 +33,7 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.ActivityResultLauncher
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.*
-import androidx.compose.animation.core.tween
+import androidx.compose.animation.core.*
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.focusable
@@ -45,6 +48,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -87,6 +91,13 @@ class MainActivity : ComponentActivity() {
     private val pipModeState = mutableStateOf(false)
     // 电视遥控器菜单键回调
     private var toggleBottomSheetAction: (() -> Unit)? = null
+
+    val isTvDevice: Boolean by lazy {
+        val uiModeManager = getSystemService(Context.UI_MODE_SERVICE) as? UiModeManager
+        (uiModeManager?.currentModeType == Configuration.UI_MODE_TYPE_TELEVISION) ||
+                packageManager.hasSystemFeature(PackageManager.FEATURE_LEANBACK) ||
+                packageManager.hasSystemFeature(PackageManager.FEATURE_TELEVISION)
+    }
 
     override fun onPictureInPictureModeChanged(
         isInPictureInPictureMode: Boolean,
@@ -210,6 +221,12 @@ class MainActivity : ComponentActivity() {
 
         requestAppAudioFocus()
         updateKeepScreenOn(preferences.keepScreenOn)
+
+        // 电视端自适应：检测到电视或机顶盒环境时默认锁定横屏自适应模式
+        if (isTvDevice && !preferences.forceLandscape) {
+            requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+        }
+
         checkAndPerformAutoCacheCleanup()
 
         fileChooserLauncher =
@@ -237,41 +254,161 @@ class MainActivity : ComponentActivity() {
      */
     private fun checkAndPerformAutoCacheCleanup() {
         if (preferences.shouldAutoClearCache()) {
-            lifecycleScope.launch(Dispatchers.IO) {
-                try {
-                    cacheDir?.listFiles()?.forEach { file ->
-                        try {
-                            file.deleteRecursively()
-                        } catch (e: Exception) {
-                            e.printStackTrace()
-                        }
-                    }
-                    codeCacheDir?.listFiles()?.forEach { file ->
-                        try {
-                            file.deleteRecursively()
-                        } catch (e: Exception) {
-                            e.printStackTrace()
-                        }
-                    }
-                    preferences.recordCacheCleared()
-                } catch (e: Exception) {
-                    e.printStackTrace()
-                }
-                launch(Dispatchers.Main) {
+            performFullCacheCleanupInternal()
+        }
+    }
+
+    fun performFullCacheCleanupInternal(onDone: (() -> Unit)? = null) {
+        lifecycleScope.launch(Dispatchers.IO) {
+            try {
+                cacheDir?.listFiles()?.forEach { file ->
                     try {
-                        webView?.clearCache(true)
+                        file.deleteRecursively()
                     } catch (e: Exception) {
                         e.printStackTrace()
                     }
                 }
+                codeCacheDir?.listFiles()?.forEach { file ->
+                    try {
+                        file.deleteRecursively()
+                    } catch (e: Exception) {
+                        e.printStackTrace()
+                    }
+                }
+                externalCacheDir?.listFiles()?.forEach { file ->
+                    try {
+                        file.deleteRecursively()
+                    } catch (e: Exception) {
+                        e.printStackTrace()
+                    }
+                }
+                // 清理下载目录中的历史更新包
+                try {
+                    val downloadDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+                    downloadDir?.listFiles { file ->
+                        file.name.startsWith("douview_update") && file.name.endsWith(".apk")
+                    }?.forEach { it.delete() }
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                }
+                preferences.recordCacheCleared()
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+            launch(Dispatchers.Main) {
+                try {
+                    webView?.clearCache(true)
+                    // 在网页端检测并自动移除已过期的临时直播流缓存与离线频道数据
+                    val cleanJs = """
+                        (function() {
+                            try {
+                                if (window.app && typeof window.app.purgeEphemeralOffline === 'function') {
+                                    window.app.purgeEphemeralOffline();
+                                }
+                                var ls = window.localStorage;
+                                if (ls) {
+                                    var streamCache = ls.getItem('dy_workbench_stream_v1');
+                                    if (streamCache) {
+                                        var parsed = JSON.parse(streamCache);
+                                        var now = Date.now();
+                                        var cleaned = {};
+                                        for (var k in parsed) {
+                                            if (parsed[k] && parsed[k].t && (now - parsed[k].t < 12 * 3600 * 1000)) {
+                                                cleaned[k] = parsed[k];
+                                            }
+                                        }
+                                        ls.setItem('dy_workbench_stream_v1', JSON.stringify(cleaned));
+                                    }
+                                }
+                            } catch(e) {}
+                        })();
+                    """.trimIndent()
+                    webView?.evaluateJavascript(cleanJs, null)
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                }
+                onDone?.invoke()
             }
         }
     }
 
     override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
-        if (keyCode == KeyEvent.KEYCODE_MENU) {
-            toggleBottomSheetAction?.invoke()
-            return true
+        when (keyCode) {
+            KeyEvent.KEYCODE_MENU -> {
+                toggleBottomSheetAction?.invoke()
+                return true
+            }
+            KeyEvent.KEYCODE_DPAD_UP, KeyEvent.KEYCODE_CHANNEL_UP -> {
+                // 电视端自适应：遥控器上键/频道加切换上一个频道
+                val js = """
+                    (function() {
+                        try {
+                            if (window.app && typeof window.app.navigateChannel === 'function') {
+                                window.app.navigateChannel(-1);
+                            } else {
+                                var items = document.querySelectorAll('.playlist li, .playlist .item, .channel-item, .list-item');
+                                var activeIdx = -1;
+                                for (var i = 0; i < items.length; i++) {
+                                    if (items[i].classList.contains('active') || items[i].classList.contains('playing')) {
+                                        activeIdx = i; break;
+                                    }
+                                }
+                                if (activeIdx > 0 && items[activeIdx - 1]) {
+                                    items[activeIdx - 1].click();
+                                } else if (items.length > 0) {
+                                    items[items.length - 1].click();
+                                }
+                            }
+                        } catch(e) {}
+                    })();
+                """.trimIndent()
+                webView?.evaluateJavascript(js, null)
+                return true
+            }
+            KeyEvent.KEYCODE_DPAD_DOWN, KeyEvent.KEYCODE_CHANNEL_DOWN -> {
+                // 电视端自适应：遥控器下键/频道减切换下一个频道
+                val js = """
+                    (function() {
+                        try {
+                            if (window.app && typeof window.app.navigateChannel === 'function') {
+                                window.app.navigateChannel(1);
+                            } else {
+                                var items = document.querySelectorAll('.playlist li, .playlist .item, .channel-item, .list-item');
+                                var activeIdx = -1;
+                                for (var i = 0; i < items.length; i++) {
+                                    if (items[i].classList.contains('active') || items[i].classList.contains('playing')) {
+                                        activeIdx = i; break;
+                                    }
+                                }
+                                if (activeIdx >= 0 && activeIdx < items.length - 1 && items[activeIdx + 1]) {
+                                    items[activeIdx + 1].click();
+                                } else if (items.length > 0) {
+                                    items[0].click();
+                                }
+                            }
+                        } catch(e) {}
+                    })();
+                """.trimIndent()
+                webView?.evaluateJavascript(js, null)
+                return true
+            }
+            KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER,
+            KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE, KeyEvent.KEYCODE_MEDIA_PLAY, KeyEvent.KEYCODE_MEDIA_PAUSE -> {
+                // 电视端自适应：确认键/播放暂停键
+                val js = """
+                    (function() {
+                        try {
+                            var v = document.getElementById('video') || document.querySelector('video');
+                            if (v) {
+                                if (v.paused) v.play().catch(function(){});
+                                else v.pause();
+                            }
+                        } catch(e) {}
+                    })();
+                """.trimIndent()
+                webView?.evaluateJavascript(js, null)
+                return true
+            }
         }
         return super.onKeyDown(keyCode, event)
     }
@@ -462,6 +599,11 @@ class MainActivity : ComponentActivity() {
                             fun isPipSupported(): Boolean {
                                 return Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
                             }
+
+                            @JavascriptInterface
+                            fun isTvMode(): Boolean {
+                                return isTvDevice
+                            }
                         }, "AndroidLiveBridge")
 
                         webViewClient = object : WebViewClient() {
@@ -588,6 +730,17 @@ class MainActivity : ComponentActivity() {
                 enter = fadeIn(),
                 exit = fadeOut(animationSpec = tween(350))
             ) {
+                val infiniteTransition = rememberInfiniteTransition(label = "loading_aura")
+                val pulseScale by infiniteTransition.animateFloat(
+                    initialValue = 0.94f,
+                    targetValue = 1.06f,
+                    animationSpec = infiniteRepeatable(
+                        animation = tween(1600, easing = FastOutSlowInEasing),
+                        repeatMode = RepeatMode.Reverse
+                    ),
+                    label = "pulse_scale"
+                )
+
                 Box(
                     modifier = Modifier
                         .fillMaxSize()
@@ -595,37 +748,57 @@ class MainActivity : ComponentActivity() {
                             androidx.compose.ui.graphics.Brush.verticalGradient(
                                 colors = listOf(
                                     Color(0xFF090A10),
-                                    Color(0xFF050508)
+                                    Color(0xFF06070B),
+                                    Color(0xFF040406)
                                 )
                             )
                         ),
                     contentAlignment = Alignment.Center
                 ) {
+                    // 背景科技感呼吸光晕
+                    Box(
+                        modifier = Modifier
+                            .size(340.dp)
+                            .graphicsLayer {
+                                scaleX = pulseScale
+                                scaleY = pulseScale
+                            }
+                            .background(
+                                androidx.compose.ui.graphics.Brush.radialGradient(
+                                    colors = listOf(
+                                        DouyinCyan.copy(alpha = 0.16f),
+                                        DouyinRed.copy(alpha = 0.08f),
+                                        Color.Transparent
+                                    )
+                                )
+                            )
+                    )
+
                     Column(
                         horizontalAlignment = Alignment.CenterHorizontally,
                         verticalArrangement = Arrangement.spacedBy(16.dp)
                     ) {
                         Box(
                             modifier = Modifier
-                                .size(64.dp)
+                                .size(68.dp)
                                 .clip(CircleShape)
                                 .background(
                                     androidx.compose.ui.graphics.Brush.radialGradient(
                                         colors = listOf(
-                                            DouyinCyan.copy(alpha = 0.25f),
-                                            DouyinRed.copy(alpha = 0.08f),
+                                            DouyinCyan.copy(alpha = 0.32f),
+                                            DouyinRed.copy(alpha = 0.12f),
                                             Color.Transparent
                                         )
                                     )
                                 )
-                                .border(1.2.dp, DouyinCyan.copy(alpha = 0.4f), CircleShape),
+                                .border(1.5.dp, DouyinCyan.copy(alpha = 0.45f), CircleShape),
                             contentAlignment = Alignment.Center
                         ) {
                             Icon(
                                 imageVector = Icons.Default.Tv,
                                 contentDescription = null,
                                 tint = DouyinCyan,
-                                modifier = Modifier.size(30.dp)
+                                modifier = Modifier.size(32.dp)
                             )
                         }
 
@@ -1001,15 +1174,17 @@ class MainActivity : ComponentActivity() {
                 onDismiss = { showClearCacheDialog = false },
                 onConfirm = {
                     showClearCacheDialog = false
-                    webView?.apply {
-                        clearCache(true)
-                        clearFormData()
-                        clearHistory()
+                    performFullCacheCleanupInternal {
+                        webView?.apply {
+                            clearCache(true)
+                            clearFormData()
+                            clearHistory()
+                        }
+                        WebStorage.getInstance().deleteAllData()
+                        CookieManager.getInstance().removeAllCookies(null)
+                        Toast.makeText(this@MainActivity, "临时直播缓存与本地存储已彻底清理", Toast.LENGTH_SHORT).show()
+                        webView?.reload()
                     }
-                    WebStorage.getInstance().deleteAllData()
-                    CookieManager.getInstance().removeAllCookies(null)
-                    Toast.makeText(this@MainActivity, "缓存与本地存储已清理", Toast.LENGTH_SHORT).show()
-                    webView?.reload()
                 }
             )
         }
@@ -1059,7 +1234,50 @@ class MainActivity : ComponentActivity() {
                     document.pictureInPictureEnabled = true;
                 } catch(e) {}
 
+                // 0. Stage 元素自适应监听器：对 .stage 与 #stage 持续监听并保障退出画中画后精准复原尺寸与样式
+                (function setupStageWatcher() {
+                    var stage = document.getElementById('stage') || document.querySelector('.stage');
+                    if (!stage) return;
+
+                    if (!window.__stagePrePipStyle) {
+                        window.__stagePrePipStyle = {
+                            cssText: stage.style.cssText || '',
+                            width: stage.style.width,
+                            height: stage.style.height,
+                            maxWidth: stage.style.maxWidth,
+                            maxHeight: stage.style.maxHeight
+                        };
+                    }
+
+                    if (window.ResizeObserver && !window.__stageResizeObserver) {
+                        window.__stageResizeObserver = new ResizeObserver(function(entries) {
+                            if (document.body.classList.contains('android-pip-mode')) return;
+                            for (var i = 0; i < entries.length; i++) {
+                                var el = entries[i].target;
+                                if (el.offsetWidth > window.innerWidth && window.innerWidth > 0) {
+                                    el.style.maxWidth = '100vw';
+                                    el.style.boxSizing = 'border-box';
+                                }
+                            }
+                        });
+                        window.__stageResizeObserver.observe(stage);
+                    }
+                })();
+
                 window.__enterPipIsolation = function() {
+                    var stage = document.getElementById('stage') || document.querySelector('.stage');
+                    if (stage) {
+                        window.__stagePrePipStyle = {
+                            cssText: stage.style.cssText || '',
+                            width: stage.style.width,
+                            height: stage.style.height,
+                            maxWidth: stage.style.maxWidth,
+                            maxHeight: stage.style.maxHeight,
+                            position: stage.style.position,
+                            aspectRatio: stage.style.aspectRatio
+                        };
+                    }
+
                     var style = document.getElementById('__pip_pure_video_style');
                     if (!style) {
                         style = document.createElement('style');
@@ -1150,6 +1368,42 @@ class MainActivity : ComponentActivity() {
                     var style = document.getElementById('__pip_pure_video_style');
                     if (style && style.parentNode) {
                         style.parentNode.removeChild(style);
+                    }
+
+                    // 精准恢复 .stage 的尺寸与原始样式，防止退出画中画后布局溢出
+                    var stage = document.getElementById('stage') || document.querySelector('.stage');
+                    if (stage) {
+                        if (window.__stagePrePipStyle && typeof window.__stagePrePipStyle.cssText === 'string' && window.__stagePrePipStyle.cssText.length > 0) {
+                            stage.style.cssText = window.__stagePrePipStyle.cssText;
+                        } else {
+                            stage.style.removeProperty('position');
+                            stage.style.removeProperty('top');
+                            stage.style.removeProperty('left');
+                            stage.style.removeProperty('right');
+                            stage.style.removeProperty('bottom');
+                            stage.style.removeProperty('width');
+                            stage.style.removeProperty('height');
+                            stage.style.removeProperty('max-width');
+                            stage.style.removeProperty('max-height');
+                            stage.style.removeProperty('z-index');
+                            stage.style.removeProperty('aspect-ratio');
+                        }
+                        stage.style.maxWidth = '100%';
+                        stage.style.boxSizing = 'border-box';
+                    }
+
+                    var workspace = document.querySelector('.workspace');
+                    if (workspace) {
+                        workspace.style.removeProperty('position');
+                        workspace.style.removeProperty('width');
+                        workspace.style.removeProperty('height');
+                    }
+
+                    var playerCol = document.querySelector('.player-col');
+                    if (playerCol) {
+                        playerCol.style.removeProperty('position');
+                        playerCol.style.removeProperty('width');
+                        playerCol.style.removeProperty('height');
                     }
 
                     // 彻底重置页面缩放、视口与宽度，杜绝退出画中画后网页内容超出 APP 视窗
@@ -1355,11 +1609,63 @@ class MainActivity : ComponentActivity() {
                     if (protoSel) protoSel.addEventListener('change', onLineChange);
                     if (qualSel) qualSel.addEventListener('change', onLineChange);
 
+                    // 3. 电视端大屏适配自适应样式注入
+                    try {
+                        if (window.AndroidLiveBridge && window.AndroidLiveBridge.isTvMode && window.AndroidLiveBridge.isTvMode()) {
+                            document.body.classList.add('is-tv-mode');
+                            var tvStyle = document.getElementById('__tv_mode_style');
+                            if (!tvStyle) {
+                                tvStyle = document.createElement('style');
+                                tvStyle.id = '__tv_mode_style';
+                                tvStyle.innerHTML = `
+                                    body.is-tv-mode .stage {
+                                        border-radius: 12px !important;
+                                        box-shadow: 0 8px 32px rgba(0,0,0,0.6) !important;
+                                    }
+                                    body.is-tv-mode {
+                                        font-size: 16px !important;
+                                    }
+                                `;
+                                document.head.appendChild(tvStyle);
+                            }
+                        }
+                    } catch(e) {}
+
+                    // 4. 军工级流媒体传输断流守护 (Stream Stall Watchdog)
+                    var lastPlaybackCurrentTime = -1;
+                    var streamStagnantCount = 0;
+
                     setInterval(function() {
                         var v = document.getElementById('video') || document.querySelector('video');
                         if (v) {
                             if (v.paused || v.muted) {
                                 triggerImmediateAutoplayAndUnmute();
+                            } else if (!v.ended && v.readyState >= 1) {
+                                if (v.currentTime === lastPlaybackCurrentTime) {
+                                    streamStagnantCount++;
+                                    // 连续停滞 3 秒，判定为断流或网络丢包，立即自愈拉流
+                                    if (streamStagnantCount >= 2) {
+                                        var retryBtn = document.getElementById('retryBtn');
+                                        var reloadBtn = document.getElementById('reloadBtn');
+                                        if (retryBtn && !retryBtn.hidden) {
+                                            retryBtn.click();
+                                        } else if (reloadBtn) {
+                                            reloadBtn.click();
+                                        } else {
+                                            if (v.buffered && v.buffered.length > 0) {
+                                                var edge = v.buffered.end(v.buffered.length - 1);
+                                                if (edge - v.currentTime > 0.4) {
+                                                    v.currentTime = edge - 0.1;
+                                                }
+                                            }
+                                            v.play().catch(function(){});
+                                        }
+                                        streamStagnantCount = 0;
+                                    }
+                                } else {
+                                    lastPlaybackCurrentTime = v.currentTime;
+                                    streamStagnantCount = 0;
+                                }
                             }
                             notifyDimensions();
                         }
