@@ -109,4 +109,8 @@ class LivePreferences(context: Context) {
     fun recordCacheCleared() {
         lastClearCacheTime = System.currentTimeMillis()
     }
+
+    var lastNonZeroVolume: Int
+        get() = prefs.getInt("last_non_zero_volume", 8)
+        set(value) = prefs.edit().putInt("last_non_zero_volume", value).apply()
 }

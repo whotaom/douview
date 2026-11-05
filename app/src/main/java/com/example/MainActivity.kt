@@ -92,11 +92,49 @@ class MainActivity : ComponentActivity() {
     // 电视遥控器菜单键回调
     private var toggleBottomSheetAction: (() -> Unit)? = null
 
+    // 媒体音量控制状态
+    private var currentMediaVolume by mutableIntStateOf(10)
+    private var maxMediaVolume by mutableIntStateOf(15)
+
+    fun updateSystemVolume(newVolume: Int) {
+        audioManager?.let { am ->
+            val clamped = newVolume.coerceIn(0, maxMediaVolume)
+            am.setStreamVolume(AudioManager.STREAM_MUSIC, clamped, AudioManager.FLAG_SHOW_UI)
+            currentMediaVolume = clamped
+        }
+    }
+
+    fun toggleSystemMute() {
+        audioManager?.let { am ->
+            if (currentMediaVolume > 0) {
+                preferences.lastNonZeroVolume = currentMediaVolume
+                am.setStreamVolume(AudioManager.STREAM_MUSIC, 0, AudioManager.FLAG_SHOW_UI)
+                currentMediaVolume = 0
+            } else {
+                val restore = if (preferences.lastNonZeroVolume > 0) preferences.lastNonZeroVolume else (maxMediaVolume / 2)
+                am.setStreamVolume(AudioManager.STREAM_MUSIC, restore, AudioManager.FLAG_SHOW_UI)
+                currentMediaVolume = restore
+            }
+        }
+    }
+
     val isTvDevice: Boolean by lazy {
         val uiModeManager = getSystemService(Context.UI_MODE_SERVICE) as? UiModeManager
         (uiModeManager?.currentModeType == Configuration.UI_MODE_TYPE_TELEVISION) ||
                 packageManager.hasSystemFeature(PackageManager.FEATURE_LEANBACK) ||
                 packageManager.hasSystemFeature(PackageManager.FEATURE_TELEVISION)
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        // 电视端自适应保障：从电视 Launcher 再次点击进入时，若处于画中画立即无缝铺满全屏
+        if (isTvDevice && Build.VERSION.SDK_INT >= Build.VERSION_CODES.N && isInPictureInPictureMode) {
+            val expandIntent = Intent(this, MainActivity::class.java).apply {
+                flags = Intent.FLAG_ACTIVITY_REORDER_TO_FRONT or Intent.FLAG_ACTIVITY_SINGLE_TOP
+            }
+            startActivity(expandIntent)
+        }
     }
 
     override fun onPictureInPictureModeChanged(
@@ -141,7 +179,10 @@ class MainActivity : ComponentActivity() {
 
     override fun onUserLeaveHint() {
         super.onUserLeaveHint()
-        enterPipModeSafely()
+        // 电视端严禁离开时自动缩为画中画微型窗口，防止电视桌面被遮挡或启动即微缩
+        if (!isTvDevice) {
+            enterPipModeSafely()
+        }
     }
 
     fun updatePipParams() {
@@ -156,7 +197,8 @@ class MainActivity : ComponentActivity() {
                     }
                 }
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                    builder.setAutoEnterEnabled(true)
+                    // 电视端严禁自动画中画 (AutoEnterEnabled)，杜绝启动时被电视 Launcher 误压缩成右下角微小窗口
+                    builder.setAutoEnterEnabled(!isTvDevice)
                     builder.setSeamlessResizeEnabled(true)
                 }
                 setPictureInPictureParams(builder.build())
@@ -183,7 +225,7 @@ class MainActivity : ComponentActivity() {
                     }
                 }
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                    builder.setAutoEnterEnabled(true)
+                    builder.setAutoEnterEnabled(!isTvDevice)
                     builder.setSeamlessResizeEnabled(true)
                 }
                 val entered = enterPictureInPictureMode(builder.build())
@@ -209,6 +251,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        window.setLayout(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
 
         // 手机状态栏可见色保障 (暗色背景下强制白色状态栏文字与图标，杜绝隐形)
         val insetsController = WindowCompat.getInsetsController(window, window.decorView)
@@ -218,6 +261,10 @@ class MainActivity : ComponentActivity() {
         preferences = LivePreferences(this)
         defaultMobileUserAgent = WebSettings.getDefaultUserAgent(this)
         audioManager = getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+        audioManager?.let { am ->
+            currentMediaVolume = am.getStreamVolume(AudioManager.STREAM_MUSIC)
+            maxMediaVolume = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC).coerceAtLeast(1)
+        }
 
         requestAppAudioFocus()
         updateKeepScreenOn(preferences.keepScreenOn)
@@ -407,6 +454,20 @@ class MainActivity : ComponentActivity() {
                     })();
                 """.trimIndent()
                 webView?.evaluateJavascript(js, null)
+                return true
+            }
+            KeyEvent.KEYCODE_VOLUME_UP -> {
+                audioManager?.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_RAISE, AudioManager.FLAG_SHOW_UI)
+                audioManager?.let { currentMediaVolume = it.getStreamVolume(AudioManager.STREAM_MUSIC) }
+                return true
+            }
+            KeyEvent.KEYCODE_VOLUME_DOWN -> {
+                audioManager?.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_LOWER, AudioManager.FLAG_SHOW_UI)
+                audioManager?.let { currentMediaVolume = it.getStreamVolume(AudioManager.STREAM_MUSIC) }
+                return true
+            }
+            KeyEvent.KEYCODE_VOLUME_MUTE -> {
+                toggleSystemMute()
                 return true
             }
         }
@@ -1142,7 +1203,11 @@ class MainActivity : ComponentActivity() {
                 onAutoClearCacheToggle = { enabled ->
                     autoClearCacheEnabled = enabled
                     preferences.autoClearCacheEnabled = enabled
-                }
+                },
+                mediaVolume = currentMediaVolume,
+                maxMediaVolume = maxMediaVolume,
+                onVolumeChange = { updateSystemVolume(it) },
+                onToggleMute = { toggleSystemMute() }
             )
         }
 

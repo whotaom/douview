@@ -409,18 +409,25 @@ fun UpdateDialog(
                         onDownloadApk(targetUrl)
                     },
                     colors = ButtonDefaults.buttonColors(
-                        containerColor = if (info.hasUpdate) DouyinRed else DouyinCyan
+                        containerColor = if (info.hasUpdate) DouyinRed else DouyinCyan,
+                        contentColor = Color.White
                     ),
-                    shape = RoundedCornerShape(10.dp),
-                    modifier = Modifier.focusable()
+                    shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier
+                        .focusable()
+                        .height(44.dp)
                 ) {
                     Icon(
-                        imageVector = if (info.hasUpdate) Icons.Default.CloudDownload else Icons.Default.OpenInBrowser,
+                        imageVector = Icons.Default.Download,
                         contentDescription = null,
-                        modifier = Modifier.size(16.dp)
+                        modifier = Modifier.size(18.dp)
                     )
                     Spacer(modifier = Modifier.width(6.dp))
-                    Text(if (info.hasUpdate) "立即下载更新 (APK)" else "访问发布页面")
+                    Text(
+                        text = "下载安装",
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 14.sp
+                    )
                 }
             }
         },

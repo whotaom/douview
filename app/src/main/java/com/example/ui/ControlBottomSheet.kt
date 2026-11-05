@@ -1,6 +1,7 @@
 package com.example.ui
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.focusable
 import androidx.compose.foundation.layout.*
@@ -45,7 +46,11 @@ fun ControlBottomSheet(
     onCheckUpdate: () -> Unit = {},
     onSwitchLine: (String) -> Unit = {},
     autoClearCacheEnabled: Boolean = true,
-    onAutoClearCacheToggle: (Boolean) -> Unit = {}
+    onAutoClearCacheToggle: (Boolean) -> Unit = {},
+    mediaVolume: Int = 10,
+    maxMediaVolume: Int = 15,
+    onVolumeChange: (Int) -> Unit = {},
+    onToggleMute: () -> Unit = {}
 ) {
     ModalBottomSheet(
         onDismissRequest = onDismissRequest,
@@ -264,6 +269,81 @@ fun ControlBottomSheet(
                         contentDescription = null,
                         tint = DouyinCyan,
                         modifier = Modifier.size(18.dp)
+                    )
+                }
+            }
+
+            // 实时音量控制
+            Surface(
+                shape = RoundedCornerShape(16.dp),
+                color = DarkSurfaceElevated,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .border(1.dp, DarkSurfaceBorder, RoundedCornerShape(16.dp))
+            ) {
+                Column(
+                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            val volumeIcon = when {
+                                mediaVolume <= 0 -> Icons.Default.VolumeMute
+                                mediaVolume < maxMediaVolume / 2 -> Icons.Default.VolumeDown
+                                else -> Icons.Default.VolumeUp
+                            }
+                            val volumeColor = if (mediaVolume <= 0) DouyinRed else DouyinCyan
+
+                            IconButton(
+                                onClick = onToggleMute,
+                                modifier = Modifier
+                                    .size(34.dp)
+                                    .clip(CircleShape)
+                                    .background(volumeColor.copy(alpha = 0.15f))
+                            ) {
+                                Icon(
+                                    imageVector = volumeIcon,
+                                    contentDescription = "静音切换",
+                                    tint = volumeColor,
+                                    modifier = Modifier.size(18.dp)
+                                )
+                            }
+
+                            Text(
+                                text = "系统媒体音量",
+                                style = MaterialTheme.typography.bodyMedium,
+                                fontWeight = FontWeight.SemiBold,
+                                color = TextPrimary
+                            )
+                        }
+
+                        val percent = if (maxMediaVolume > 0) (mediaVolume * 100 / maxMediaVolume) else 0
+                        Text(
+                            text = if (mediaVolume <= 0) "已静音" else "$percent%",
+                            style = MaterialTheme.typography.labelMedium,
+                            fontWeight = FontWeight.Bold,
+                            color = if (mediaVolume <= 0) DouyinRed else DouyinCyan
+                        )
+                    }
+
+                    Slider(
+                        value = mediaVolume.toFloat().coerceIn(0f, maxMediaVolume.toFloat()),
+                        onValueChange = { onVolumeChange(it.toInt()) },
+                        valueRange = 0f..maxMediaVolume.toFloat(),
+                        steps = if (maxMediaVolume > 1) (maxMediaVolume - 1) else 0,
+                        colors = SliderDefaults.colors(
+                            thumbColor = DouyinCyan,
+                            activeTrackColor = DouyinCyan,
+                            inactiveTrackColor = DarkSurfaceBorder
+                        ),
+                        modifier = Modifier.fillMaxWidth()
                     )
                 }
             }

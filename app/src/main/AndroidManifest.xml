@@ -58,6 +58,8 @@
             android:banner="@drawable/ic_tv_banner"
             android:theme="@style/Theme.MyApplication"
             android:supportsPictureInPicture="true"
+            android:launchMode="singleTask"
+            android:resizeableActivity="true"
             android:configChanges="orientation|screenSize|keyboardHidden|screenLayout|smallestScreenSize|uiMode"
             android:windowSoftInputMode="adjustResize">
             <intent-filter>
