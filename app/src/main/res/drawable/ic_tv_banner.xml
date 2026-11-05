@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- 电视端 16:9 专用横幅底图 (320x180dp Leanback Banner) -->
+    <item>
+        <shape android:shape="rectangle">
+            <gradient
+                android:angle="135"
+                android:startColor="#090B10"
+                android:centerColor="#121622"
+                android:endColor="#050608" />
+            <corners android:radius="8dp" />
+        </shape>
+    </item>
+    <!-- 科技感青红渐变光晕轮廓 -->
+    <item
+        android:left="2dp"
+        android:top="2dp"
+        android:right="2dp"
+        android:bottom="2dp">
+        <shape android:shape="rectangle">
+            <stroke
+                android:width="1.2dp"
+                android:color="#2600F5D4" />
+            <corners android:radius="7dp" />
+        </shape>
+    </item>
+    <!-- 中心高清应用标志 -->
+    <item
+        android:width="96dp"
+        android:height="96dp"
+        android:gravity="center"
+        android:drawable="@drawable/ic_app_emblem" />
+</layer-list>
