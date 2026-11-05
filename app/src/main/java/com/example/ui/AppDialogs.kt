@@ -369,34 +369,6 @@ fun UpdateDialog(
                             modifier = Modifier.padding(10.dp)
                         )
                     }
-
-                    Surface(
-                        shape = RoundedCornerShape(8.dp),
-                        color = DouyinCyan.copy(alpha = 0.08f),
-                        border = ButtonDefaults.outlinedButtonBorder.copy(
-                            brush = androidx.compose.ui.graphics.SolidColor(DouyinCyan.copy(alpha = 0.25f))
-                        ),
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Row(
-                            modifier = Modifier.padding(8.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(6.dp)
-                        ) {
-                            Icon(
-                                imageVector = Icons.Default.Tv,
-                                contentDescription = null,
-                                tint = DouyinCyan,
-                                modifier = Modifier.size(16.dp)
-                            )
-                            Text(
-                                text = "电视端提示：若安装提示「软件包似乎无效」，系系统防证书冲突保护，请先卸载电视上的旧版本后再安装新版 APK 即可。",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = DouyinCyan,
-                                fontSize = 11.sp
-                            )
-                        }
-                    }
                 }
             }
         },

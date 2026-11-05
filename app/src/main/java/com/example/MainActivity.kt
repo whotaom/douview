@@ -89,52 +89,12 @@ class MainActivity : ComponentActivity() {
     private var videoSourceRect: Rect? = null
     // 画中画模式状态
     private val pipModeState = mutableStateOf(false)
-    // 电视遥控器菜单键回调
+    // 菜单键回调
     private var toggleBottomSheetAction: (() -> Unit)? = null
-
-    // 媒体音量控制状态
-    private var currentMediaVolume by mutableIntStateOf(10)
-    private var maxMediaVolume by mutableIntStateOf(15)
-
-    fun updateSystemVolume(newVolume: Int) {
-        audioManager?.let { am ->
-            val clamped = newVolume.coerceIn(0, maxMediaVolume)
-            am.setStreamVolume(AudioManager.STREAM_MUSIC, clamped, AudioManager.FLAG_SHOW_UI)
-            currentMediaVolume = clamped
-        }
-    }
-
-    fun toggleSystemMute() {
-        audioManager?.let { am ->
-            if (currentMediaVolume > 0) {
-                preferences.lastNonZeroVolume = currentMediaVolume
-                am.setStreamVolume(AudioManager.STREAM_MUSIC, 0, AudioManager.FLAG_SHOW_UI)
-                currentMediaVolume = 0
-            } else {
-                val restore = if (preferences.lastNonZeroVolume > 0) preferences.lastNonZeroVolume else (maxMediaVolume / 2)
-                am.setStreamVolume(AudioManager.STREAM_MUSIC, restore, AudioManager.FLAG_SHOW_UI)
-                currentMediaVolume = restore
-            }
-        }
-    }
-
-    val isTvDevice: Boolean by lazy {
-        val uiModeManager = getSystemService(Context.UI_MODE_SERVICE) as? UiModeManager
-        (uiModeManager?.currentModeType == Configuration.UI_MODE_TYPE_TELEVISION) ||
-                packageManager.hasSystemFeature(PackageManager.FEATURE_LEANBACK) ||
-                packageManager.hasSystemFeature(PackageManager.FEATURE_TELEVISION)
-    }
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
-        // 电视端自适应保障：从电视 Launcher 再次点击进入时，若处于画中画立即无缝铺满全屏
-        if (isTvDevice && Build.VERSION.SDK_INT >= Build.VERSION_CODES.N && isInPictureInPictureMode) {
-            val expandIntent = Intent(this, MainActivity::class.java).apply {
-                flags = Intent.FLAG_ACTIVITY_REORDER_TO_FRONT or Intent.FLAG_ACTIVITY_SINGLE_TOP
-            }
-            startActivity(expandIntent)
-        }
     }
 
     override fun onPictureInPictureModeChanged(
@@ -179,10 +139,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onUserLeaveHint() {
         super.onUserLeaveHint()
-        // 电视端严禁离开时自动缩为画中画微型窗口，防止电视桌面被遮挡或启动即微缩
-        if (!isTvDevice) {
-            enterPipModeSafely()
-        }
+        enterPipModeSafely()
     }
 
     fun updatePipParams() {
@@ -197,8 +154,7 @@ class MainActivity : ComponentActivity() {
                     }
                 }
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                    // 电视端严禁自动画中画 (AutoEnterEnabled)，杜绝启动时被电视 Launcher 误压缩成右下角微小窗口
-                    builder.setAutoEnterEnabled(!isTvDevice)
+                    builder.setAutoEnterEnabled(true)
                     builder.setSeamlessResizeEnabled(true)
                 }
                 setPictureInPictureParams(builder.build())
@@ -225,7 +181,7 @@ class MainActivity : ComponentActivity() {
                     }
                 }
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                    builder.setAutoEnterEnabled(!isTvDevice)
+                    builder.setAutoEnterEnabled(true)
                     builder.setSeamlessResizeEnabled(true)
                 }
                 val entered = enterPictureInPictureMode(builder.build())
@@ -261,18 +217,9 @@ class MainActivity : ComponentActivity() {
         preferences = LivePreferences(this)
         defaultMobileUserAgent = WebSettings.getDefaultUserAgent(this)
         audioManager = getSystemService(Context.AUDIO_SERVICE) as? AudioManager
-        audioManager?.let { am ->
-            currentMediaVolume = am.getStreamVolume(AudioManager.STREAM_MUSIC)
-            maxMediaVolume = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC).coerceAtLeast(1)
-        }
 
         requestAppAudioFocus()
         updateKeepScreenOn(preferences.keepScreenOn)
-
-        // 电视端自适应：检测到电视或机顶盒环境时默认锁定横屏自适应模式
-        if (isTvDevice && !preferences.forceLandscape) {
-            requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
-        }
 
         checkAndPerformAutoCacheCleanup()
 
@@ -383,91 +330,6 @@ class MainActivity : ComponentActivity() {
         when (keyCode) {
             KeyEvent.KEYCODE_MENU -> {
                 toggleBottomSheetAction?.invoke()
-                return true
-            }
-            KeyEvent.KEYCODE_DPAD_UP, KeyEvent.KEYCODE_CHANNEL_UP -> {
-                // 电视端自适应：遥控器上键/频道加切换上一个频道
-                val js = """
-                    (function() {
-                        try {
-                            if (window.app && typeof window.app.navigateChannel === 'function') {
-                                window.app.navigateChannel(-1);
-                            } else {
-                                var items = document.querySelectorAll('.playlist li, .playlist .item, .channel-item, .list-item');
-                                var activeIdx = -1;
-                                for (var i = 0; i < items.length; i++) {
-                                    if (items[i].classList.contains('active') || items[i].classList.contains('playing')) {
-                                        activeIdx = i; break;
-                                    }
-                                }
-                                if (activeIdx > 0 && items[activeIdx - 1]) {
-                                    items[activeIdx - 1].click();
-                                } else if (items.length > 0) {
-                                    items[items.length - 1].click();
-                                }
-                            }
-                        } catch(e) {}
-                    })();
-                """.trimIndent()
-                webView?.evaluateJavascript(js, null)
-                return true
-            }
-            KeyEvent.KEYCODE_DPAD_DOWN, KeyEvent.KEYCODE_CHANNEL_DOWN -> {
-                // 电视端自适应：遥控器下键/频道减切换下一个频道
-                val js = """
-                    (function() {
-                        try {
-                            if (window.app && typeof window.app.navigateChannel === 'function') {
-                                window.app.navigateChannel(1);
-                            } else {
-                                var items = document.querySelectorAll('.playlist li, .playlist .item, .channel-item, .list-item');
-                                var activeIdx = -1;
-                                for (var i = 0; i < items.length; i++) {
-                                    if (items[i].classList.contains('active') || items[i].classList.contains('playing')) {
-                                        activeIdx = i; break;
-                                    }
-                                }
-                                if (activeIdx >= 0 && activeIdx < items.length - 1 && items[activeIdx + 1]) {
-                                    items[activeIdx + 1].click();
-                                } else if (items.length > 0) {
-                                    items[0].click();
-                                }
-                            }
-                        } catch(e) {}
-                    })();
-                """.trimIndent()
-                webView?.evaluateJavascript(js, null)
-                return true
-            }
-            KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER,
-            KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE, KeyEvent.KEYCODE_MEDIA_PLAY, KeyEvent.KEYCODE_MEDIA_PAUSE -> {
-                // 电视端自适应：确认键/播放暂停键
-                val js = """
-                    (function() {
-                        try {
-                            var v = document.getElementById('video') || document.querySelector('video');
-                            if (v) {
-                                if (v.paused) v.play().catch(function(){});
-                                else v.pause();
-                            }
-                        } catch(e) {}
-                    })();
-                """.trimIndent()
-                webView?.evaluateJavascript(js, null)
-                return true
-            }
-            KeyEvent.KEYCODE_VOLUME_UP -> {
-                audioManager?.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_RAISE, AudioManager.FLAG_SHOW_UI)
-                audioManager?.let { currentMediaVolume = it.getStreamVolume(AudioManager.STREAM_MUSIC) }
-                return true
-            }
-            KeyEvent.KEYCODE_VOLUME_DOWN -> {
-                audioManager?.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_LOWER, AudioManager.FLAG_SHOW_UI)
-                audioManager?.let { currentMediaVolume = it.getStreamVolume(AudioManager.STREAM_MUSIC) }
-                return true
-            }
-            KeyEvent.KEYCODE_VOLUME_MUTE -> {
-                toggleSystemMute()
                 return true
             }
         }
@@ -659,11 +521,6 @@ class MainActivity : ComponentActivity() {
                             @JavascriptInterface
                             fun isPipSupported(): Boolean {
                                 return Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
-                            }
-
-                            @JavascriptInterface
-                            fun isTvMode(): Boolean {
-                                return isTvDevice
                             }
                         }, "AndroidLiveBridge")
 
@@ -1203,11 +1060,7 @@ class MainActivity : ComponentActivity() {
                 onAutoClearCacheToggle = { enabled ->
                     autoClearCacheEnabled = enabled
                     preferences.autoClearCacheEnabled = enabled
-                },
-                mediaVolume = currentMediaVolume,
-                maxMediaVolume = maxMediaVolume,
-                onVolumeChange = { updateSystemVolume(it) },
-                onToggleMute = { toggleSystemMute() }
+                }
             )
         }
 
@@ -1674,29 +1527,7 @@ class MainActivity : ComponentActivity() {
                     if (protoSel) protoSel.addEventListener('change', onLineChange);
                     if (qualSel) qualSel.addEventListener('change', onLineChange);
 
-                    // 3. 电视端大屏适配自适应样式注入
-                    try {
-                        if (window.AndroidLiveBridge && window.AndroidLiveBridge.isTvMode && window.AndroidLiveBridge.isTvMode()) {
-                            document.body.classList.add('is-tv-mode');
-                            var tvStyle = document.getElementById('__tv_mode_style');
-                            if (!tvStyle) {
-                                tvStyle = document.createElement('style');
-                                tvStyle.id = '__tv_mode_style';
-                                tvStyle.innerHTML = `
-                                    body.is-tv-mode .stage {
-                                        border-radius: 12px !important;
-                                        box-shadow: 0 8px 32px rgba(0,0,0,0.6) !important;
-                                    }
-                                    body.is-tv-mode {
-                                        font-size: 16px !important;
-                                    }
-                                `;
-                                document.head.appendChild(tvStyle);
-                            }
-                        }
-                    } catch(e) {}
-
-                    // 4. 军工级流媒体传输断流守护 (Stream Stall Watchdog)
+                    // 3. 军工级流媒体传输断流守护 (Stream Stall Watchdog)
                     var lastPlaybackCurrentTime = -1;
                     var streamStagnantCount = 0;
 
