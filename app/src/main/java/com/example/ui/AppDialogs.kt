@@ -373,7 +373,7 @@ fun UpdateDialog(
             }
         },
         confirmButton = {
-            if (releaseInfo != null) {
+            if (releaseInfo != null && releaseInfo!!.hasUpdate) {
                 val info = releaseInfo!!
                 Button(
                     onClick = {
