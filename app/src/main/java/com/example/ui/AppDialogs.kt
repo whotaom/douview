@@ -381,7 +381,7 @@ fun UpdateDialog(
                         onDownloadApk(targetUrl)
                     },
                     colors = ButtonDefaults.buttonColors(
-                        containerColor = if (info.hasUpdate) DouyinRed else DouyinCyan,
+                        containerColor = DouyinRed,
                         contentColor = Color.White
                     ),
                     shape = RoundedCornerShape(12.dp),

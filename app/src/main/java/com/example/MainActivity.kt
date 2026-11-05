@@ -1152,7 +1152,42 @@ class MainActivity : ComponentActivity() {
                     document.pictureInPictureEnabled = true;
                 } catch(e) {}
 
-                // 0. Stage 元素自适应监听器：对 .stage 与 #stage 持续监听并保障退出画中画后精准复原尺寸与样式
+                // 0. Stage 元素自适应监听器：对 .stage 与 #stage 持续监听并保障意外退出画中画后精准复原尺寸与样式
+                window.__restoreStageStyle = function() {
+                    var stages = document.querySelectorAll('.stage, #stage');
+                    for (var i = 0; i < stages.length; i++) {
+                        var stage = stages[i];
+                        if (window.__stagePrePipStyle && typeof window.__stagePrePipStyle.cssText === 'string' && window.__stagePrePipStyle.cssText.length > 0) {
+                            stage.style.cssText = window.__stagePrePipStyle.cssText;
+                        } else {
+                            stage.style.removeProperty('position');
+                            stage.style.removeProperty('top');
+                            stage.style.removeProperty('left');
+                            stage.style.removeProperty('right');
+                            stage.style.removeProperty('bottom');
+                            stage.style.removeProperty('width');
+                            stage.style.removeProperty('height');
+                            stage.style.removeProperty('max-width');
+                            stage.style.removeProperty('max-height');
+                            stage.style.removeProperty('z-index');
+                            stage.style.removeProperty('aspect-ratio');
+                        }
+                        stage.style.maxWidth = '100%';
+                        stage.style.width = '100%';
+                        stage.style.boxSizing = 'border-box';
+                    }
+
+                    var workspaces = document.querySelectorAll('.workspace, .player-col, main, #app');
+                    for (var j = 0; j < workspaces.length; j++) {
+                        var ws = workspaces[j];
+                        ws.style.removeProperty('position');
+                        ws.style.removeProperty('width');
+                        ws.style.removeProperty('height');
+                        ws.style.removeProperty('max-width');
+                        ws.style.removeProperty('max-height');
+                    }
+                };
+
                 (function setupStageWatcher() {
                     var stage = document.getElementById('stage') || document.querySelector('.stage');
                     if (!stage) return;
@@ -1180,6 +1215,19 @@ class MainActivity : ComponentActivity() {
                         });
                         window.__stageResizeObserver.observe(stage);
                     }
+
+                    // 持续监听 DOM 变更与画中画意外脱离状态
+                    if (window.MutationObserver && !window.__stageWatcherObserver) {
+                        window.__stageWatcherObserver = new MutationObserver(function() {
+                            if (!document.body.classList.contains('android-pip-mode')) {
+                                var s = document.getElementById('stage') || document.querySelector('.stage');
+                                if (s && s.style.position === 'fixed') {
+                                    window.__restoreStageStyle();
+                                }
+                            }
+                        });
+                        window.__stageWatcherObserver.observe(document.body, { attributes: true, attributeFilter: ['class'] });
+                    }
                 })();
 
                 window.__enterPipIsolation = function() {
@@ -1194,6 +1242,19 @@ class MainActivity : ComponentActivity() {
                             position: stage.style.position,
                             aspectRatio: stage.style.aspectRatio
                         };
+
+                        // 军工级进入画中画监听：对 .stage 元素挂载专属 MutationObserver，实时监控意外样式变动
+                        if (window.MutationObserver) {
+                            if (window.__stagePipActiveObserver) {
+                                window.__stagePipActiveObserver.disconnect();
+                            }
+                            window.__stagePipActiveObserver = new MutationObserver(function() {
+                                if (!document.body.classList.contains('android-pip-mode')) {
+                                    window.__restoreStageStyle();
+                                }
+                            });
+                            window.__stagePipActiveObserver.observe(stage, { attributes: true, attributeFilter: ['style', 'class'] });
+                        }
                     }
 
                     var style = document.getElementById('__pip_pure_video_style');
@@ -1288,40 +1349,34 @@ class MainActivity : ComponentActivity() {
                         style.parentNode.removeChild(style);
                     }
 
-                    // 精准恢复 .stage 的尺寸与原始样式，防止退出画中画后布局溢出
+                    // 退出画中画时释放专属进入监听并对 .stage 进行军工级复原与二次防溢出监听
+                    if (window.__stagePipActiveObserver) {
+                        window.__stagePipActiveObserver.disconnect();
+                        window.__stagePipActiveObserver = null;
+                    }
+
+                    window.__restoreStageStyle();
+
+                    // 对 .stage 启动退出保护监听器（持续 2 秒），防止播放器内部重排或异步样式二次污染导致界面布局溢出
                     var stage = document.getElementById('stage') || document.querySelector('.stage');
-                    if (stage) {
-                        if (window.__stagePrePipStyle && typeof window.__stagePrePipStyle.cssText === 'string' && window.__stagePrePipStyle.cssText.length > 0) {
-                            stage.style.cssText = window.__stagePrePipStyle.cssText;
-                        } else {
-                            stage.style.removeProperty('position');
-                            stage.style.removeProperty('top');
-                            stage.style.removeProperty('left');
-                            stage.style.removeProperty('right');
-                            stage.style.removeProperty('bottom');
-                            stage.style.removeProperty('width');
-                            stage.style.removeProperty('height');
-                            stage.style.removeProperty('max-width');
-                            stage.style.removeProperty('max-height');
-                            stage.style.removeProperty('z-index');
-                            stage.style.removeProperty('aspect-ratio');
+                    if (stage && window.MutationObserver) {
+                        if (window.__stageExitGuardian) {
+                            window.__stageExitGuardian.disconnect();
                         }
-                        stage.style.maxWidth = '100%';
-                        stage.style.boxSizing = 'border-box';
-                    }
-
-                    var workspace = document.querySelector('.workspace');
-                    if (workspace) {
-                        workspace.style.removeProperty('position');
-                        workspace.style.removeProperty('width');
-                        workspace.style.removeProperty('height');
-                    }
-
-                    var playerCol = document.querySelector('.player-col');
-                    if (playerCol) {
-                        playerCol.style.removeProperty('position');
-                        playerCol.style.removeProperty('width');
-                        playerCol.style.removeProperty('height');
+                        window.__stageExitGuardian = new MutationObserver(function() {
+                            if (!document.body.classList.contains('android-pip-mode')) {
+                                if (stage.style.position === 'fixed' || stage.offsetWidth > window.innerWidth) {
+                                    window.__restoreStageStyle();
+                                }
+                            }
+                        });
+                        window.__stageExitGuardian.observe(stage, { attributes: true, attributeFilter: ['style'] });
+                        setTimeout(function() {
+                            if (window.__stageExitGuardian) {
+                                window.__stageExitGuardian.disconnect();
+                                window.__stageExitGuardian = null;
+                            }
+                        }, 2000);
                     }
 
                     // 彻底重置页面缩放、视口与宽度，杜绝退出画中画后网页内容超出 APP 视窗
@@ -1351,6 +1406,8 @@ class MainActivity : ComponentActivity() {
                         document.documentElement.style.zoom = '1';
                         document.body.style.zoom = '1';
                         window.dispatchEvent(new Event('resize'));
+                        setTimeout(function() { window.dispatchEvent(new Event('resize')); }, 100);
+                        setTimeout(function() { window.dispatchEvent(new Event('resize')); }, 300);
                     } catch(err) {}
 
                     var v = document.getElementById('video') || document.querySelector('video');
@@ -1527,9 +1584,70 @@ class MainActivity : ComponentActivity() {
                     if (protoSel) protoSel.addEventListener('change', onLineChange);
                     if (qualSel) qualSel.addEventListener('change', onLineChange);
 
-                    // 3. 军工级流媒体传输断流守护 (Stream Stall Watchdog)
+                    // 3. 军工级流媒体传输断流守护与超低延迟追帧 (Stream Stall Watchdog & Live Sync)
                     var lastPlaybackCurrentTime = -1;
                     var streamStagnantCount = 0;
+
+                    function recoverStreamStall(reason) {
+                        var v = document.getElementById('video') || document.querySelector('video');
+                        if (!v) return;
+                        // 优先尝试缓冲尾部追帧（追溯最新 live edge，消除卡死停滞）
+                        if (v.buffered && v.buffered.length > 0) {
+                            var edge = v.buffered.end(v.buffered.length - 1);
+                            if (edge - v.currentTime > 0.3) {
+                                v.currentTime = edge - 0.08;
+                                v.play().catch(function(){});
+                                return;
+                            }
+                        }
+                        // 播放器内核 (hls.js / mpegts.js) 自愈
+                        try {
+                            if (window.hls) {
+                                window.hls.startLoad();
+                                window.hls.recoverMediaError();
+                            }
+                        } catch(e) {}
+                        try {
+                            if (window.mpegtsPlayer && typeof window.mpegtsPlayer.play === 'function') {
+                                window.mpegtsPlayer.play();
+                            }
+                        } catch(e) {}
+                        // 节点重试或重载
+                        var retryBtn = document.getElementById('retryBtn');
+                        var reloadBtn = document.getElementById('reloadBtn');
+                        if (retryBtn && !retryBtn.hidden) {
+                            retryBtn.click();
+                        } else if (reloadBtn) {
+                            reloadBtn.click();
+                        } else {
+                            v.play().catch(function(){});
+                        }
+                    }
+
+                    // 监听视频等待与挂起事件，毫秒级快速探测断流
+                    document.addEventListener('waiting', function(e) {
+                        if (e.target && e.target.tagName === 'VIDEO') {
+                            setTimeout(function() {
+                                var v = e.target;
+                                if (v && v.readyState < 3 && !v.paused) {
+                                    recoverStreamStall('waiting_event');
+                                }
+                            }, 1200);
+                        }
+                    }, true);
+
+                    document.addEventListener('stalled', function(e) {
+                        if (e.target && e.target.tagName === 'VIDEO') {
+                            setTimeout(function() {
+                                recoverStreamStall('stalled_event');
+                            }, 1500);
+                        }
+                    }, true);
+
+                    window.addEventListener('online', function() {
+                        recoverStreamStall('network_online');
+                        setTimeout(triggerImmediateAutoplayAndUnmute, 300);
+                    });
 
                     setInterval(function() {
                         var v = document.getElementById('video') || document.querySelector('video');
@@ -1539,23 +1657,9 @@ class MainActivity : ComponentActivity() {
                             } else if (!v.ended && v.readyState >= 1) {
                                 if (v.currentTime === lastPlaybackCurrentTime) {
                                     streamStagnantCount++;
-                                    // 连续停滞 3 秒，判定为断流或网络丢包，立即自愈拉流
+                                    // 连续停滞 2 周期(3秒)，判定为断流，立即自愈拉流
                                     if (streamStagnantCount >= 2) {
-                                        var retryBtn = document.getElementById('retryBtn');
-                                        var reloadBtn = document.getElementById('reloadBtn');
-                                        if (retryBtn && !retryBtn.hidden) {
-                                            retryBtn.click();
-                                        } else if (reloadBtn) {
-                                            reloadBtn.click();
-                                        } else {
-                                            if (v.buffered && v.buffered.length > 0) {
-                                                var edge = v.buffered.end(v.buffered.length - 1);
-                                                if (edge - v.currentTime > 0.4) {
-                                                    v.currentTime = edge - 0.1;
-                                                }
-                                            }
-                                            v.play().catch(function(){});
-                                        }
+                                        recoverStreamStall('periodic_watchdog');
                                         streamStagnantCount = 0;
                                     }
                                 } else {
@@ -1720,10 +1824,11 @@ class MainActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-            if (!isInPictureInPictureMode && pipModeState.value) {
+            if (!isInPictureInPictureMode) {
                 pipModeState.value = false
+                // 确保任何意外退出画中画后（即使状态标记未同步），均强制执行 stage 尺寸复原与网页视口校准
                 webView?.evaluateJavascript(
-                    "(function() { if (window.__exitPipIsolation) window.__exitPipIsolation(); })();",
+                    "(function() { if (document.body && (document.body.classList.contains('android-pip-mode') || (window.__stagePrePipStyle && document.getElementById('stage')))) { if (window.__exitPipIsolation) window.__exitPipIsolation(); } })();",
                     null
                 )
                 webView?.post {
