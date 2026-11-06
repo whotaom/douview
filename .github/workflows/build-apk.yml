@@ -87,7 +87,6 @@ jobs:
           cd app/build/outputs/apk/release/
           if [ -f "app-release.apk" ]; then
             cp app-release.apk douv-1.0.1.apk
-            cp app-release.apk douview-1.0.1.apk
           fi
 
       - name: Build Debug APK
@@ -98,14 +97,14 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: DouView-Release-v1.0.1-APK
-          path: app/build/outputs/apk/release/*.apk
+          path: app/build/outputs/apk/release/app-release.apk
           retention-days: 30
 
       - name: Upload Debug APK Artifact
         uses: actions/upload-artifact@v4
         with:
           name: DouView-Debug-v1.0.1-APK
-          path: app/build/outputs/apk/debug/*.apk
+          path: app/build/outputs/apk/debug/app-debug.apk
           retention-days: 30
 
       - name: Create GitHub Release (On Tag)
@@ -114,8 +113,9 @@ jobs:
         with:
           name: Release ${{ github.ref_name }}
           files: |
-            app/build/outputs/apk/release/*.apk
-            app/build/outputs/apk/debug/*.apk
+            app/build/outputs/apk/release/app-release.apk
+            app/build/outputs/apk/release/douv-1.0.1.apk
+            app/build/outputs/apk/debug/app-debug.apk
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
