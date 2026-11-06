@@ -1525,25 +1525,26 @@ class MainActivity : ComponentActivity() {
                         unmuteBtn.click();
                     }
 
-                    var playBtn = document.querySelector('.xgplayer-start, .vjs-big-play-button, .play-btn');
-                    if (playBtn && playBtn.offsetParent !== null) {
-                        playBtn.click();
+                    // 仅当主视频明确暂停时才轻量激活大播放按钮，杜绝连点导致的播放/暂停震荡与频繁缓冲
+                    var mainVideo = document.getElementById('video') || document.querySelector('video');
+                    if (mainVideo && mainVideo.paused) {
+                        var playBtn = document.querySelector('.xgplayer-start, .vjs-big-play-button');
+                        if (playBtn && playBtn.offsetParent !== null) {
+                            playBtn.click();
+                        }
                     }
                 }
 
-                // 立即执行并多频段唤醒
+                // 首次进入平稳首播唤醒
                 triggerImmediateAutoplayAndUnmute();
-                setTimeout(triggerImmediateAutoplayAndUnmute, 100);
-                setTimeout(triggerImmediateAutoplayAndUnmute, 300);
-                setTimeout(triggerImmediateAutoplayAndUnmute, 800);
-                setTimeout(triggerImmediateAutoplayAndUnmute, 1500);
+                setTimeout(triggerImmediateAutoplayAndUnmute, 400);
+                setTimeout(triggerImmediateAutoplayAndUnmute, 1200);
 
                 if (!window.__douyin_live_stabilizer_injected) {
                     window.__douyin_live_stabilizer_injected = true;
 
                     document.addEventListener('play', function(e) {
                         if (e.target && e.target.tagName === 'VIDEO') {
-                            setTimeout(triggerImmediateAutoplayAndUnmute, 50);
                             setTimeout(notifyDimensions, 100);
                         }
                     }, true);
@@ -1551,7 +1552,6 @@ class MainActivity : ComponentActivity() {
                     document.addEventListener('loadedmetadata', function(e) {
                         if (e.target && e.target.tagName === 'VIDEO') {
                             notifyDimensions();
-                            setTimeout(triggerImmediateAutoplayAndUnmute, 100);
                         }
                     }, true);
 
@@ -1574,9 +1574,7 @@ class MainActivity : ComponentActivity() {
                         if (window.AndroidLiveBridge && window.AndroidLiveBridge.onStreamLineChanged) {
                             window.AndroidLiveBridge.onStreamLineChanged();
                         }
-                        setTimeout(triggerImmediateAutoplayAndUnmute, 200);
-                        setTimeout(triggerImmediateAutoplayAndUnmute, 600);
-                        setTimeout(triggerImmediateAutoplayAndUnmute, 1200);
+                        setTimeout(triggerImmediateAutoplayAndUnmute, 300);
                     }
 
                     var protoSel = document.getElementById('protoSel');
@@ -1584,82 +1582,28 @@ class MainActivity : ComponentActivity() {
                     if (protoSel) protoSel.addEventListener('change', onLineChange);
                     if (qualSel) qualSel.addEventListener('change', onLineChange);
 
-                    // 3. 军工级流媒体传输断流守护与超低延迟追帧 (Stream Stall Watchdog & Live Sync)
+                    // 3. 军工级平稳流媒体自愈看门狗 (Smooth & Resilient Stream Watchdog)
+                    // 彻底移除对 waiting/stalled 的激进拦截，让内核原生缓冲机制平稳工作；
+                    // 仅在真实持续停滞（6秒以上未前进）且非暂停时，才进行轻量级拉流唤醒
                     var lastPlaybackCurrentTime = -1;
                     var streamStagnantCount = 0;
-
-                    function recoverStreamStall(reason) {
-                        var v = document.getElementById('video') || document.querySelector('video');
-                        if (!v) return;
-                        // 优先尝试缓冲尾部追帧（追溯最新 live edge，消除卡死停滞）
-                        if (v.buffered && v.buffered.length > 0) {
-                            var edge = v.buffered.end(v.buffered.length - 1);
-                            if (edge - v.currentTime > 0.3) {
-                                v.currentTime = edge - 0.08;
-                                v.play().catch(function(){});
-                                return;
-                            }
-                        }
-                        // 播放器内核 (hls.js / mpegts.js) 自愈
-                        try {
-                            if (window.hls) {
-                                window.hls.startLoad();
-                                window.hls.recoverMediaError();
-                            }
-                        } catch(e) {}
-                        try {
-                            if (window.mpegtsPlayer && typeof window.mpegtsPlayer.play === 'function') {
-                                window.mpegtsPlayer.play();
-                            }
-                        } catch(e) {}
-                        // 节点重试或重载
-                        var retryBtn = document.getElementById('retryBtn');
-                        var reloadBtn = document.getElementById('reloadBtn');
-                        if (retryBtn && !retryBtn.hidden) {
-                            retryBtn.click();
-                        } else if (reloadBtn) {
-                            reloadBtn.click();
-                        } else {
-                            v.play().catch(function(){});
-                        }
-                    }
-
-                    // 监听视频等待与挂起事件，毫秒级快速探测断流
-                    document.addEventListener('waiting', function(e) {
-                        if (e.target && e.target.tagName === 'VIDEO') {
-                            setTimeout(function() {
-                                var v = e.target;
-                                if (v && v.readyState < 3 && !v.paused) {
-                                    recoverStreamStall('waiting_event');
-                                }
-                            }, 1200);
-                        }
-                    }, true);
-
-                    document.addEventListener('stalled', function(e) {
-                        if (e.target && e.target.tagName === 'VIDEO') {
-                            setTimeout(function() {
-                                recoverStreamStall('stalled_event');
-                            }, 1500);
-                        }
-                    }, true);
-
-                    window.addEventListener('online', function() {
-                        recoverStreamStall('network_online');
-                        setTimeout(triggerImmediateAutoplayAndUnmute, 300);
-                    });
 
                     setInterval(function() {
                         var v = document.getElementById('video') || document.querySelector('video');
                         if (v) {
-                            if (v.paused || v.muted) {
-                                triggerImmediateAutoplayAndUnmute();
+                            if (v.paused && !v.ended) {
+                                v.play().catch(function(){});
                             } else if (!v.ended && v.readyState >= 1) {
-                                if (v.currentTime === lastPlaybackCurrentTime) {
+                                if (v.currentTime === lastPlaybackCurrentTime && lastPlaybackCurrentTime > 0) {
                                     streamStagnantCount++;
-                                    // 连续停滞 2 周期(3秒)，判定为断流，立即自愈拉流
-                                    if (streamStagnantCount >= 2) {
-                                        recoverStreamStall('periodic_watchdog');
+                                    // 连续停滞 3 周期 (6秒)，确认为断流卡死，平稳自愈
+                                    if (streamStagnantCount >= 3) {
+                                        var retryBtn = document.getElementById('retryBtn');
+                                        if (retryBtn && !retryBtn.hidden) {
+                                            retryBtn.click();
+                                        } else {
+                                            v.play().catch(function(){});
+                                        }
                                         streamStagnantCount = 0;
                                     }
                                 } else {
@@ -1669,7 +1613,7 @@ class MainActivity : ComponentActivity() {
                             }
                             notifyDimensions();
                         }
-                    }, 1500);
+                    }, 2000);
                 }
             })();
         """.trimIndent()

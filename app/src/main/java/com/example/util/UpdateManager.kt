@@ -12,12 +12,9 @@ import android.widget.Toast
 import androidx.core.content.FileProvider
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import okhttp3.Request
 import org.json.JSONObject
-import java.io.BufferedReader
 import java.io.File
-import java.io.InputStreamReader
-import java.net.HttpURLConnection
-import java.net.URL
 
 data class AppReleaseInfo(
     val currentVersion: String,
@@ -37,30 +34,28 @@ object UpdateManager {
     fun getCurrentVersion(context: Context): String {
         return try {
             val pInfo = context.packageManager.getPackageInfo(context.packageName, 0)
-            pInfo.versionName ?: "1.0.0"
+            pInfo.versionName ?: "1.0.1"
         } catch (e: Exception) {
-            "1.0.0"
+            "1.0.1"
         }
     }
 
     suspend fun checkUpdate(context: Context): Result<AppReleaseInfo> = withContext(Dispatchers.IO) {
         try {
             val currentVer = getCurrentVersion(context)
-            val url = URL(GITHUB_REPO_API)
-            val connection = (url.openConnection() as HttpURLConnection).apply {
-                requestMethod = "GET"
-                connectTimeout = 8000
-                readTimeout = 8000
-                setRequestProperty("Accept", "application/vnd.github.v3+json")
-                setRequestProperty("User-Agent", "DouView-Android-App")
-            }
+            val request = Request.Builder()
+                .url(GITHUB_REPO_API)
+                .header("Accept", "application/vnd.github.v3+json")
+                .header("User-Agent", "DouView-Android-App")
+                .get()
+                .build()
 
-            if (connection.responseCode in 200..299) {
-                val reader = BufferedReader(InputStreamReader(connection.inputStream))
-                val response = reader.readText()
-                reader.close()
+            val response = NetworkClient.okHttpClient.newCall(request).execute()
+            val responseBody = response.body?.string() ?: ""
+            val isSuccess = response.isSuccessful
 
-                val json = JSONObject(response)
+            if (isSuccess && responseBody.isNotBlank()) {
+                val json = JSONObject(responseBody)
                 val tagName = json.optString("tag_name", "").trim()
                 val releaseTitle = json.optString("name", "新版本更新").ifBlank { "新版本 $tagName" }
                 val body = json.optString("body", "包含多项性能提升、直播流稳定性优化与体验改善。")
@@ -95,13 +90,13 @@ object UpdateManager {
                     )
                 )
             } else {
-                // 如果 GitHub 暂无 Release 或被限流，优雅降级返回已是最新或提供主页
+                // 如果 GitHub 暂无 Release 或被限流，优雅降级返回当前 1.0.1 版本的更新要点
                 Result.success(
                     AppReleaseInfo(
                         currentVersion = currentVer,
                         latestVersion = "v$currentVer",
-                        title = "当前版本已是最新",
-                        changelog = "当前已是工业级稳定版本，暂无更高版本发布。",
+                        title = "当前版本已是最新 (v$currentVer)",
+                        changelog = "【v1.0.1 稳定版更新要点】\n1. 流媒体传输策略全面恢复平稳机制，消除缓冲死循环；\n2. OkHttp 网络层添加连接超时(10s)与读取超时(15s)设置，并增加失败重试拦截器，提升直播流解析稳定性；\n3. 画中画全生命周期 .stage 容器尺寸与样式深度隔离守护；\n4. 更新弹窗强化：有真实新版才提供下载更新，当前最新版状态清爽闭环。",
                         apkUrl = GITHUB_REPO_PAGE,
                         hasUpdate = false,
                         releasePageUrl = GITHUB_REPO_PAGE
