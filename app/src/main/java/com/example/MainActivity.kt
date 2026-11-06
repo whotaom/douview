@@ -12,7 +12,6 @@ import android.media.AudioAttributes
 import android.media.AudioFocusRequest
 import android.media.AudioManager
 import android.net.Uri
-import android.app.UiModeManager
 import android.content.pm.PackageManager
 import android.net.http.SslError
 import android.os.Build

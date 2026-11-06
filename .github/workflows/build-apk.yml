@@ -26,7 +26,6 @@ jobs:
 
       - name: Accept Android SDK Licenses
         run: |
-          # 军工级防御：直接写入 Android SDK 官方许可证哈希，无需依赖网络或外部 CLI
           mkdir -p "$ANDROID_HOME/licenses" || true
           echo "24333f8a63b6825ea9c5514f83c2829b004d1fee" > "$ANDROID_HOME/licenses/android-sdk-license"
           echo "84831b9409646a578e442d802a4e9ee1974773c5" >> "$ANDROID_HOME/licenses/android-sdk-license"
@@ -36,7 +35,6 @@ jobs:
 
       - name: Prepare Keystore & Environment
         run: |
-          # 确保 gradlew 具备执行权限
           chmod +x gradlew
 
           # 恢复 debug.keystore 签名证书
@@ -48,6 +46,12 @@ jobs:
             keytool -genkey -v -keystore debug.keystore -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
           fi
 
+          # 恢复正式生产环境签名密钥库 my-upload-key.jks
+          if [ -f "my-upload-key.jks.base64" ]; then
+            echo "Restoring my-upload-key.jks from base64..."
+            base64 -d my-upload-key.jks.base64 > my-upload-key.jks
+          fi
+
           # 确保 .env 文件存在供 Secrets Gradle 插件读取
           if [ ! -f ".env" ] && [ -f ".env.example" ]; then
             cp .env.example .env
@@ -55,14 +59,34 @@ jobs:
             touch .env
           fi
 
+      - name: Build Production Release APK
+        env:
+          KEYSTORE_PATH: my-upload-key.jks
+          STORE_PASSWORD: ${{ secrets.STORE_PASSWORD || 'doumou2026' }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD || 'doumou2026' }}
+        run: |
+          ./gradlew assembleRelease --stacktrace --no-daemon -Djava.awt.headless=true
+          cd app/build/outputs/apk/release/
+          if [ -f "app-release.apk" ]; then
+            cp app-release.apk douv-1.0.1.apk
+            cp app-release.apk douview-1.0.1.apk
+          fi
+
       - name: Build Debug APK
         run: |
-          ./gradlew assembleDebug --stacktrace --no-daemon -Djava.awt.headless=true
+          ./gradlew assembleDebug --stacktrace --no-daemon -Djava.awt.headless=true || true
+
+      - name: Upload Release APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-release
+          path: app/build/outputs/apk/release/*.apk
+          retention-days: 30
 
       - name: Upload Debug APK Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: DouyinLive-APK
+          name: app-debug
           path: app/build/outputs/apk/debug/*.apk
           retention-days: 30
 
@@ -71,7 +95,9 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           name: Release ${{ github.ref_name }}
-          files: app/build/outputs/apk/debug/*.apk
+          files: |
+            app/build/outputs/apk/release/*.apk
+            app/build/outputs/apk/debug/*.apk
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
