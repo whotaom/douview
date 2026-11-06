@@ -1,103 +1,81 @@
-name: Build Android APK
+name: Build Release APK
 
 on:
   push:
-    branches: [ main, master ]
-    tags: [ 'v*' ]
-  pull_request:
-    branches: [ main, master ]
+    branches: [main]
+    tags: ["v*"]
   workflow_dispatch:
+
+permissions:
+  contents: write # 仅用于打 tag 时创建 Release
 
 jobs:
   build:
-    name: Build & Export APK
+    name: Build & Export app-release.apk
     runs-on: ubuntu-latest
-
+    timeout-minutes: 30
+    env:
+      STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
+      KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4
+      - uses: actions/setup-java@v5
         with:
-          java-version: '17'
-          distribution: 'temurin'
-          cache: gradle
+          distribution: temurin
+          java-version: "17"
 
-      - name: Accept Android SDK Licenses
+      - uses: gradle/actions/setup-gradle@v4
+
+      # 使用仓库根目录已有的 my-upload-key.jks（与 AI Studio 一致）。
+      # 若该文件缺失，则从 my-upload-key.jks.base64 还原。
+      # 显式设置 KEYSTORE_PATH，避免 Gradle 去 app/ 目录里找。
+      - name: Locate release keystore
         run: |
-          mkdir -p "$ANDROID_HOME/licenses" || true
-          echo "24333f8a63b6825ea9c5514f83c2829b004d1fee" > "$ANDROID_HOME/licenses/android-sdk-license"
-          echo "84831b9409646a578e442d802a4e9ee1974773c5" >> "$ANDROID_HOME/licenses/android-sdk-license"
-          echo "d56f5187479451eabf01fb78af6dfcb131a6481e" >> "$ANDROID_HOME/licenses/android-sdk-license"
-          echo "24333f8a63b6825ea9c5514f83c2829b004d1fee" > "$ANDROID_HOME/licenses/android-sdk-preview-license"
-          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses 2>/dev/null || true
+          KS="$GITHUB_WORKSPACE/my-upload-key.jks"
+          if [ ! -s "$KS" ]; then
+            if [ -s "$GITHUB_WORKSPACE/my-upload-key.jks.base64" ]; then
+              base64 -d "$GITHUB_WORKSPACE/my-upload-key.jks.base64" > "$KS"
+            else
+              echo "::error::仓库中找不到 my-upload-key.jks 或 my-upload-key.jks.base64"
+              exit 1
+            fi
+          fi
+          echo "KEYSTORE_PATH=$KS" >> "$GITHUB_ENV"
 
-      - name: Prepare Keystore & Environment
+      # 提前校验口令和别名，出错时给出明确提示（Gradle 的报错很绕）
+      - name: Check keystore password and alias
+        run: |
+          if [ -z "$STORE_PASSWORD" ] || [ -z "$KEY_PASSWORD" ]; then
+            echo "::error::未设置 Secrets: STORE_PASSWORD / KEY_PASSWORD"
+            exit 1
+          fi
+          keytool -list -keystore "$KEYSTORE_PATH" -storepass "$STORE_PASSWORD" -alias upload > /dev/null \
+            || { echo "::error::密钥库口令不正确，或其中不存在别名 upload"; exit 1; }
+
+      - name: Build release APK
         run: |
           chmod +x gradlew
+          ./gradlew assembleRelease --no-daemon --stacktrace
 
-          # 恢复 debug.keystore 签名证书
-          if [ -f "debug.keystore.base64" ]; then
-            echo "Restoring debug.keystore from base64..."
-            base64 -d debug.keystore.base64 > debug.keystore
-          elif [ ! -f "debug.keystore" ]; then
-            echo "Generating fallback debug.keystore..."
-            keytool -genkey -v -keystore debug.keystore -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
-          fi
-
-          # 恢复正式生产环境签名密钥库 my-upload-key.jks
-          if [ -f "my-upload-key.jks.base64" ]; then
-            echo "Restoring my-upload-key.jks from base64..."
-            base64 -d my-upload-key.jks.base64 > my-upload-key.jks
-          fi
-
-          # 确保 .env 文件存在供 Secrets Gradle 插件读取
-          if [ ! -f ".env" ] && [ -f ".env.example" ]; then
-            cp .env.example .env
-          elif [ ! -f ".env" ]; then
-            touch .env
-          fi
-
-      - name: Build Production Release APK
-        env:
-          KEYSTORE_PATH: my-upload-key.jks
-          STORE_PASSWORD: ${{ secrets.STORE_PASSWORD || 'doumou2026' }}
-          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD || 'doumou2026' }}
+      - name: Verify APK signature
         run: |
-          ./gradlew assembleRelease --stacktrace --no-daemon -Djava.awt.headless=true
-          cd app/build/outputs/apk/release/
-          if [ -f "app-release.apk" ]; then
-            cp app-release.apk douv-1.0.1.apk
-            cp app-release.apk douview-1.0.1.apk
-          fi
+          APKSIGNER=$(ls "$ANDROID_HOME"/build-tools/*/apksigner | sort -V | tail -n 1)
+          "$APKSIGNER" verify --verbose --print-certs app/build/outputs/apk/release/app-release.apk
+          ls -lh app/build/outputs/apk/release/app-release.apk
 
-      - name: Build Debug APK
-        run: |
-          ./gradlew assembleDebug --stacktrace --no-daemon -Djava.awt.headless=true || true
-
-      - name: Upload Release APK Artifact
+      - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: app-release
-          path: app/build/outputs/apk/release/*.apk
-          retention-days: 30
+          name: DouView-Release-v1.0.1-APK
+          path: app/build/outputs/apk/release/app-release.apk
+          if-no-files-found: error
 
-      - name: Upload Debug APK Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: app-debug
-          path: app/build/outputs/apk/debug/*.apk
-          retention-days: 30
-
-      - name: Create GitHub Release (On Tag)
+      - name: Publish GitHub Release (tag builds only)
         if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
-        with:
-          name: Release ${{ github.ref_name }}
-          files: |
-            app/build/outputs/apk/release/*.apk
-            app/build/outputs/apk/debug/*.apk
-          generate_release_notes: true
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            app/build/outputs/apk/release/app-release.apk \
+            --title "$GITHUB_REF_NAME" --generate-notes
