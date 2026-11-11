@@ -65,6 +65,15 @@
             </intent-filter>
         </activity>
 
+        <!-- 电视大屏真正沉浸式全屏纯净播放 Activity -->
+        <activity
+            android:name=".tv.player.TvFullscreenPlayerActivity"
+            android:exported="false"
+            android:theme="@style/Theme.Fullscreen.TV"
+            android:screenOrientation="landscape"
+            android:launchMode="singleTop"
+            android:configChanges="keyboard|keyboardHidden|navigation|orientation|screenSize|screenLayout|uiMode" />
+
         <provider
             android:name="androidx.core.content.FileProvider"
             android:authorities="${applicationId}.fileprovider"
