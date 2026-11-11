@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- 320x180 dp 16:9 比例深色渐变背景 -->
+    <item>
+        <shape android:shape="rectangle">
+            <gradient
+                android:angle="135"
+                android:startColor="#161823"
+                android:centerColor="#101117"
+                android:endColor="#08080A"
+                android:type="linear" />
+            <size
+                android:width="320dp"
+                android:height="180dp" />
+        </shape>
+    </item>
+    <!-- 居中抖眸流控徽章图标 -->
+    <item
+        android:width="120dp"
+        android:height="120dp"
+        android:drawable="@drawable/ic_app_emblem"
+        android:gravity="center" />
+</layer-list>
