@@ -23,6 +23,8 @@ import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.PlayerView
+import com.example.tv.channel.Channel
+import com.example.tv.channel.ChannelManager
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -32,33 +34,38 @@ import org.json.JSONObject
 import java.util.concurrent.TimeUnit
 
 /**
- * 电视大屏全屏原生播放器（Media3 / ExoPlayer 原生渲染方案）
- * 彻底解决电视盒子（Amlogic、Rockchip、全志等）在 WebView 下播放视频黑屏但有声音的问题：
- * 1. ExoPlayer 原生 SurfaceView 渲染，绕过 WebView 复杂的离屏混合合成；
- * 2. 深度适配 tv_fuxiaoya_com 后端接口：自动请求 live.php?rid=xxxx 获取高清 HLS 真实流；
- * 3. 军工级清晰度自动降级策略：origin (原画) -> uhd -> hd (高清) -> sd (标清) -> ld，遇到解码失败或卡顿缓冲超时自动平滑降级；
- * 4. 遥控器原生交互优化：OK 键控制播放/暂停，上下方向键手动微调清晰度，返回键秒停流无残留背景音。
+ * 电视大屏全屏原生播放器（完全对齐 tv_fuxiaoya_com 网页版逻辑）
+ * 1. 自动连接官方默认服务 https://tv.fuxiaoya.com，无需手动设置房间号；
+ * 2. 深度集成 ChannelManager，支持「在线优先」智能排序；
+ * 3. 自动通过 live.php?rid=xxx 提取 HLS 原生多码率高清直播流；
+ * 4. 军工级故障降级：清晰度失败自动向下兼容（原画 -> 高清 -> 标清），全部失败自动切换至下一可用电视频道；
+ * 5. 遥控器原生全适配：上下键一键切台，OK键控制暂停/播放，返回键秒停流退出。
  */
 class TvFullscreenPlayerActivity : ComponentActivity() {
 
     companion object {
-        const val EXTRA_URL = "extra_url"                 // 兼容传入的网页、带参地址或直接流
-        const val EXTRA_RID = "extra_rid"                 // 明确指定房间号
-        const val EXTRA_STREAM_URL = "extra_stream_url"   // 明确指定直接 HLS 流地址 (.m3u8)
-        const val EXTRA_BASE_URL = "extra_base_url"       // 基础服务域名，默认 https://tv.fuxiaoya.com
-        const val EXTRA_TITLE = "extra_title"             // 兼容标题参数
+        const val DEFAULT_BASE_URL = "https://tv.fuxiaoya.com"
+        const val EXTRA_URL = "extra_url"
+        const val EXTRA_RID = "extra_rid"
+        const val EXTRA_STREAM_URL = "extra_stream_url"
+        const val EXTRA_BASE_URL = "extra_base_url"
+        const val EXTRA_TITLE = "extra_title"
     }
+
+    private lateinit var channelManager: ChannelManager
+    private var playList: List<Channel> = emptyList()
+    private var currentChannelIndex = 0
+
+    // 当前频道的清晰度梯度列表: List<Pair<清晰度名称, HLS地址>>
+    private var qualityList: List<Pair<String, String>> = emptyList()
+    private var currentQualityIndex = 0
 
     private var player: ExoPlayer? = null
     private lateinit var playerView: PlayerView
     private lateinit var rootContainer: FrameLayout
     private lateinit var tipView: TextView
 
-    // 清晰度列表：List<Pair<清晰度名称, HLS媒体流地址>>，已按高到低排序
-    private var qualityList: List<Pair<String, String>> = emptyList()
-    private var currentQualityIndex = 0
-
-    // 缓冲超时监测机制（12秒缓冲无法播放自动降级）
+    // 缓冲超时监测机制（12秒连续缓冲无响应自动降清晰度）
     private var bufferingTimeoutRunnable: Runnable? = null
     private val BUFFERING_TIMEOUT_MS = 12_000L
 
@@ -71,10 +78,10 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // 1. 真正沉浸式全屏 + 屏幕常亮守护
+        // 1. 进入真实沉浸全屏与屏幕常亮
         enterTrueFullscreen()
 
-        // 2. 根容器纯黑底色，杜绝边缘白边
+        // 2. 根布局容器
         rootContainer = FrameLayout(this).apply {
             setBackgroundColor(Color.BLACK)
             layoutParams = FrameLayout.LayoutParams(
@@ -98,104 +105,120 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         }
         rootContainer.addView(playerView)
 
-        // 4. 极简屏幕提示层（加载状态 / 降级提示 / 异常告知）
+        // 4. 极简屏幕提示层
         tipView = TextView(this).apply {
             layoutParams = FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.WRAP_CONTENT,
                 FrameLayout.LayoutParams.WRAP_CONTENT
-            ).also {
-                it.gravity = android.view.Gravity.CENTER
-            }
+            ).also { it.gravity = android.view.Gravity.CENTER }
             setTextColor(Color.WHITE)
             textSize = 18f
             setPadding(32, 16, 32, 16)
             setBackgroundColor(Color.parseColor("#99000000"))
-            text = "正在解析并连接直播流..."
+            text = "正在连接直播服务..."
             visibility = View.VISIBLE
         }
         rootContainer.addView(tipView)
 
-        // 5. 遥控器返回键干净退出
+        // 5. 遥控器返回键处理
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
                 exitPlayer()
             }
         })
 
-        // 6. 解析参数并启动流媒体播放
-        startPlay()
+        // 6. 初始化频道列表与播放策略
+        channelManager = ChannelManager(this)
+        setupPlayListAndStart()
     }
 
-    private fun startPlay() {
-        // 场景 A：已直接传入解析好的 HLS 直播流
-        val directStreamUrl = intent.getStringExtra(EXTRA_STREAM_URL)
+    private fun setupPlayListAndStart() {
+        // 场景 A：直接指定了 HLS 媒体流 (.m3u8)
+        val directStreamUrl = intent.getStringExtra(EXTRA_STREAM_URL)?.trim()
         if (!directStreamUrl.isNullOrBlank()) {
-            qualityList = listOf("默认流" to directStreamUrl.trim())
+            playList = listOf(Channel(rid = "direct", name = "直接媒体流", isLive = true))
+            currentChannelIndex = 0
+            qualityList = listOf("默认流" to directStreamUrl)
             currentQualityIndex = 0
             playCurrentQuality()
             return
         }
 
-        // 场景 B：从传入的 EXTRA_URL 或 EXTRA_RID 智能解析房间号与中控地址
-        val rawUrl = intent.getStringExtra(EXTRA_URL)?.trim() ?: ""
-        var rid = intent.getStringExtra(EXTRA_RID)?.trim() ?: ""
-        var baseUrl = intent.getStringExtra(EXTRA_BASE_URL)?.trimEnd('/') ?: "https://tv.fuxiaoya.com"
+        // 加载全部持久化/默认频道并按「在线优先」排序（与网页版逻辑完全一致）
+        val loadedChannels = channelManager.loadChannels()
+        val sortedChannels = loadedChannels.sortedBy { if (it.isLive) 0 else 1 }.toMutableList()
 
-        if (rid.isBlank() && rawUrl.isNotBlank()) {
+        // 检查 Intent 中是否带有指定的特定房间号或链接
+        var targetRid: String? = intent.getStringExtra(EXTRA_RID)?.trim()
+        val rawUrl = intent.getStringExtra(EXTRA_URL)?.trim() ?: ""
+
+        if (targetRid.isNullOrBlank() && rawUrl.isNotBlank()) {
             if (rawUrl.endsWith(".m3u8") || rawUrl.contains(".m3u8?")) {
-                // 直接是 m3u8 地址
+                playList = listOf(Channel(rid = "direct", name = "直接流媒体", isLive = true))
+                currentChannelIndex = 0
                 qualityList = listOf("默认流" to rawUrl)
                 currentQualityIndex = 0
                 playCurrentQuality()
                 return
             }
-
-            // 尝试从 URL 查询参数解析 rid（例如：https://tv.fuxiaoya.com/?rid=127453393722）
             try {
                 val uri = Uri.parse(rawUrl)
                 val paramRid = uri.getQueryParameter("rid")
                 if (!paramRid.isNullOrBlank()) {
-                    rid = paramRid
-                }
-                if (!uri.host.isNullOrBlank() && uri.scheme != null) {
-                    baseUrl = "${uri.scheme}://${uri.host}"
-                    if (uri.port != -1 && uri.port != 80 && uri.port != 443) {
-                        baseUrl += ":${uri.port}"
-                    }
+                    targetRid = paramRid
                 }
             } catch (_: Exception) {
             }
-
-            // 若仍为空且纯为数字，则整段作为 rid
-            if (rid.isBlank() && rawUrl.all { it.isDigit() }) {
-                rid = rawUrl
+            if (targetRid.isNullOrBlank() && rawUrl.all { it.isDigit() }) {
+                targetRid = rawUrl
             }
         }
 
-        if (rid.isBlank()) {
-            showTip("未检测到直播间房间号\n请在中控台设置带 ?rid=xxxx 的地址\n（例如：https://tv.fuxiaoya.com/?rid=127453393722）")
+        // 若指定了目标房间号，优先定位到该频道；若不在列表中则插入首位
+        if (!targetRid.isNullOrBlank()) {
+            val existingIndex = sortedChannels.indexOfFirst { it.rid == targetRid }
+            if (existingIndex >= 0) {
+                currentChannelIndex = existingIndex
+            } else {
+                sortedChannels.add(0, Channel(rid = targetRid, name = "自定义频道 ($targetRid)", isLive = true))
+                currentChannelIndex = 0
+            }
+        } else {
+            currentChannelIndex = 0
+        }
+
+        playList = sortedChannels
+        startCurrentChannel()
+    }
+
+    /**
+     * 播放当前选中的频道（自动向 live.php 请求多清晰度流）
+     */
+    private fun startCurrentChannel() {
+        if (currentChannelIndex !in playList.indices) {
+            showTip("没有可用频道，按返回键退出")
             return
         }
 
-        // 场景 C：调用 tv.fuxiaoya.com 后端 live.php 解析真实 HLS 多清晰度地址
-        val targetBaseUrl = baseUrl
-        val targetRid = rid
-        lifecycleScope.launch {
-            showTip("正在获取房间 [$targetRid] 的高清直播流...")
-            qualityList = fetchQualityList(targetBaseUrl, targetRid)
+        val channel = playList[currentChannelIndex]
+        val baseUrl = intent.getStringExtra(EXTRA_BASE_URL)?.trimEnd('/') ?: DEFAULT_BASE_URL
+        val channelTag = "【第 ${currentChannelIndex + 1}/${playList.size} 台】"
+        showTip("正在解析：$channelTag ${channel.name}")
 
+        lifecycleScope.launch {
+            qualityList = fetchQualityList(baseUrl, channel.rid)
             if (qualityList.isEmpty()) {
-                showTip("未能从服务器解析到可用的 HLS 直播流\n请检查房间是否正在直播，按返回键退出")
+                // 当前频道取流失败，自动无缝切到下一个频道
+                switchToNextChannel("当前频道解析失败")
                 return@launch
             }
-
             currentQualityIndex = 0
             playCurrentQuality()
         }
     }
 
     /**
-     * 调用 live.php 获取并按优先级从高到低排序清晰度列表
+     * 调用 live.php 获取并按优先级排序清晰度列表
      * 优先级：origin (原画) -> uhd -> hd (高清) -> sd (标清) -> ld -> default
      */
     private suspend fun fetchQualityList(baseUrl: String, rid: String): List<Pair<String, String>> =
@@ -219,15 +242,12 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
                     val json = JSONObject(body)
                     val code = json.optInt("code", 0)
                     val streamsObj = json.optJSONObject("streams")
-
-                    if (code != 200 || streamsObj == null) {
-                        return@withContext emptyList()
-                    }
+                    if (code != 200 || streamsObj == null) return@withContext emptyList()
 
                     val priorityKeys = listOf("origin", "uhd", "hd", "sd", "ld", "default")
                     val result = mutableListOf<Pair<String, String>>()
 
-                    // 1. 优先按推荐清晰度梯度加入
+                    // 1. 优先按梯队放入清晰度
                     for (key in priorityKeys) {
                         val streamItem = streamsObj.optJSONObject(key)
                         val hlsUrl = streamItem?.optString("hls")?.trim()
@@ -237,7 +257,7 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
                         }
                     }
 
-                    // 2. 补齐其他可能存在的自定义清晰度（避免遗漏）
+                    // 2. 补齐其他可能存在的自定义清晰度（避免漏流）
                     val keysIterator = streamsObj.keys()
                     while (keysIterator.hasNext()) {
                         val key = keysIterator.next()
@@ -250,7 +270,6 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
                             }
                         }
                     }
-
                     result
                 }
             } catch (e: Exception) {
@@ -260,20 +279,23 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         }
 
     /**
-     * 开始播放当前索引对应的清晰度流
+     * 播放当前频道的当前清晰度
      */
     private fun playCurrentQuality() {
         if (currentQualityIndex !in qualityList.indices) {
-            showTip("所有可用清晰度均尝试失败，按返回键退出")
+            // 当前频道的所有清晰度均告失败 → 自动切换至下一个频道
+            switchToNextChannel("清晰度全部失败")
             return
         }
 
-        val (name, hlsUrl) = qualityList[currentQualityIndex]
-        showTip("正在连接 [$name] 画质...")
+        val (qualityName, hlsUrl) = qualityList[currentQualityIndex]
+        val channel = playList.getOrNull(currentChannelIndex)
+        val channelName = channel?.name ?: ""
+        val indexInfo = "【${currentChannelIndex + 1}/${playList.size}】"
+        showTip("$indexInfo $channelName · $qualityName")
 
         releasePlayer()
 
-        // 针对电视大屏定制的平稳缓冲策略，有效平抑抖动
         val loadControl = DefaultLoadControl.Builder()
             .setBufferDurationsMs(
                 12_000,   // 最小缓冲 12 秒
@@ -283,7 +305,6 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
             )
             .build()
 
-        // 原生数据源，设置 TV 专属 User-Agent 与超时
         val dataSourceFactory = DefaultHttpDataSource.Factory()
             .setUserAgent("Mozilla/5.0 (Linux; Android 13; TV) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36")
             .setAllowCrossProtocolRedirects(true)
@@ -302,14 +323,14 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
 
                 exo.addListener(object : Player.Listener {
                     override fun onPlayerError(error: PlaybackException) {
-                        // 播放异常时自动触发降级机制
+                        // 当前清晰度出错 → 自动降清晰度
                         switchToLowerQuality("播放异常")
                     }
 
                     override fun onPlaybackStateChanged(state: Int) {
                         when (state) {
                             Player.STATE_BUFFERING -> {
-                                showTip("正在缓冲 [$name]...")
+                                showTip("正在缓冲 [$qualityName]...")
                                 scheduleBufferingTimeout()
                             }
                             Player.STATE_READY -> {
@@ -318,7 +339,7 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
                             }
                             Player.STATE_ENDED -> {
                                 cancelBufferingTimeout()
-                                showTip("直播已结束")
+                                showTip("直播已结束，按遥控器上下键切台")
                             }
                         }
                     }
@@ -333,23 +354,56 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
     }
 
     /**
-     * 自动向下一个清晰度梯度降级
+     * 降清晰度核心方法
      */
     private fun switchToLowerQuality(reason: String) {
         cancelBufferingTimeout()
         currentQualityIndex++
 
         if (currentQualityIndex >= qualityList.size) {
-            showTip("所有清晰度均播放失败 ($reason)\n请检查网络或按遥控器返回键退出")
+            // 当前频道所有清晰度全部失败，自动尝试下一个可用频道
+            switchToNextChannel("清晰度全部失败")
             return
         }
 
         val (nextName, _) = qualityList[currentQualityIndex]
-        showTip("$reason，正在自动降级切换至: $nextName")
+        showTip("$reason，正在降级切换至: $nextName")
 
         playerView.postDelayed({
             playCurrentQuality()
         }, 1200L)
+    }
+
+    /**
+     * 切换到下一个频道
+     */
+    private fun switchToNextChannel(reason: String = "") {
+        cancelBufferingTimeout()
+        currentChannelIndex++
+        if (currentChannelIndex >= playList.size) {
+            showTip("所有电视频道均已尝试完毕${if (reason.isNotEmpty()) "（$reason）" else ""}，按返回键退出")
+            return
+        }
+        val next = playList[currentChannelIndex]
+        showTip("自动切台至：${next.name}")
+        playerView.postDelayed({
+            startCurrentChannel()
+        }, 1000L)
+    }
+
+    /**
+     * 切换到上一个频道
+     */
+    private fun switchToPrevChannel() {
+        cancelBufferingTimeout()
+        if (currentChannelIndex <= 0) {
+            showTip("已经是第一个频道")
+            return
+        }
+        currentChannelIndex--
+        val prev = playList[currentChannelIndex]
+        showTip("切换到：${prev.name}")
+        startCurrentChannel()
     }
 
     private fun scheduleBufferingTimeout() {
@@ -409,33 +463,24 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         finish()
     }
 
-    // 遥控器 D-pad 原生键位拦截支持
+    // 遥控器 D-pad 原生键位交互
     override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
         when (keyCode) {
             KeyEvent.KEYCODE_BACK -> {
                 exitPlayer()
                 return true
             }
-            KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER -> {
-                player?.let {
-                    if (it.isPlaying) it.pause() else it.play()
-                }
+            KeyEvent.KEYCODE_DPAD_UP -> {
+                switchToPrevChannel()
                 return true
             }
-            // 遥控器上下键：手动切换清晰度
             KeyEvent.KEYCODE_DPAD_DOWN -> {
-                if (qualityList.size > 1 && currentQualityIndex < qualityList.size - 1) {
-                    currentQualityIndex++
-                    playCurrentQuality()
-                    return true
-                }
+                switchToNextChannel()
+                return true
             }
-            KeyEvent.KEYCODE_DPAD_UP -> {
-                if (qualityList.size > 1 && currentQualityIndex > 0) {
-                    currentQualityIndex--
-                    playCurrentQuality()
-                    return true
-                }
+            KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER -> {
+                player?.let { if (it.isPlaying) it.pause() else it.play() }
+                return true
             }
         }
         return super.onKeyDown(keyCode, event)
