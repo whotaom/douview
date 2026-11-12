@@ -3,6 +3,7 @@ package com.example.tv.player
 import android.graphics.Color
 import android.net.Uri
 import android.os.Bundle
+import android.util.Log
 import android.view.KeyEvent
 import android.view.View
 import android.view.WindowManager
@@ -17,12 +18,17 @@ import androidx.lifecycle.lifecycleScope
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
+import androidx.media3.common.VideoSize
 import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.exoplayer.DefaultLoadControl
+import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.mediacodec.MediaCodecSelector
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
+import androidx.media3.exoplayer.trackselection.DefaultTrackSelector
 import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.PlayerView
+import com.example.R
 import com.example.tv.channel.Channel
 import com.example.tv.channel.ChannelManager
 import kotlinx.coroutines.Dispatchers
@@ -34,16 +40,18 @@ import org.json.JSONObject
 import java.util.concurrent.TimeUnit
 
 /**
- * 电视大屏全屏原生播放器（完全对齐 tv_fuxiaoya_com 网页版逻辑）
- * 1. 自动连接官方默认服务 https://tv.fuxiaoya.com，无需手动设置房间号；
- * 2. 深度集成 ChannelManager，支持「在线优先」智能排序；
- * 3. 自动通过 live.php?rid=xxx 提取 HLS 原生多码率高清直播流；
- * 4. 军工级故障降级：清晰度失败自动向下兼容（原画 -> 高清 -> 标清），全部失败自动切换至下一可用电视频道；
- * 5. 遥控器原生全适配：上下键一键切台，OK键控制暂停/播放，返回键秒停流退出。
+ * 电视大屏全屏原生播放器（针对 H96 Max RK3528 等 32位电视芯片深度定制版）
+ * 彻底解决机顶盒「有声音但黑屏」的核心方案：
+ * 1. 强制通过 activity_tv_fullscreen_player.xml 实例化 SurfaceView（app:surface_type="surface_view"），解决 TextureView 在 RK 芯片上的合成黑屏；
+ * 2. 启用 DefaultRenderersFactory.setEnableDecoderFallback(true)，硬件解码器异常时自动回退至兼容渲染管线；
+ * 3. 显式关闭隧道模式 (Tunneling Mode)，解除部分 Android TV 13 盒子固件在隧道直通模式下的视频图层锁死；
+ * 4. 监听 onVideoSizeChanged 与 onRenderedFirstFrame，第一帧渲染即刻置顶 SurfaceView 并消除任何提示遮罩；
+ * 5. 网页版逻辑全量对齐：在线优先、自动取流、清晰度自动降级、遥控器上下键丝滑切台。
  */
 class TvFullscreenPlayerActivity : ComponentActivity() {
 
     companion object {
+        private const val TAG = "TVPlayer"
         const val DEFAULT_BASE_URL = "https://tv.fuxiaoya.com"
         const val EXTRA_URL = "extra_url"
         const val EXTRA_RID = "extra_rid"
@@ -81,53 +89,29 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         // 1. 进入真实沉浸全屏与屏幕常亮
         enterTrueFullscreen()
 
-        // 2. 根布局容器
-        rootContainer = FrameLayout(this).apply {
-            setBackgroundColor(Color.BLACK)
-            layoutParams = FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.MATCH_PARENT,
-                FrameLayout.LayoutParams.MATCH_PARENT
-            )
-        }
-        setContentView(rootContainer)
+        // 2. 加载带 app:surface_type="surface_view" 的专用布局，解决 RK3528 芯片视频层无法显示的问题
+        setContentView(R.layout.activity_tv_fullscreen_player)
+        rootContainer = findViewById(R.id.rootContainer)
+        playerView = findViewById(R.id.playerView)
+        tipView = findViewById(R.id.tipView)
 
-        // 3. 原生 Media3 PlayerView（无多余控制栏，保持纯净视频画面）
-        playerView = PlayerView(this).apply {
-            layoutParams = FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.MATCH_PARENT,
-                FrameLayout.LayoutParams.MATCH_PARENT
-            )
+        // 确保播放器视图初始设置
+        playerView.apply {
             useController = false
             resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
             setBackgroundColor(Color.BLACK)
             setShutterBackgroundColor(Color.BLACK)
             setKeepContentOnPlayerReset(true)
         }
-        rootContainer.addView(playerView)
 
-        // 4. 极简屏幕提示层
-        tipView = TextView(this).apply {
-            layoutParams = FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.WRAP_CONTENT,
-                FrameLayout.LayoutParams.WRAP_CONTENT
-            ).also { it.gravity = android.view.Gravity.CENTER }
-            setTextColor(Color.WHITE)
-            textSize = 18f
-            setPadding(32, 16, 32, 16)
-            setBackgroundColor(Color.parseColor("#99000000"))
-            text = "正在连接直播服务..."
-            visibility = View.VISIBLE
-        }
-        rootContainer.addView(tipView)
-
-        // 5. 遥控器返回键处理
+        // 3. 遥控器返回键处理
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
                 exitPlayer()
             }
         })
 
-        // 6. 初始化频道列表与播放策略
+        // 4. 初始化频道列表与播放策略
         channelManager = ChannelManager(this)
         setupPlayListAndStart()
     }
@@ -144,7 +128,7 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
             return
         }
 
-        // 加载全部持久化/默认频道并按「在线优先」排序（与网页版逻辑完全一致）
+        // 加载全部持久化/默认频道并按「在线优先」排序
         val loadedChannels = channelManager.loadChannels()
         val sortedChannels = loadedChannels.sortedBy { if (it.isLive) 0 else 1 }.toMutableList()
 
@@ -174,7 +158,6 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
             }
         }
 
-        // 若指定了目标房间号，优先定位到该频道；若不在列表中则插入首位
         if (!targetRid.isNullOrBlank()) {
             val existingIndex = sortedChannels.indexOfFirst { it.rid == targetRid }
             if (existingIndex >= 0) {
@@ -192,7 +175,7 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
     }
 
     /**
-     * 播放当前选中的频道（自动向 live.php 请求多清晰度流）
+     * 播放当前选中的频道（向 live.php 请求多清晰度流）
      */
     private fun startCurrentChannel() {
         if (currentChannelIndex !in playList.indices) {
@@ -208,7 +191,6 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         lifecycleScope.launch {
             qualityList = fetchQualityList(baseUrl, channel.rid)
             if (qualityList.isEmpty()) {
-                // 当前频道取流失败，自动无缝切到下一个频道
                 switchToNextChannel("当前频道解析失败")
                 return@launch
             }
@@ -217,10 +199,6 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         }
     }
 
-    /**
-     * 调用 live.php 获取并按优先级排序清晰度列表
-     * 优先级：origin (原画) -> uhd -> hd (高清) -> sd (标清) -> ld -> default
-     */
     private suspend fun fetchQualityList(baseUrl: String, rid: String): List<Pair<String, String>> =
         withContext(Dispatchers.IO) {
             try {
@@ -247,7 +225,6 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
                     val priorityKeys = listOf("origin", "uhd", "hd", "sd", "ld", "default")
                     val result = mutableListOf<Pair<String, String>>()
 
-                    // 1. 优先按梯队放入清晰度
                     for (key in priorityKeys) {
                         val streamItem = streamsObj.optJSONObject(key)
                         val hlsUrl = streamItem?.optString("hls")?.trim()
@@ -257,7 +234,6 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
                         }
                     }
 
-                    // 2. 补齐其他可能存在的自定义清晰度（避免漏流）
                     val keysIterator = streamsObj.keys()
                     while (keysIterator.hasNext()) {
                         val key = keysIterator.next()
@@ -279,11 +255,10 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         }
 
     /**
-     * 播放当前频道的当前清晰度
+     * 播放当前频道的当前清晰度（针对 RK3528 盒子的硬件渲染加强配置）
      */
     private fun playCurrentQuality() {
         if (currentQualityIndex !in qualityList.indices) {
-            // 当前频道的所有清晰度均告失败 → 自动切换至下一个频道
             switchToNextChannel("清晰度全部失败")
             return
         }
@@ -296,25 +271,42 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
 
         releasePlayer()
 
+        // ========== 关键：针对 H96 Max RK3528 的解码器回退与渲染器优化 ==========
+        val renderersFactory = DefaultRenderersFactory(this).apply {
+            // 启用解码器回退：若硬件解码器协商失败，自动回退至兼容模式，避免黑屏
+            setEnableDecoderFallback(true)
+            setExtensionRendererMode(DefaultRenderersFactory.EXTENSION_RENDERER_MODE_PREFER)
+            setMediaCodecSelector(MediaCodecSelector.DEFAULT)
+        }
+
+        // 关键：显式关闭隧道模式 (Tunneling Mode)，避免 RK 芯片视频图层锁死
+        val trackSelector = DefaultTrackSelector(this).apply {
+            parameters = buildUponParameters()
+                .setTunnelingEnabled(false)
+                .setAllowVideoMixedMimeTypeAdaptiveness(true)
+                .build()
+        }
+
         val loadControl = DefaultLoadControl.Builder()
             .setBufferDurationsMs(
-                12_000,   // 最小缓冲 12 秒
-                45_000,   // 最大缓冲 45 秒
-                2_000,    // 开播缓冲 2 秒
-                5_000     // 重新缓冲 5 秒
+                15_000,   // 最小缓冲 15 秒
+                50_000,   // 最大缓冲 50 秒
+                3_000,    // 开播缓冲 3 秒
+                6_000     // 重新缓冲 6 秒
             )
             .build()
 
         val dataSourceFactory = DefaultHttpDataSource.Factory()
             .setUserAgent("Mozilla/5.0 (Linux; Android 13; TV) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36")
             .setAllowCrossProtocolRedirects(true)
-            .setConnectTimeoutMs(12_000)
-            .setReadTimeoutMs(15_000)
+            .setConnectTimeoutMs(15_000)
+            .setReadTimeoutMs(20_000)
 
         val mediaSourceFactory = DefaultMediaSourceFactory(this)
             .setDataSourceFactory(dataSourceFactory)
 
-        player = ExoPlayer.Builder(this)
+        player = ExoPlayer.Builder(this, renderersFactory)
+            .setTrackSelector(trackSelector)
             .setLoadControl(loadControl)
             .setMediaSourceFactory(mediaSourceFactory)
             .build()
@@ -323,8 +315,8 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
 
                 exo.addListener(object : Player.Listener {
                     override fun onPlayerError(error: PlaybackException) {
-                        // 当前清晰度出错 → 自动降清晰度
-                        switchToLowerQuality("播放异常")
+                        Log.e(TAG, "播放异常: ${error.errorCodeName} | ${error.message}")
+                        switchToLowerQuality("播放异常: ${error.errorCodeName}")
                     }
 
                     override fun onPlaybackStateChanged(state: Int) {
@@ -336,12 +328,29 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
                             Player.STATE_READY -> {
                                 cancelBufferingTimeout()
                                 tipView.visibility = View.GONE
+                                playerView.bringToFront()
                             }
                             Player.STATE_ENDED -> {
                                 cancelBufferingTimeout()
                                 showTip("直播已结束，按遥控器上下键切台")
                             }
                         }
+                    }
+
+                    override fun onVideoSizeChanged(videoSize: VideoSize) {
+                        // 视频尺寸发生变化表明视频轨已正常解码并建立画面 Surface
+                        Log.d(TAG, "视频尺寸已更新: ${videoSize.width}x${videoSize.height}")
+                        cancelBufferingTimeout()
+                        tipView.visibility = View.GONE
+                        playerView.bringToFront()
+                    }
+
+                    override fun onRenderedFirstFrame() {
+                        // 第一帧渲染完毕，立即置顶 SurfaceView 确保绝无遮挡
+                        Log.d(TAG, "第一帧画面已渲染")
+                        cancelBufferingTimeout()
+                        tipView.visibility = View.GONE
+                        playerView.bringToFront()
                     }
                 })
 
@@ -353,15 +362,11 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
             }
     }
 
-    /**
-     * 降清晰度核心方法
-     */
     private fun switchToLowerQuality(reason: String) {
         cancelBufferingTimeout()
         currentQualityIndex++
 
         if (currentQualityIndex >= qualityList.size) {
-            // 当前频道所有清晰度全部失败，自动尝试下一个可用频道
             switchToNextChannel("清晰度全部失败")
             return
         }
@@ -374,9 +379,6 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         }, 1200L)
     }
 
-    /**
-     * 切换到下一个频道
-     */
     private fun switchToNextChannel(reason: String = "") {
         cancelBufferingTimeout()
         currentChannelIndex++
@@ -391,9 +393,6 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         }, 1000L)
     }
 
-    /**
-     * 切换到上一个频道
-     */
     private fun switchToPrevChannel() {
         cancelBufferingTimeout()
         if (currentChannelIndex <= 0) {
@@ -463,7 +462,6 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         finish()
     }
 
-    // 遥控器 D-pad 原生键位交互
     override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
         when (keyCode) {
             KeyEvent.KEYCODE_BACK -> {

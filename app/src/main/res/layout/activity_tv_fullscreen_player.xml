@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:id="@+id/rootContainer"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="#000000">
+
+    <!-- 关键：强制设置 app:surface_type="surface_view"，专治 RK3528 等芯片有声音黑屏问题 -->
+    <androidx.media3.ui.PlayerView
+        android:id="@+id/playerView"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:background="#000000"
+        app:surface_type="surface_view"
+        app:use_controller="false"
+        app:resize_mode="fit"
+        app:shutter_background_color="#000000"
+        app:keep_content_on_player_reset="true" />
+
+    <TextView
+        android:id="@+id/tipView"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="center"
+        android:background="#99000000"
+        android:paddingLeft="32dp"
+        android:paddingTop="16dp"
+        android:paddingRight="32dp"
+        android:paddingBottom="16dp"
+        android:text="正在连接直播服务..."
+        android:textColor="#FFFFFF"
+        android:textSize="18sp"
+        android:visibility="visible" />
+</FrameLayout>

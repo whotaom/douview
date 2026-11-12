@@ -205,6 +205,23 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        // 关键：智能识别电视机顶盒硬件（如 H96 Max 等），若在 TV 上启动自动直达真正的电视交互主入口
+        val uiModeManager = getSystemService(Context.UI_MODE_SERVICE) as? android.app.UiModeManager
+        val isTvDevice = uiModeManager?.currentModeType == Configuration.UI_MODE_TYPE_TELEVISION
+            || packageManager.hasSystemFeature(PackageManager.FEATURE_LEANBACK)
+            || packageManager.hasSystemFeature(PackageManager.FEATURE_TELEVISION)
+            || !packageManager.hasSystemFeature(PackageManager.FEATURE_TOUCHSCREEN)
+
+        if (isTvDevice) {
+            val tvIntent = Intent(this, com.example.tv.TvMainActivity::class.java).apply {
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
+            }
+            startActivity(tvIntent)
+            finish()
+            return
+        }
+
         enableEdgeToEdge()
         window.setLayout(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
 

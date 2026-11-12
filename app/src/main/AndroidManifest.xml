@@ -72,6 +72,7 @@
             android:theme="@style/Theme.Fullscreen.TV"
             android:screenOrientation="landscape"
             android:launchMode="singleTop"
+            android:hardwareAccelerated="true"
             android:configChanges="keyboard|keyboardHidden|navigation|orientation|screenSize|screenLayout|uiMode" />
 
         <provider
