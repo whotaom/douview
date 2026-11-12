@@ -49,6 +49,13 @@ fun TvHomeScreen(
     var showChannelDialog by remember { mutableStateOf(false) }
     var channels by remember { mutableStateOf(channelManager.loadChannels()) }
 
+    // 进入中控台后自动后台轻量探活，动态刷新在线台数
+    LaunchedEffect(Unit) {
+        val updated = channelManager.checkLiveStatus(LivePreferences.DEFAULT_URL, channels)
+        channels = updated
+        channelManager.saveChannels(updated)
+    }
+
     Column(
         modifier = Modifier
             .fillMaxSize()

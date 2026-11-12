@@ -95,6 +95,9 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
     private lateinit var channelMenuContainer: FrameLayout
     private lateinit var channelMenuList: LinearLayout
 
+    // 媒体流技术信息悬浮面板 (OK / DPAD_CENTER 呼出)
+    private lateinit var infoOverlay: TextView
+
     // 换台防抖控制 (600ms)
     private var lastSwitchTime = 0L
     private val SWITCH_DEBOUNCE = 600L
@@ -132,14 +135,17 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
             setKeepContentOnPlayerReset(true)
         }
 
-        // 3. 初始化左侧在线频道选台抽屉（无全屏遮罩，仅占左侧 420dp）
+        // 3. 初始化左侧在线频道选台抽屉与技术信息面板
         initChannelMenu()
+        initInfoOverlay()
 
         // 4. 遥控器返回键处理
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
                 if (isChannelMenuShowing) {
                     hideChannelMenu()
+                } else if (infoOverlay.visibility == View.VISIBLE) {
+                    hideLiveInfo()
                 } else {
                     exitPlayer()
                 }
@@ -200,22 +206,26 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
      */
     private fun showChannelMenu() {
         if (isChannelMenuShowing) return
+        hideLiveInfo()
         isChannelMenuShowing = true
         channelMenuList.removeAllViews()
 
-        // 仅筛选在线频道展示
-        val onlineList = playList.filter { it.isLive }
-        if (onlineList.isEmpty()) {
+        // 仅筛选在线频道展示，同时保留真实全局索引
+        val onlineWithIndex = playList.mapIndexed { index, channel ->
+            index to channel
+        }.filter { it.second.isLive }
+
+        if (onlineWithIndex.isEmpty()) {
             showTip("当前没有在线频道")
             isChannelMenuShowing = false
             return
         }
 
-        onlineList.forEachIndexed { _, channel ->
-            val realIndex = playList.indexOf(channel) // 原始索引，用于全局切换
+        onlineWithIndex.forEach { (realIndex, channel) ->
             val isCurrent = (realIndex == currentChannelIndex)
 
             val item = TextView(this).apply {
+                tag = realIndex // 绑定真实全局索引，确保跳转准确无误
                 text = buildString {
                     append(if (isCurrent) "▶ " else "   ")
                     append(channel.name)
@@ -240,9 +250,10 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
                     }
                 }
 
-                setOnClickListener {
+                setOnClickListener { v ->
+                    val target = v.tag as? Int ?: return@setOnClickListener
                     hideChannelMenu()
-                    switchToChannel(realIndex)
+                    switchToChannel(target, force = true)
                 }
             }
             channelMenuList.addView(item)
@@ -252,13 +263,102 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         channelMenuContainer.bringToFront()
 
         // 焦点自动精准锁定在当前播放的在线频道
-        val focusIndex = onlineList.indexOfFirst { playList.indexOf(it) == currentChannelIndex }.coerceAtLeast(0)
+        val focusIndex = onlineWithIndex.indexOfFirst { it.first == currentChannelIndex }.coerceAtLeast(0)
         channelMenuList.getChildAt(focusIndex)?.requestFocus()
     }
 
     private fun hideChannelMenu() {
         isChannelMenuShowing = false
         channelMenuContainer.visibility = View.GONE
+    }
+
+    /**
+     * 初始化技术信息悬浮面板 (OK / DPAD_CENTER 呼出)
+     */
+    private fun initInfoOverlay() {
+        infoOverlay = TextView(this).apply {
+            layoutParams = FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                FrameLayout.LayoutParams.WRAP_CONTENT
+            ).also {
+                it.gravity = Gravity.CENTER
+            }
+            setBackgroundColor(Color.parseColor("#E6121212")) // 深色半透明背景
+            setTextColor(Color.WHITE)
+            textSize = 15f
+            setLineSpacing(8f, 1.25f)
+            setPadding(40, 32, 40, 32)
+            visibility = View.GONE
+            elevation = 35f
+            isFocusable = false
+            isClickable = false
+        }
+        rootContainer.addView(infoOverlay)
+    }
+
+    /**
+     * 展示当前频道的媒体流技术信息面板
+     */
+    private fun showLiveInfo() {
+        val exo = player ?: return
+        hideChannelMenu()
+
+        val channel = playList.getOrNull(currentChannelIndex)
+        val channelName = channel?.name ?: "未知频道"
+        val rid = channel?.rid ?: "-"
+        val isLiveText = if (channel?.isLive == true) "在线直播中" else "离线"
+
+        val videoFormat = exo.videoFormat
+        val audioFormat = exo.audioFormat
+        val width = videoFormat?.width ?: -1
+        val height = videoFormat?.height ?: -1
+        val resText = if (width > 0 && height > 0) "${width} × ${height}" else "解析中"
+
+        val videoCodec = videoFormat?.sampleMimeType ?: "未知"
+        val audioCodec = audioFormat?.sampleMimeType ?: "未知"
+
+        val bitrateEstimate = videoFormat?.bitrate?.takeIf { it > 0 }
+            ?: (videoFormat?.averageBitrate?.takeIf { it > 0 })
+        val bitrateText = if (bitrateEstimate != null && bitrateEstimate > 0) {
+            "${bitrateEstimate / 1000} kbps"
+        } else {
+            "自适应"
+        }
+
+        val bufferedMs = exo.totalBufferedDuration
+
+        val playbackStateStr = when (exo.playbackState) {
+            Player.STATE_IDLE -> "空闲"
+            Player.STATE_BUFFERING -> "缓冲中"
+            Player.STATE_READY -> if (exo.isPlaying) "正在播放" else "已暂停"
+            Player.STATE_ENDED -> "已结束"
+            else -> "未知"
+        }
+
+        val (curQuality, _) = qualityList.getOrNull(currentQualityIndex) ?: ("默认" to "")
+
+        val infoText = buildString {
+            append("【当前频道流信息】\n")
+            append("频道名称：$channelName\n")
+            append("房间号 (RID)：$rid\n")
+            append("直播状态：$isLiveText\n")
+            append("清晰度流：$curQuality\n")
+            append("视频分辨率：$resText\n")
+            append("视频编码：$videoCodec\n")
+            append("音频编码：$audioCodec\n")
+            append("当前码率：$bitrateText\n")
+            append("缓冲时长：${bufferedMs} ms\n")
+            append("播放状态：$playbackStateStr\n\n")
+            append("（再次按 OK 或返回键关闭）")
+        }
+
+        infoOverlay.text = infoText
+        infoOverlay.visibility = View.VISIBLE
+        infoOverlay.bringToFront()
+    }
+
+    private fun hideLiveInfo() {
+        infoOverlay.visibility = View.GONE
     }
 
     private fun setupPlayListAndStart() {
@@ -536,13 +636,15 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
     /**
      * 切换到指定索引的电视频道（带防抖、流缓存与即时文案反馈）
      */
-    private fun switchToChannel(index: Int) {
+    private fun switchToChannel(index: Int, force: Boolean = false) {
         val now = System.currentTimeMillis()
-        if (now - lastSwitchTime < SWITCH_DEBOUNCE) return
+        if (!force && now - lastSwitchTime < SWITCH_DEBOUNCE) return
         lastSwitchTime = now
 
-        if (index !in playList.indices || index == currentChannelIndex) return
+        if (index !in playList.indices) return
+        if (!force && index == currentChannelIndex) return
 
+        hideLiveInfo()
         currentChannelIndex = index
         val channel = playList[index]
         showTip("已切换到：${channel.name}")
@@ -698,14 +800,36 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
                 }
                 KeyEvent.KEYCODE_DPAD_CENTER,
                 KeyEvent.KEYCODE_ENTER -> {
-                    // 当前焦点子项会自发触发 click 事件
+                    // 主动获取当前获焦的项，直接执行跳转，防止部分电视盒子遥控器不向子 View 分发 performClick
+                    val focusedView = currentFocus ?: channelMenuList.focusedChild
+                    val target = (focusedView?.tag as? Int)
+                    if (target != null) {
+                        hideChannelMenu()
+                        switchToChannel(target, force = true)
+                        return true
+                    }
                     return false
                 }
             }
             return super.onKeyDown(keyCode, event)
         }
 
-        // 2. 正常播放状态下的遥控器控制
+        // 2. 媒体流技术信息浮层开启时的按键拦截（按 OK、Enter、Back、Menu、Info 均关闭）
+        if (infoOverlay.visibility == View.VISIBLE) {
+            when (keyCode) {
+                KeyEvent.KEYCODE_DPAD_CENTER,
+                KeyEvent.KEYCODE_ENTER,
+                KeyEvent.KEYCODE_BACK,
+                KeyEvent.KEYCODE_INFO,
+                KeyEvent.KEYCODE_MENU -> {
+                    hideLiveInfo()
+                    return true
+                }
+            }
+            return super.onKeyDown(keyCode, event)
+        }
+
+        // 3. 正常播放状态下的遥控器控制
         when (keyCode) {
             KeyEvent.KEYCODE_BACK -> {
                 exitPlayer()
@@ -726,15 +850,7 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
             }
             KeyEvent.KEYCODE_DPAD_CENTER,
             KeyEvent.KEYCODE_ENTER -> {
-                player?.let {
-                    if (it.isPlaying) {
-                        it.pause()
-                        showTip("已暂停", 3000)
-                    } else {
-                        it.play()
-                        showTip("继续播放", 1500)
-                    }
-                }
+                showLiveInfo()
                 return true
             }
             KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE -> {

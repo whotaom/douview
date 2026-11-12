@@ -203,6 +203,80 @@ class ChannelManager(private val context: Context) {
         return map.values.toList()
     }
 
+    /**
+     * 批量或并发测活：检查各频道是否真正在线开播
+     */
+    suspend fun checkLiveStatus(
+        baseUrl: String = "https://tv.fuxiaoya.com",
+        channels: List<Channel>
+    ): List<Channel> = withContext(Dispatchers.IO) {
+        val result = channels.toMutableList()
+        var batchSupported = false
+
+        // 1. 尝试 batch 批量接口
+        channels.chunked(8).forEach { chunk ->
+            val ids = chunk.joinToString(",") { it.rid }
+            try {
+                val url = "${baseUrl.trimEnd('/')}/live.php?batch=$ids"
+                val request = Request.Builder()
+                    .url(url)
+                    .header("User-Agent", "Mozilla/5.0 (Linux; Android 13; TV) AppleWebKit/537.36")
+                    .get()
+                    .build()
+
+                okHttp.newCall(request).execute().use { resp ->
+                    if (resp.isSuccessful) {
+                        val body = resp.body?.string() ?: ""
+                        val json = JSONObject(body)
+                        val batchObj = json.optJSONObject("batch")
+                        if (batchObj != null) {
+                            batchSupported = true
+                            chunk.forEach { ch ->
+                                val chObj = batchObj.optJSONObject(ch.rid)
+                                if (chObj != null) {
+                                    val isLive = chObj.optBoolean("is_live", chObj.optBoolean("isLive", true))
+                                    val index = result.indexOfFirst { it.rid == ch.rid }
+                                    if (index >= 0) {
+                                        result[index] = result[index].copy(isLive = isLive)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+
+        // 2. 若无 batch 接口，对首屏关键频道进行并发单房探活
+        if (!batchSupported) {
+            channels.take(12).forEach { ch ->
+                try {
+                    val url = "${baseUrl.trimEnd('/')}/live.php?rid=${ch.rid.trim()}"
+                    val request = Request.Builder()
+                        .url(url)
+                        .header("User-Agent", "Mozilla/5.0 (Linux; Android 13; TV) AppleWebKit/537.36")
+                        .get()
+                        .build()
+
+                    okHttp.newCall(request).execute().use { resp ->
+                        if (resp.isSuccessful) {
+                            val body = resp.body?.string() ?: ""
+                            val json = JSONObject(body)
+                            val code = json.optInt("code", 0)
+                            val streams = json.optJSONObject("streams")
+                            val isLive = (code == 200 && streams != null && streams.length() > 0)
+                            val index = result.indexOfFirst { it.rid == ch.rid }
+                            if (index >= 0) {
+                                result[index] = result[index].copy(isLive = isLive)
+                            }
+                        }
+                    }
+                } catch (_: Exception) {}
+            }
+        }
+        result
+    }
+
     private fun parseJsonArray(jsonStr: String): List<Channel> {
         return try {
             val array = JSONArray(jsonStr)
