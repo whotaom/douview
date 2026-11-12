@@ -20,6 +20,11 @@ android {
     versionName = "1.0.1"
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
+    ndk {
+      // 强制包含 32 位 armeabi-v7a，确保 H96_Max_RK3528 等 32 位电视盒子完美安装运行
+      abiFilters += listOf("armeabi-v7a", "arm64-v8a", "x86", "x86_64")
+    }
   }
 
   // Do not remove or modify these signingConfigs. They are necessary for building, installing,

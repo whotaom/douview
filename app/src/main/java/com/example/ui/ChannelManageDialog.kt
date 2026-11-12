@@ -165,6 +165,42 @@ fun ChannelManageDialog(
                                 modifier = Modifier.clickable { replaceMode = !replaceMode }
                             )
                         }
+
+                        Spacer(modifier = Modifier.height(6.dp))
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Text(
+                                text = "快捷预置源：",
+                                fontSize = 11.sp,
+                                color = TextSecondary
+                            )
+                            SuggestionChip(
+                                onClick = { remoteUrlInput = "https://tv.fuxiaoya.com/dy.json" },
+                                label = { Text("官方主线 (dy.json)", fontSize = 11.sp) },
+                                colors = SuggestionChipDefaults.suggestionChipColors(
+                                    containerColor = DarkBg,
+                                    labelColor = DouyinCyan
+                                ),
+                                border = SuggestionChipDefaults.suggestionChipBorder(
+                                    enabled = true,
+                                    borderColor = DarkSurfaceBorder
+                                )
+                            )
+                            SuggestionChip(
+                                onClick = { remoteUrlInput = "https://tt.fuxiaoya.com/dy.json" },
+                                label = { Text("备用加速 (tt.fuxiaoya.com)", fontSize = 11.sp) },
+                                colors = SuggestionChipDefaults.suggestionChipColors(
+                                    containerColor = DarkBg,
+                                    labelColor = DouyinGreen
+                                ),
+                                border = SuggestionChipDefaults.suggestionChipBorder(
+                                    enabled = true,
+                                    borderColor = DarkSurfaceBorder
+                                )
+                            )
+                        }
                     }
                 }
 
