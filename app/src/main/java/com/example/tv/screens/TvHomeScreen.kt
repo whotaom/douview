@@ -67,17 +67,6 @@ fun TvHomeScreen(
             )
 
             TvActionButton(
-                text = if (isDesktopUa) "桌面 UA" else "移动 UA",
-                icon = if (isDesktopUa) Icons.Default.DesktopWindows else Icons.Default.Smartphone,
-                onClick = {
-                    val next = !isDesktopUa
-                    preferences.isDesktopUa = next
-                    isDesktopUa = next
-                    Toast.makeText(context, if (next) "已切换为桌面版 UA 模式" else "已切换为移动版 UA 模式", Toast.LENGTH_SHORT).show()
-                }
-            )
-
-            TvActionButton(
                 text = "清理缓存",
                 icon = Icons.Default.DeleteSweep,
                 onClick = { showClearCacheDialog = true }
@@ -444,7 +433,8 @@ fun TvHomeScreen(
             onConfirm = {
                 showClearCacheDialog = false
                 preferences.recordCacheCleared()
-                Toast.makeText(context, "电视端缓存已成功彻底清空", Toast.LENGTH_SHORT).show()
+                TvFullscreenPlayerActivity.clearStreamCache()
+                Toast.makeText(context, "电视端缓存与流地址缓存已彻底清空", Toast.LENGTH_SHORT).show()
             }
         )
     }
