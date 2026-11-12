@@ -1,0 +1,770 @@
+TV + 移动端：竖屏直播播放器 + 视频流动态磨砂背景 + 换台修复 + TV 性能优化
+一、竖屏播放器 + 视频流动态磨砂背景（可辨认）
+推荐实现思路（性能与效果平衡）
+主画面：竖屏比例容器播放（9:16 或居中）
+背景：同一路视频流做低分辨率 + 强模糊 + 压暗，形成磨砂玻璃效果，仍能隐约看到画面动态
+TV 端降低模糊频率与分辨率，避免 RK3528 卡顿
+1. 布局结构（通用）
+Text
+FrameLayout (全屏黑底)
+├── BackgroundPlayerView   // 背景层：视频流 + 模糊 + 变暗（全屏）
+├── ForegroundPlayerView   // 前景竖屏播放器（居中，9:16）
+└── 提示 / 菜单 / 信息浮层
+2. 背景层实现要点（Compose / View 均可）
+方案 A（推荐，性能较好）：同一 ExoPlayer，用两个 PlayerView 共享，或背景用 TextureView 截帧后模糊。
+更稳妥、对盒子友好的做法：
+Kotlin
+// 背景：低清 + 模糊 + 压暗
+backgroundPlayerView.apply {
+    useController = false
+    resizeMode = AspectRatioFrameLayout.RESIZE_MODE_ZOOM   // 铺满
+    setBackgroundColor(Color.BLACK)
+}
+
+// 前景：竖屏播放
+foregroundPlayerView.apply {
+    useController = false
+    resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
+    // 布局上宽高比约 9:16，水平居中
+}
+磨砂效果（两种选一）：
+① 系统 RenderEffect（Android 12+，简单）
+Kotlin
+if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+    backgroundPlayerView.setRenderEffect(
+        RenderEffect.createBlurEffect(28f, 28f, Shader.TileMode.CLAMP)
+    )
+    // 再盖一层半透明黑，保证文字可读
+    blurOverlay.setBackgroundColor(Color.parseColor("#99000000"))
+}
+② 兼容方案（截帧 + 模糊，适合 TV 盒子）
+每隔 800–1200ms 从播放器取一帧（或使用 VideoFrameMetadataListener）
+缩放到很小（如 180p）→ 快速模糊 → 设为背景 ImageView
+前景仍用正常清晰度播放
+这样背景有动态感，但不会每帧全尺寸模糊，RK3528 也能扛住。
+3. 竖屏容器示例（Compose）
+Kotlin
+Box(Modifier.fillMaxSize().background(Color.Black)) {
+    // 动态磨砂背景
+    AndroidView(
+        factory = { ctx -> /* background PlayerView */ },
+        modifier = Modifier
+            .fillMaxSize()
+            .graphicsLayer { // 可选额外压暗
+                alpha = 0.55f
+            }
+    )
+    // 半透明遮罩，提升前景可辨认性
+    Box(Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.45f)))
+
+    // 前景竖屏播放器
+    AndroidView(
+        factory = { ctx -> /* foreground PlayerView */ },
+        modifier = Modifier
+            .align(Alignment.Center)
+            .fillMaxHeight(0.92f)
+            .aspectRatio(9f / 16f)
+            .clip(RoundedCornerShape(12.dp))
+    )
+}
+移动端同样结构，横屏时可改回横屏布局或保持竖屏卡片。
+二、继续修正换台 BUG（关键）
+换台失败常见原因：索引错乱、菜单过滤后索引对不上、异步取流未取消上一次。
+强制正确逻辑：
+Kotlin
+private var switchGeneration = 0L   // 防止旧请求覆盖新台
+
+private fun switchToChannel(index: Int) {
+    if (index !in playList.indices) return
+    val now = System.currentTimeMillis()
+    if (now - lastSwitchTime < 500) return
+    lastSwitchTime = now
+
+    currentChannelIndex = index
+    val channel = playList[index]
+    val gen = ++switchGeneration
+
+    pendingTipForChannel = channel.name
+    showTip("正在切换到：${channel.name}", autoHideMs = 0)
+
+    // 取消上一路
+    player?.stop()
+    player?.clearMediaItems()
+
+    lifecycleScope.launch {
+        val list = withContext(Dispatchers.IO) {
+            // 优先缓存
+            val cached = streamCache[channel.rid]
+            val t = streamCacheTime[channel.rid] ?: 0L
+            if (cached != null && now - t < CACHE_TTL) cached
+            else fetchQualityList(DEFAULT_BASE_URL, channel.rid).also {
+                if (it.isNotEmpty()) cacheStream(channel.rid, it)
+            }
+        }
+
+        // 已换台则丢弃过期结果
+        if (gen != switchGeneration) return@launch
+
+        if (list.isEmpty()) {
+            showTip("该频道暂无法播放")
+            pendingTipForChannel = null
+            return@launch
+        }
+        qualityList = list
+        currentQualityIndex = 0
+        playCurrentQuality()
+    }
+}
+菜单点击必须传真实 index（过滤在线后仍用原始 playList 下标），不要用过滤后的 0、1、2。
+菜单只显示在线：
+Kotlin
+val online = playList.mapIndexed { i, c -> i to c }.filter { it.second.isLive }
+三、TV 性能优化（针对 H96 Max RK3528）
+优化项	做法
+背景模糊	降采样 + 降低更新频率（≥800ms），或仅用半透明黑 + 轻微模糊
+双 PlayerView	背景共用同一 ExoPlayer 时避免两路解码；若必须两路，背景用更低码率/分辨率
+缓冲	DefaultLoadControl 适当减小 maxBuffer，降低内存
+解码	保持 setEnableDecoderFallback(true)，surface_type = surface_view
+列表	频道菜单用普通 View + 复用，避免一屏过多焦点节点
+切台	先 stop/clear 再起播，避免多实例堆积
+缓存	流地址缓存 5 分钟，减少重复 live.php
+UI	减少实时动画；提示用简单 alpha，避免复杂阴影
+ExoPlayer 建议配置：
+Kotlin
+val loadControl = DefaultLoadControl.Builder()
+    .setBufferDurationsMs(10_000, 30_000, 2_000, 5_000)  // TV 上更保守
+    .build()
+
+val renderersFactory = DefaultRenderersFactory(this).apply {
+    setEnableDecoderFallback(true)
+    setExtensionRendererMode(DefaultRenderersFactory.EXTENSION_RENDERER_MODE_PREFER)
+}
+背景层若用截帧模糊，务必在子线程做缩放+模糊，主线程只 setImageBitmap。
+四、体验与实现优先级
+先修换台（generation + 真实 index + 完成后再收起提示）
+菜单只出在线 + 左侧浮层
+竖屏 + 磨砂背景（移动端可先做完整模糊，TV 端用轻量版）
+TV 性能：缓冲、解码回退、切台停播、缓存
+五、磨砂可辨认的简单参数建议
+模糊半径：18–32px（TV 取小）
+背景额外压暗：#66000000 ~ #99000000
+前景竖屏圆角：8–12dp，可加很细的亮边提升层次
+这样背景仍能感觉到画面在动，又不抢前景、不影响信息阅读。
+需要我下一步输出：
+竖屏 + 磨砂背景的完整 Activity/Compose 示例，或
+只含换台修复 + 性能参数的完整播放页关键代码
+直接说优先哪一块即可。按顶级 Android TV / 直播客户端的做法完成
+优秀团队会用的数据、工具与方法：
+类别	内容
+数据	播放器真实状态、onRenderedFirstFrame、设备解码能力、人眼可辨的对比度/模糊半径
+工具	ExoPlayer Listener、SurfaceView、可控透明度 + 轻模糊、generation 防竞态
+方法	状态驱动 UI、单实例优先、弱设备降载、反馈与出画绑定
+下面直接给出：可辨认磨砂竖屏背景 + 换台修复 + TV 性能参数 的完整播放页核心实现。
+设计结论（保证「人眼可辩」）
+模糊半径：12–16（再大就糊成色块）
+压暗遮罩：30%～40% 黑（再深就看不清）
+背景视频：RESIZE_MODE_ZOOM 铺满，保留动态与轮廓
+前景：竖屏 9:16 居中，清晰主画面
+弱设备（RK3528）：优先轻模糊 + 遮罩；系统不支持 RenderEffect 时退化为「半透明黑 + 略暗背景视频」，仍可辨认
+完整播放页核心代码
+Kotlin
+package com.aistudio.douyinlive.zkytvm.tv.player
+
+import android.graphics.Color
+import android.graphics.RenderEffect
+import android.graphics.Shader
+import android.os.Build
+import android.os.Bundle
+import android.text.TextUtils
+import android.util.Log
+import android.view.Gravity
+import android.view.KeyEvent
+import android.view.View
+import android.view.ViewGroup
+import android.view.WindowManager
+import android.widget.FrameLayout
+import android.widget.LinearLayout
+import android.widget.ScrollView
+import android.widget.TextView
+import androidx.activity.OnBackPressedCallback
+import androidx.appcompat.app.AppCompatActivity
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
+import androidx.lifecycle.lifecycleScope
+import androidx.media3.common.MediaItem
+import androidx.media3.common.PlaybackException
+import androidx.media3.common.Player
+import androidx.media3.common.VideoSize
+import androidx.media3.datasource.DefaultHttpDataSource
+import androidx.media3.exoplayer.DefaultLoadControl
+import androidx.media3.exoplayer.DefaultRenderersFactory
+import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
+import androidx.media3.exoplayer.trackselection.DefaultTrackSelector
+import androidx.media3.ui.AspectRatioFrameLayout
+import androidx.media3.ui.PlayerView
+import com.google.gson.Gson
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import java.util.concurrent.TimeUnit
+
+class TvFullscreenPlayerActivity : AppCompatActivity() {
+
+    companion object {
+        const val DEFAULT_BASE_URL = "https://tv.fuxiaoya.com"
+        private const val TAG = "TVPlayer"
+        private val TV_UA =
+            "Mozilla/5.0 (Linux; Android 13; TV) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
+
+    data class Channel(
+        val rid: String,
+        val name: String,
+        val title: String = "",
+        val isLive: Boolean = true
+    )
+
+    data class LiveResponse(val code: Int, val streams: Map<String, StreamQuality>? = null)
+    data class StreamQuality(val name: String? = null, val hls: String? = null, val flv: String? = null)
+
+    // UI
+    private lateinit var root: FrameLayout
+    private lateinit var bgPlayerView: PlayerView          // 磨砂背景
+    private lateinit var fgPlayerView: PlayerView          // 竖屏前景
+    private lateinit var dimOverlay: View                  // 压暗，保证可辨认又不太糊
+    private lateinit var tipView: TextView
+    private lateinit var channelMenu: FrameLayout
+    private lateinit var channelMenuList: LinearLayout
+    private lateinit var infoOverlay: TextView
+
+    private var player: ExoPlayer? = null
+    private var isMenuShowing = false
+    private var isInfoShowing = false
+
+    // 频道
+    private var playList: List<Channel> = emptyList()
+    private var currentIndex = 0
+    private var qualityList: List<Pair<String, String>> = emptyList()
+    private var qualityIndex = 0
+
+    // 换台防竞态 + 反馈
+    private var switchGen = 0L
+    private var lastSwitchAt = 0L
+    private var pendingTipName: String? = null
+
+    // 缓存
+    private val streamCache = mutableMapOf<String, List<Pair<String, String>>>()
+    private val streamCacheAt = mutableMapOf<String, Long>()
+    private val CACHE_TTL = 5 * 60 * 1000L
+
+    private val gson = Gson()
+    private val okHttp = OkHttpClient.Builder()
+        .connectTimeout(12, TimeUnit.SECONDS)
+        .readTimeout(15, TimeUnit.SECONDS)
+        .followRedirects(true)
+        .build()
+
+    private val defaultChannels = listOf(
+        Channel("127453393722", "央视网快看", "总台央视新闻频道正在播出", true),
+        Channel("232551178364", "电影频道云影院", "直播丨CCTV6电影频道", true),
+        Channel("50828500437", "央视频", "新闻正在直播", true),
+        Channel("783811579858", "央视三农", "CCTV-17", true),
+        Channel("193671986973", "安静听歌", "24小时听歌", true)
+    )
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        enterFullscreen()
+        buildUi()
+        playList = defaultChannels.filter { it.isLive }.ifEmpty { defaultChannels }
+        currentIndex = 0
+        switchToChannel(0)
+
+        onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
+            override fun handleOnBackPressed() = handleBack()
+        })
+    }
+
+    // -------------------- UI --------------------
+
+    private fun buildUi() {
+        root = FrameLayout(this).apply {
+            setBackgroundColor(Color.BLACK)
+            layoutParams = FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT
+            )
+        }
+        setContentView(root)
+
+        // 背景播放器（全屏动态）
+        bgPlayerView = PlayerView(this).apply {
+            layoutParams = FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT
+            )
+            useController = false
+            resizeMode = AspectRatioFrameLayout.RESIZE_MODE_ZOOM
+            setBackgroundColor(Color.BLACK)
+            setShutterBackgroundColor(Color.BLACK)
+            // 人眼可辩：轻模糊（系统支持时）
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                setRenderEffect(
+                    RenderEffect.createBlurEffect(14f, 14f, Shader.TileMode.CLAMP)
+                )
+            }
+        }
+        root.addView(bgPlayerView)
+
+        // 压暗层：30%～40%，保证前景可读、背景仍可辩
+        dimOverlay = View(this).apply {
+            layoutParams = FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT
+            )
+            setBackgroundColor(Color.parseColor("#66000000")) // ~40% 黑
+        }
+        root.addView(dimOverlay)
+
+        // 前景竖屏播放器
+        val fgW = (resources.displayMetrics.widthPixels * 0.42f).toInt().coerceAtLeast(360)
+        val fgH = (fgW * 16f / 9f).toInt()
+        fgPlayerView = PlayerView(this).apply {
+            layoutParams = FrameLayout.LayoutParams(fgW, fgH).also {
+                it.gravity = Gravity.CENTER
+            }
+            useController = false
+            resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
+            setBackgroundColor(Color.BLACK)
+            setShutterBackgroundColor(Color.BLACK)
+            elevation = 8f
+        }
+        root.addView(fgPlayerView)
+
+        // 换台提示（顶层）
+        tipView = TextView(this).apply {
+            layoutParams = FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                FrameLayout.LayoutParams.WRAP_CONTENT
+            ).also {
+                it.gravity = Gravity.CENTER_HORIZONTAL or Gravity.TOP
+                it.topMargin = 40.dp()
+            }
+            setTextColor(Color.WHITE)
+            textSize = 18f
+            setPadding(28, 12, 28, 12)
+            setBackgroundColor(Color.parseColor("#CC111111"))
+            elevation = 40f
+            visibility = View.GONE
+        }
+        root.addView(tipView)
+
+        // 左侧选台菜单（仅在线、无全屏遮罩）
+        channelMenu = FrameLayout(this).apply {
+            layoutParams = FrameLayout.LayoutParams(400.dp(), FrameLayout.LayoutParams.MATCH_PARENT)
+            setBackgroundColor(Color.parseColor("#E6121212"))
+            visibility = View.GONE
+            elevation = 24f
+        }
+        val menuTitle = TextView(this).apply {
+            text = "在线频道"
+            setTextColor(Color.WHITE)
+            textSize = 18f
+            setPadding(24, 24, 24, 8)
+        }
+        channelMenuList = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(8, 0, 8, 16)
+        }
+        val scroll = ScrollView(this).apply {
+            layoutParams = FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT
+            ).also { it.topMargin = 64.dp() }
+            addView(channelMenuList)
+        }
+        channelMenu.addView(menuTitle)
+        channelMenu.addView(scroll)
+        root.addView(channelMenu)
+
+        // OK 键信息层
+        infoOverlay = TextView(this).apply {
+            layoutParams = FrameLayout.LayoutParams(480.dp(), FrameLayout.LayoutParams.WRAP_CONTENT)
+                .also { it.gravity = Gravity.CENTER }
+            setBackgroundColor(Color.parseColor("#E6101010"))
+            setTextColor(Color.WHITE)
+            textSize = 15f
+            setPadding(24, 20, 24, 20)
+            elevation = 48f
+            visibility = View.GONE
+            setLineSpacing(5f, 1.15f)
+        }
+        root.addView(infoOverlay)
+    }
+
+    // -------------------- 播放与换台（修复版） --------------------
+
+    private fun switchToChannel(index: Int) {
+        if (index !in playList.indices) return
+        val now = System.currentTimeMillis()
+        if (now - lastSwitchAt < 450) return
+        lastSwitchAt = now
+
+        currentIndex = index
+        val ch = playList[index]
+        val gen = ++switchGen
+
+        pendingTipName = ch.name
+        showTip("正在切换到：${ch.name}", autoHide = false)
+
+        player?.stop()
+        player?.clearMediaItems()
+
+        lifecycleScope.launch {
+            val list = withContext(Dispatchers.IO) {
+                val cached = streamCache[ch.rid]
+                val t = streamCacheAt[ch.rid] ?: 0L
+                if (cached != null && now - t < CACHE_TTL) cached
+                else fetchQualities(ch.rid).also { if (it.isNotEmpty()) cache(ch.rid, it) }
+            }
+            if (gen != switchGen) return@launch
+
+            if (list.isEmpty()) {
+                pendingTipName = null
+                showTip("该频道暂无法播放", autoHide = true)
+                return@launch
+            }
+            qualityList = list
+            qualityIndex = 0
+            playQuality()
+        }
+    }
+
+    private fun playQuality() {
+        if (qualityIndex !in qualityList.indices) {
+            pendingTipName = null
+            showTip("播放失败", autoHide = true)
+            return
+        }
+        val (qName, hls) = qualityList[qualityIndex]
+        val chName = playList.getOrNull(currentIndex)?.name ?: ""
+        if (pendingTipName != null) {
+            showTip("正在切换到：$chName · $qName", autoHide = false)
+        }
+
+        releasePlayerOnly()
+
+        val renderers = DefaultRenderersFactory(this).apply {
+            setEnableDecoderFallback(true)
+            setExtensionRendererMode(DefaultRenderersFactory.EXTENSION_RENDERER_MODE_PREFER)
+        }
+        val loadControl = DefaultLoadControl.Builder()
+            .setBufferDurationsMs(10_000, 28_000, 2_000, 5_000) // TV 性能参数
+            .build()
+        val trackSelector = DefaultTrackSelector(this).apply {
+            parameters = buildUponParameters().setTunnelingEnabled(false).build()
+        }
+        val dataSource = DefaultHttpDataSource.Factory()
+            .setUserAgent(TV_UA)
+            .setAllowCrossProtocolRedirects(true)
+            .setConnectTimeoutMs(12_000)
+            .setReadTimeoutMs(15_000)
+        val mediaSourceFactory = DefaultMediaSourceFactory(this).setDataSourceFactory(dataSource)
+
+        player = ExoPlayer.Builder(this, renderers)
+            .setTrackSelector(trackSelector)
+            .setLoadControl(loadControl)
+            .setMediaSourceFactory(mediaSourceFactory)
+            .build()
+            .also { exo ->
+                // 同一播放器驱动背景 + 前景（省一路解码，性能关键）
+                bgPlayerView.player = exo
+                fgPlayerView.player = exo
+
+                exo.addListener(object : Player.Listener {
+                    override fun onPlayerError(error: PlaybackException) {
+                        Log.e(TAG, "error ${error.errorCodeName}: ${error.message}")
+                        qualityIndex++
+                        fgPlayerView.postDelayed({ playQuality() }, 900)
+                    }
+
+                    override fun onPlaybackStateChanged(state: Int) {
+                        when (state) {
+                            Player.STATE_BUFFERING -> {
+                                if (pendingTipName != null) {
+                                    showTip("正在切换到：$pendingTipName（缓冲中）", autoHide = false)
+                                }
+                            }
+                            Player.STATE_READY -> onSwitchCompleted()
+                            Player.STATE_ENDED -> showTip("直播已结束", autoHide = true)
+                        }
+                    }
+
+                    override fun onRenderedFirstFrame() {
+                        onSwitchCompleted()
+                    }
+
+                    override fun onVideoSizeChanged(videoSize: VideoSize) {
+                        Log.d(TAG, "video ${videoSize.width}x${videoSize.height}")
+                    }
+                })
+
+                exo.setMediaItem(MediaItem.fromUri(hls))
+                exo.prepare()
+                exo.playWhenReady = true
+            }
+    }
+
+    private fun onSwitchCompleted() {
+        if (pendingTipName != null) {
+            val name = pendingTipName
+            pendingTipName = null
+            showTip("已切换到：$name", autoHide = true)
+        } else {
+            tipView.visibility = View.GONE
+        }
+    }
+
+    private suspend fun fetchQualities(rid: String): List<Pair<String, String>> =
+        withContext(Dispatchers.IO) {
+            try {
+                val req = Request.Builder()
+                    .url("$DEFAULT_BASE_URL/live.php?rid=$rid")
+                    .header("User-Agent", TV_UA)
+                    .header("Referer", "$DEFAULT_BASE_URL/")
+                    .get().build()
+                okHttp.newCall(req).execute().use { resp ->
+                    if (!resp.isSuccessful) return@withContext emptyList()
+                    val body = resp.body?.string() ?: return@withContext emptyList()
+                    val data = gson.fromJson(body, LiveResponse::class.java)
+                    if (data.code != 200 || data.streams.isNullOrEmpty()) return@withContext emptyList()
+                    val order = listOf("origin", "uhd", "hd", "sd", "ld", "default")
+                    val out = mutableListOf<Pair<String, String>>()
+                    for (k in order) {
+                        val q = data.streams[k]
+                        if (!q?.hls.isNullOrBlank()) out.add((q.name ?: k) to q.hls!!)
+                    }
+                    data.streams.forEach { (k, q) ->
+                        if (k !in order && !q.hls.isNullOrBlank() && out.none { it.second == q.hls }) {
+                            out.add((q.name ?: k) to q.hls!!)
+                        }
+                    }
+                    out
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "fetch", e)
+                emptyList()
+            }
+        }
+
+    private fun cache(rid: String, list: List<Pair<String, String>>) {
+        streamCache[rid] = list
+        streamCacheAt[rid] = System.currentTimeMillis()
+    }
+
+    // -------------------- 菜单（仅在线） --------------------
+
+    private fun showMenu() {
+        if (isMenuShowing) return
+        val online = playList.mapIndexed { i, c -> i to c }.filter { it.second.isLive }
+        if (online.isEmpty()) {
+            showTip("当前没有在线直播", autoHide = true)
+            return
+        }
+        isMenuShowing = true
+        channelMenuList.removeAllViews()
+        online.forEach { (realIdx, ch) ->
+            val current = realIdx == currentIndex
+            val tv = TextView(this).apply {
+                text = (if (current) "▶ " else "   ") + ch.name
+                maxLines = 1
+                ellipsize = TextUtils.TruncateAt.END
+                setTextColor(if (current) Color.parseColor("#4FC3F7") else Color.WHITE)
+                textSize = 17f
+                setPadding(18, 14, 18, 14)
+                isFocusable = true
+                isClickable = true
+                tag = realIdx
+                setOnFocusChangeListener { v, has ->
+                    v.setBackgroundColor(if (has) Color.parseColor("#33FFFFFF") else Color.TRANSPARENT)
+                    (v as TextView).setTextColor(
+                        if (has || (v.tag as Int) == currentIndex) Color.parseColor("#4FC3F7")
+                        else Color.WHITE
+                    )
+                }
+                setOnClickListener { v ->
+                    val idx = v.tag as Int
+                    hideMenu()
+                    switchToChannel(idx)
+                }
+            }
+            channelMenuList.addView(tv)
+        }
+        channelMenu.visibility = View.VISIBLE
+        val focus = online.indexOfFirst { it.first == currentIndex }.coerceAtLeast(0)
+        channelMenuList.getChildAt(focus)?.requestFocus()
+    }
+
+    private fun hideMenu() {
+        isMenuShowing = false
+        channelMenu.visibility = View.GONE
+    }
+
+    // -------------------- OK 信息 --------------------
+
+    private fun toggleInfo() {
+        if (isInfoShowing) {
+            infoOverlay.visibility = View.GONE
+            isInfoShowing = false
+            return
+        }
+        val ch = playList.getOrNull(currentIndex) ?: return
+        val p = player
+        val vf = p?.videoFormat
+        val af = p?.audioFormat
+        val br = ((p?.bitrateEstimate ?: 0).coerceAtLeast(0) / 1000)
+        infoOverlay.text = buildString {
+            append("频道：${ch.name}\n房间：${ch.rid}\n")
+            append("状态：${if (ch.isLive) "在线" else "离线"}\n")
+            append("────────────────\n")
+            append("分辨率：${vf?.width ?: "-"}×${vf?.height ?: "-"}\n")
+            append("视频：${vf?.sampleMimeType ?: "-"}\n")
+            append("音频：${af?.sampleMimeType ?: "-"}\n")
+            append("码率：${if (br > 0) "$br kbps" else "-"}\n")
+            append("缓冲：${p?.totalBufferedDuration ?: 0} ms\n")
+            append("────────────────\n按 OK / 返回 关闭")
+        }
+        infoOverlay.visibility = View.VISIBLE
+        infoOverlay.bringToFront()
+        isInfoShowing = true
+    }
+
+    // -------------------- 按键 / 生命周期 --------------------
+
+    private fun handleBack() {
+        when {
+            isMenuShowing -> hideMenu()
+            isInfoShowing -> {
+                infoOverlay.visibility = View.GONE
+                isInfoShowing = false
+            }
+            else -> {
+                releaseAll()
+                finish()
+            }
+        }
+    }
+
+    override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
+        if (isMenuShowing) {
+            if (keyCode == KeyEvent.KEYCODE_MENU || keyCode == KeyEvent.KEYCODE_BACK ||
+                keyCode == KeyEvent.KEYCODE_INFO
+            ) {
+                hideMenu()
+                return true
+            }
+            return super.onKeyDown(keyCode, event)
+        }
+        when (keyCode) {
+            KeyEvent.KEYCODE_BACK -> {
+                handleBack()
+                return true
+            }
+            KeyEvent.KEYCODE_MENU, KeyEvent.KEYCODE_INFO -> {
+                showMenu()
+                return true
+            }
+            KeyEvent.KEYCODE_DPAD_UP -> {
+                if (currentIndex > 0) switchToChannel(currentIndex - 1)
+                else showTip("已经是第一个频道", autoHide = true)
+                return true
+            }
+            KeyEvent.KEYCODE_DPAD_DOWN -> {
+                if (currentIndex < playList.lastIndex) switchToChannel(currentIndex + 1)
+                else showTip("已经是最后一个频道", autoHide = true)
+                return true
+            }
+            KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER -> {
+                toggleInfo()
+                return true
+            }
+        }
+        return super.onKeyDown(keyCode, event)
+    }
+
+    private fun showTip(msg: String, autoHide: Boolean) {
+        tipView.bringToFront()
+        tipView.text = msg
+        tipView.visibility = View.VISIBLE
+        tipView.alpha = 1f
+        tipView.removeCallbacks(hideTipRunnable)
+        if (autoHide) tipView.postDelayed(hideTipRunnable, 1800)
+    }
+
+    private val hideTipRunnable = Runnable {
+        tipView.animate().alpha(0f).setDuration(220).withEndAction {
+            tipView.visibility = View.GONE
+        }.start()
+    }
+
+    private fun enterFullscreen() {
+        WindowCompat.setDecorFitsSystemWindows(window, false)
+        WindowInsetsControllerCompat(window, window.decorView).let {
+            it.hide(WindowInsetsCompat.Type.systemBars())
+            it.systemBarsBehavior =
+                WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        }
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+    }
+
+    private fun releasePlayerOnly() {
+        bgPlayerView.player = null
+        fgPlayerView.player = null
+        player?.release()
+        player = null
+    }
+
+    private fun releaseAll() {
+        releasePlayerOnly()
+        streamCache.clear()
+    }
+
+    override fun onStop() {
+        super.onStop()
+        player?.playWhenReady = false
+    }
+
+    override fun onStart() {
+        super.onStart()
+        player?.playWhenReady = true
+    }
+
+    override fun onDestroy() {
+        releaseAll()
+        super.onDestroy()
+    }
+
+    private fun Int.dp(): Int = (this * resources.displayMetrics.density).toInt()
+}
+关键参数一览（人眼可辩 + 性能）
+项目	值	原因
+背景模糊	14px	仍能看清轮廓与动态
+压暗	#66000000（约 40%）	前景清晰，背景可辩
+缓冲	10s–28s	降低 RK3528 内存与卡顿
+隧道模式	关闭	减少黑屏
+解码回退	开启	兼容烂盒子
+单 ExoPlayer	背景+前景共用	只解一路，性能最好
+换台反馈	STATE_READY / 首帧后消失	状态驱动，不误关
+若仍觉得背景偏糊
+只需改两处：
+Kotlin
+// 更清晰：模糊再降
+RenderEffect.createBlurEffect(10f, 10f, Shader.TileMode.CLAMP)
+
+// 更清晰：压暗再减
+dimOverlay.setBackgroundColor(Color.parseColor("#4D000000")) // ~30%
+按此实现即可同时满足：竖屏主画面、可辨认动态磨砂背景、换台正确且反馈等出画再消失、TV 性能可控。

@@ -31,6 +31,7 @@ import com.example.ui.ClearCacheConfirmDialog
 import com.example.ui.UpdateDialog
 import com.example.ui.theme.*
 import com.example.util.UpdateManager
+import kotlinx.coroutines.launch
 
 @Composable
 fun TvHomeScreen(
@@ -40,6 +41,7 @@ fun TvHomeScreen(
     val context = LocalContext.current
     val preferences = remember { LivePreferences(context) }
     val channelManager = remember { ChannelManager(context) }
+    val coroutineScope = rememberCoroutineScope()
 
     var currentTargetUrl by remember { mutableStateOf(preferences.targetUrl) }
     var historyUrls by remember { mutableStateOf(preferences.getHistoryUrls()) }
@@ -67,9 +69,23 @@ fun TvHomeScreen(
             subtitle = "当前中控服务: https://tv.fuxiaoya.com · 在线频道自动就绪"
         ) {
             TvActionButton(
+                text = "立即拉取",
+                icon = Icons.Default.Refresh,
+                isPrimary = true,
+                onClick = {
+                    Toast.makeText(context, "正在检测在线状态…", Toast.LENGTH_SHORT).show()
+                    coroutineScope.launch {
+                        val updated = channelManager.checkLiveStatus(LivePreferences.DEFAULT_URL, channelManager.loadChannels())
+                        channels = updated
+                        channelManager.saveChannels(updated)
+                        Toast.makeText(context, "检测完成：在线 ${updated.count { it.isLive }} 台", Toast.LENGTH_SHORT).show()
+                    }
+                }
+            )
+
+            TvActionButton(
                 text = "频道管理",
                 icon = Icons.Default.LiveTv,
-                isPrimary = true,
                 onClick = { showChannelDialog = true }
             )
 
@@ -106,12 +122,10 @@ fun TvHomeScreen(
                         fontSize = 14.sp,
                         fontWeight = FontWeight.SemiBold
                     )
-                    val total = channels.size
-                    val online = channels.count { it.isLive }
                     Text(
-                        text = "共 $total 台 · 在线 $online 台",
-                        color = Color.White.copy(alpha = 0.85f),
-                        fontSize = 14.sp,
+                        text = "共 ${channels.size} 台 · 在线 ${channels.count { it.isLive }} 台",
+                        color = Color.White.copy(alpha = 0.9f),
+                        fontSize = 16.sp,
                         fontWeight = FontWeight.Bold
                     )
                 }

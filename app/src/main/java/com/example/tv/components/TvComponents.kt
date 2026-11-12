@@ -151,26 +151,38 @@ fun TvActionButton(
     isPrimary: Boolean = false
 ) {
     var isFocused by remember { mutableStateOf(false) }
-    val scale by animateFloatAsState(if (isFocused) 1.08f else 1.0f, label = "btnScale")
+    val scale by animateFloatAsState(
+        targetValue = if (isFocused) 1.08f else 1.0f,
+        animationSpec = tween(180),
+        label = "btnScale"
+    )
     val bgColor = if (isFocused) {
-        if (isPrimary) DouyinRed else Color(0xFF3A3A3A)
+        if (isPrimary) Color(0xFF1E88E5) else Color(0xFF3A3A3A)
     } else {
-        if (isPrimary) DouyinRed.copy(alpha = 0.85f) else Color(0xFF2A2A2A)
+        if (isPrimary) Color(0xFF1565C0) else Color(0xFF2A2A2A)
     }
 
     Surface(
         shape = RoundedCornerShape(10.dp),
         color = bgColor,
-        border = BorderStroke(if (isFocused) 2.5.dp else 1.dp, if (isFocused) Color(0xFF4FC3F7) else DarkSurfaceBorder),
+        border = BorderStroke(
+            if (isFocused) 2.5.dp else 1.dp,
+            if (isFocused) Color(0xFF4FC3F7) else DarkSurfaceBorder
+        ),
         shadowElevation = if (isFocused) 12.dp else 0.dp,
         modifier = modifier
             .scale(scale)
+            .shadow(
+                elevation = if (isFocused) 14.dp else 0.dp,
+                shape = RoundedCornerShape(10.dp),
+                spotColor = if (isFocused) Color(0xFF4FC3F7) else Color.Transparent
+            )
             .onFocusChanged { isFocused = it.isFocused }
             .focusable()
             .clickable(onClick = onClick)
     ) {
         Row(
-            modifier = Modifier.padding(horizontal = 20.dp, vertical = 12.dp),
+            modifier = Modifier.padding(horizontal = 22.dp, vertical = 12.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
@@ -185,7 +197,7 @@ fun TvActionButton(
             Text(
                 text = text,
                 color = Color.White,
-                fontSize = 15.sp,
+                fontSize = 16.sp,
                 fontWeight = FontWeight.Bold
             )
         }

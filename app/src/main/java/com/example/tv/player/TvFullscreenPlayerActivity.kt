@@ -1,15 +1,17 @@
 package com.example.tv.player
 
 import android.graphics.Color
-import android.graphics.Typeface
-import android.media.AudioManager
+import android.graphics.RenderEffect
+import android.graphics.Shader
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.text.TextUtils
 import android.util.Log
 import android.view.Gravity
 import android.view.KeyEvent
 import android.view.View
+import android.view.ViewGroup
 import android.view.WindowManager
 import android.widget.FrameLayout
 import android.widget.LinearLayout
@@ -29,15 +31,16 @@ import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
-import androidx.media3.exoplayer.mediacodec.MediaCodecSelector
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.exoplayer.trackselection.DefaultTrackSelector
 import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.PlayerView
-import com.example.R
 import com.example.tv.channel.Channel
 import com.example.tv.channel.ChannelManager
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
@@ -46,18 +49,20 @@ import org.json.JSONObject
 import java.util.concurrent.TimeUnit
 
 /**
- * 电视大屏全屏原生播放器（完整优化版：左侧在线选台浮层 + 顶部防遮挡高亮换台提示 + 流缓存 + RK3528专项加固）
- * 1. 遥控器【菜单键 / 信息键】：仅在左侧滑出 420dp 悬浮面板，只展示「在线频道」，文字超长自动省略，不遮挡右侧直播画面；
- * 2. 换台反馈修复：顶部居中 30dp 高层级悬浮提示，带 160ms 淡入 / 250ms 淡出动效，绝不被底层视频画面遮盖；
- * 3. 换台毫秒级响应：5 分钟 TTL 流缓存 + 600ms 防抖；
- * 4. 完美保持 H96 Max RK3528 硬件级渲染修复（SurfaceView 硬件加速、解码器回退、关闭隧道模式）。
+ * 电视大屏全屏竖屏直播播放器（顶级 TV 方案）
+ * 1. 竖屏主画面 + 视频流动态磨砂背景（人眼可辩，轻模糊 14px + 40% 压暗，动态与轮廓清晰可感）
+ * 2. 单 ExoPlayer 驱动背景 + 前景，省去一路解码，完美适配 RK3528 等 32 位电视盒子
+ * 3. 单飞 Job + switchGen 换台防竞态，先 stop/clear 再起播，避免连续换台失效或旧台覆盖新台
+ * 4. 换台反馈与首帧渲染/就绪深度绑定，真正出画后才淡出
+ * 5. 菜单仅筛选在线直播频道，左侧 400dp 无全屏遮罩
+ * 6. OK 键实时调出直播流技术指标面板（编码、分辨率、码率、缓冲时长）
  */
 class TvFullscreenPlayerActivity : ComponentActivity() {
 
     companion object {
-        private const val TAG = "TVPlayer"
         const val DEFAULT_BASE_URL = "https://tv.fuxiaoya.com"
-        const val TV_USER_AGENT =
+        private const val TAG = "TVPlayer"
+        private const val TV_UA =
             "Mozilla/5.0 (Linux; Android 13; TV) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
         const val EXTRA_URL = "extra_url"
@@ -66,10 +71,10 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         const val EXTRA_BASE_URL = "extra_base_url"
         const val EXTRA_TITLE = "extra_title"
 
-        // 全局静态流缓存 (rid -> 清晰度列表)，支持跨页面或清理缓存
+        // 全局静态流缓存 (rid -> 清晰度列表)，支持 5 分钟有效时间
         val streamCache = mutableMapOf<String, List<Pair<String, String>>>()
         val streamCacheTime = mutableMapOf<String, Long>()
-        const val CACHE_TTL = 5 * 60 * 1000L // 5 分钟有效时间
+        const val CACHE_TTL = 5 * 60 * 1000L
 
         fun clearStreamCache() {
             streamCache.clear()
@@ -78,34 +83,35 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
     }
 
     private lateinit var channelManager: ChannelManager
-    private var playList: List<Channel> = emptyList()
-    private var currentChannelIndex = 0
 
-    // 当前频道的清晰度梯度列表: List<Pair<清晰度名称, HLS地址>>
-    private var qualityList: List<Pair<String, String>> = emptyList()
-    private var currentQualityIndex = 0
+    // UI 组件
+    private lateinit var root: FrameLayout
+    private lateinit var bgPlayerView: PlayerView          // 磨砂背景播放层
+    private lateinit var dimOverlay: View                  // 压暗层，约 40% 黑，保证前景可读、背景动态人眼可辨
+    private lateinit var fgPlayerView: PlayerView          // 居中竖屏 9:16 前景主播放器
+    private lateinit var tipView: TextView                 // 顶部高层级换台与状态提示
+    private lateinit var channelMenu: FrameLayout          // 左侧在线选台悬浮面板
+    private lateinit var channelMenuList: LinearLayout
+    private lateinit var infoOverlay: TextView             // OK 键技术参数浮层
 
     private var player: ExoPlayer? = null
-    private lateinit var playerView: PlayerView
-    private lateinit var rootContainer: FrameLayout
-    private lateinit var tipView: TextView
+    private var isMenuShowing = false
+    private var isInfoShowing = false
 
-    // 左侧频道选择抽屉菜单相关
-    private var isChannelMenuShowing = false
-    private lateinit var channelMenuContainer: FrameLayout
-    private lateinit var channelMenuList: LinearLayout
+    // 播放列表与当前索引
+    private var playList: List<Channel> = emptyList()
+    private var currentIndex = 0
+    private var qualityList: List<Pair<String, String>> = emptyList()
+    private var qualityIndex = 0
 
-    // 媒体流技术信息悬浮面板 (OK / DPAD_CENTER 呼出)
-    private lateinit var infoOverlay: TextView
+    // 单飞 Job 与换台防竞态
+    private var switchJob: Job? = null
+    private var switchGen = 0L
+    private var lastSwitchAt = 0L
+    private val SWITCH_MIN_INTERVAL = 350L
+    private var pendingTipForChannel: String? = null
 
-    // 换台防抖控制 (600ms)
-    private var lastSwitchTime = 0L
-    private val SWITCH_DEBOUNCE = 600L
-
-    // 提示框动画与自动隐藏句柄
-    private var tipHideRunnable: Runnable? = null
-
-    // 缓冲超时监测机制（12秒连续缓冲无响应自动降清晰度）
+    // 缓冲超时监测 (12秒连续缓冲自动降清晰度)
     private var bufferingTimeoutRunnable: Runnable? = null
     private val BUFFERING_TIMEOUT_MS = 12_000L
 
@@ -117,263 +123,159 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        enterFullscreen()
+        buildUi()
 
-        // 1. 进入真实沉浸全屏与屏幕常亮
-        enterTrueFullscreen()
+        channelManager = ChannelManager(this)
+        setupPlayListAndStart()
 
-        // 2. 加载带 app:surface_type="surface_view" 的专用布局
-        setContentView(R.layout.activity_tv_fullscreen_player)
-        rootContainer = findViewById(R.id.rootContainer)
-        playerView = findViewById(R.id.playerView)
-        tipView = findViewById(R.id.tipView)
+        onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
+            override fun handleOnBackPressed() {
+                handleBack()
+            }
+        })
+    }
 
-        playerView.apply {
+    // -------------------- UI 结构构建 --------------------
+
+    private fun buildUi() {
+        root = FrameLayout(this).apply {
+            setBackgroundColor(Color.BLACK)
+            layoutParams = FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT
+            )
+        }
+        setContentView(root)
+
+        // 1. 背景播放器（全屏铺满 + 轻微磨砂模糊）
+        bgPlayerView = PlayerView(this).apply {
+            layoutParams = FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT
+            )
+            useController = false
+            resizeMode = AspectRatioFrameLayout.RESIZE_MODE_ZOOM
+            setBackgroundColor(Color.BLACK)
+            setShutterBackgroundColor(Color.BLACK)
+            setKeepContentOnPlayerReset(true)
+
+            // 人眼可辨：轻模糊 14px（Android 12+ 系统支持时开启）
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                setRenderEffect(
+                    RenderEffect.createBlurEffect(14f, 14f, Shader.TileMode.CLAMP)
+                )
+            }
+        }
+        root.addView(bgPlayerView)
+
+        // 2. 压暗遮罩层：约 40% 黑 (#66000000)，保证前景清晰锐利、背景动态与轮廓依然清晰可辨
+        dimOverlay = View(this).apply {
+            layoutParams = FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT
+            )
+            setBackgroundColor(Color.parseColor("#66000000"))
+        }
+        root.addView(dimOverlay)
+
+        // 3. 前景竖屏播放器（严格 9:16 居中显示，清晰主画面）
+        val screenW = resources.displayMetrics.widthPixels
+        val fgW = (screenW * 0.42f).toInt().coerceAtLeast(360)
+        val fgH = (fgW * 16f / 9f).toInt()
+        fgPlayerView = PlayerView(this).apply {
+            layoutParams = FrameLayout.LayoutParams(fgW, fgH).also {
+                it.gravity = Gravity.CENTER
+            }
             useController = false
             resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
             setBackgroundColor(Color.BLACK)
             setShutterBackgroundColor(Color.BLACK)
             setKeepContentOnPlayerReset(true)
+            elevation = 8f
         }
+        root.addView(fgPlayerView)
 
-        // 3. 初始化左侧在线频道选台抽屉与技术信息面板
-        initChannelMenu()
-        initInfoOverlay()
-
-        // 4. 遥控器返回键处理
-        onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
-            override fun handleOnBackPressed() {
-                if (isChannelMenuShowing) {
-                    hideChannelMenu()
-                } else if (infoOverlay.visibility == View.VISIBLE) {
-                    hideLiveInfo()
-                } else {
-                    exitPlayer()
-                }
-            }
-        })
-
-        // 5. 初始化频道列表与播放策略
-        channelManager = ChannelManager(this)
-        setupPlayListAndStart()
-    }
-
-    /**
-     * 构建电视大屏左侧选台面板（仅占左侧 420dp，不遮挡右侧直播画面）
-     */
-    private fun initChannelMenu() {
-        channelMenuContainer = FrameLayout(this).apply {
-            layoutParams = FrameLayout.LayoutParams(
-                420.dpToPx(),
-                FrameLayout.LayoutParams.MATCH_PARENT
-            ).also {
-                it.gravity = Gravity.START
-            }
-            setBackgroundColor(Color.parseColor("#E6121212")) // 半透明深色，右侧画面清晰透出
-            visibility = View.GONE
-            elevation = 20f
-            isClickable = true
-            isFocusable = true
-        }
-
-        val title = TextView(this).apply {
-            text = "在线频道"
-            setTextColor(Color.WHITE)
-            textSize = 20f
-            setPadding(28, 28, 28, 12)
-            setTypeface(null, Typeface.BOLD)
-        }
-
-        channelMenuList = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(12, 0, 12, 24)
-        }
-
-        val scrollView = ScrollView(this).apply {
-            layoutParams = FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.MATCH_PARENT,
-                FrameLayout.LayoutParams.MATCH_PARENT
-            ).also { it.topMargin = 72 }
-            addView(channelMenuList)
-        }
-
-        channelMenuContainer.addView(title)
-        channelMenuContainer.addView(scrollView)
-        rootContainer.addView(channelMenuContainer)
-    }
-
-    /**
-     * 弹出左侧选台浮层（仅展示在线频道，文字过长自动省略，焦点自动落到当前台）
-     */
-    private fun showChannelMenu() {
-        if (isChannelMenuShowing) return
-        hideLiveInfo()
-        isChannelMenuShowing = true
-        channelMenuList.removeAllViews()
-
-        // 仅筛选在线频道展示，同时保留真实全局索引
-        val onlineWithIndex = playList.mapIndexed { index, channel ->
-            index to channel
-        }.filter { it.second.isLive }
-
-        if (onlineWithIndex.isEmpty()) {
-            showTip("当前没有在线频道")
-            isChannelMenuShowing = false
-            return
-        }
-
-        onlineWithIndex.forEach { (realIndex, channel) ->
-            val isCurrent = (realIndex == currentChannelIndex)
-
-            val item = TextView(this).apply {
-                tag = realIndex // 绑定真实全局索引，确保跳转准确无误
-                text = buildString {
-                    append(if (isCurrent) "▶ " else "   ")
-                    append(channel.name)
-                }
-                maxLines = 1
-                ellipsize = TextUtils.TruncateAt.END // 文字过长省略
-                setTextColor(if (isCurrent) Color.parseColor("#4FC3F7") else Color.WHITE)
-                textSize = 17f
-                setPadding(20, 16, 20, 16)
-                isFocusable = true
-                isClickable = true
-                setBackgroundColor(if (isCurrent) Color.parseColor("#224FC3F7") else Color.TRANSPARENT)
-
-                setOnFocusChangeListener { _, hasFocus ->
-                    setBackgroundColor(
-                        if (hasFocus) Color.parseColor("#33FFFFFF") else (if (isCurrent) Color.parseColor("#224FC3F7") else Color.TRANSPARENT)
-                    )
-                    if (hasFocus) {
-                        setTextColor(Color.parseColor("#4FC3F7"))
-                    } else {
-                        setTextColor(if (isCurrent) Color.parseColor("#4FC3F7") else Color.WHITE)
-                    }
-                }
-
-                setOnClickListener { v ->
-                    val target = v.tag as? Int ?: return@setOnClickListener
-                    hideChannelMenu()
-                    switchToChannel(target, force = true)
-                }
-            }
-            channelMenuList.addView(item)
-        }
-
-        channelMenuContainer.visibility = View.VISIBLE
-        channelMenuContainer.bringToFront()
-
-        // 焦点自动精准锁定在当前播放的在线频道
-        val focusIndex = onlineWithIndex.indexOfFirst { it.first == currentChannelIndex }.coerceAtLeast(0)
-        channelMenuList.getChildAt(focusIndex)?.requestFocus()
-    }
-
-    private fun hideChannelMenu() {
-        isChannelMenuShowing = false
-        channelMenuContainer.visibility = View.GONE
-    }
-
-    /**
-     * 初始化技术信息悬浮面板 (OK / DPAD_CENTER 呼出)
-     */
-    private fun initInfoOverlay() {
-        infoOverlay = TextView(this).apply {
+        // 4. 换台提示（顶部居中，高 elevation 绝不被视频底层遮挡）
+        tipView = TextView(this).apply {
             layoutParams = FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.WRAP_CONTENT,
                 FrameLayout.LayoutParams.WRAP_CONTENT
             ).also {
+                it.gravity = Gravity.CENTER_HORIZONTAL or Gravity.TOP
+                it.topMargin = 40.dp()
+            }
+            setTextColor(Color.WHITE)
+            textSize = 18f
+            setPadding(28, 12, 28, 12)
+            setBackgroundColor(Color.parseColor("#CC111111"))
+            elevation = 40f
+            visibility = View.GONE
+        }
+        root.addView(tipView)
+
+        // 5. 左侧在线选台悬浮面板（仅占 400dp，无全屏遮罩）
+        channelMenu = FrameLayout(this).apply {
+            layoutParams = FrameLayout.LayoutParams(400.dp(), FrameLayout.LayoutParams.MATCH_PARENT).also {
+                it.gravity = Gravity.START
+            }
+            setBackgroundColor(Color.parseColor("#E6121212"))
+            visibility = View.GONE
+            elevation = 24f
+            isClickable = true
+            isFocusable = true
+        }
+
+        val menuTitle = TextView(this).apply {
+            text = "在线频道"
+            setTextColor(Color.WHITE)
+            textSize = 18f
+            setPadding(24, 24, 24, 8)
+        }
+        channelMenuList = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(8, 0, 8, 16)
+        }
+        val scroll = ScrollView(this).apply {
+            layoutParams = FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT
+            ).also { it.topMargin = 64.dp() }
+            addView(channelMenuList)
+        }
+        channelMenu.addView(menuTitle)
+        channelMenu.addView(scroll)
+        root.addView(channelMenu)
+
+        // 6. OK 键技术参数信息面板
+        infoOverlay = TextView(this).apply {
+            layoutParams = FrameLayout.LayoutParams(480.dp(), FrameLayout.LayoutParams.WRAP_CONTENT).also {
                 it.gravity = Gravity.CENTER
             }
-            setBackgroundColor(Color.parseColor("#E6121212")) // 深色半透明背景
+            setBackgroundColor(Color.parseColor("#E6101010"))
             setTextColor(Color.WHITE)
             textSize = 15f
-            setLineSpacing(8f, 1.25f)
-            setPadding(40, 32, 40, 32)
+            setPadding(24, 20, 24, 20)
+            elevation = 48f
             visibility = View.GONE
-            elevation = 35f
-            isFocusable = false
-            isClickable = false
+            setLineSpacing(5f, 1.18f)
         }
-        rootContainer.addView(infoOverlay)
+        root.addView(infoOverlay)
     }
 
-    /**
-     * 展示当前频道的媒体流技术信息面板
-     */
-    private fun showLiveInfo() {
-        val exo = player ?: return
-        hideChannelMenu()
-
-        val channel = playList.getOrNull(currentChannelIndex)
-        val channelName = channel?.name ?: "未知频道"
-        val rid = channel?.rid ?: "-"
-        val isLiveText = if (channel?.isLive == true) "在线直播中" else "离线"
-
-        val videoFormat = exo.videoFormat
-        val audioFormat = exo.audioFormat
-        val width = videoFormat?.width ?: -1
-        val height = videoFormat?.height ?: -1
-        val resText = if (width > 0 && height > 0) "${width} × ${height}" else "解析中"
-
-        val videoCodec = videoFormat?.sampleMimeType ?: "未知"
-        val audioCodec = audioFormat?.sampleMimeType ?: "未知"
-
-        val bitrateEstimate = videoFormat?.bitrate?.takeIf { it > 0 }
-            ?: (videoFormat?.averageBitrate?.takeIf { it > 0 })
-        val bitrateText = if (bitrateEstimate != null && bitrateEstimate > 0) {
-            "${bitrateEstimate / 1000} kbps"
-        } else {
-            "自适应"
-        }
-
-        val bufferedMs = exo.totalBufferedDuration
-
-        val playbackStateStr = when (exo.playbackState) {
-            Player.STATE_IDLE -> "空闲"
-            Player.STATE_BUFFERING -> "缓冲中"
-            Player.STATE_READY -> if (exo.isPlaying) "正在播放" else "已暂停"
-            Player.STATE_ENDED -> "已结束"
-            else -> "未知"
-        }
-
-        val (curQuality, _) = qualityList.getOrNull(currentQualityIndex) ?: ("默认" to "")
-
-        val infoText = buildString {
-            append("【当前频道流信息】\n")
-            append("频道名称：$channelName\n")
-            append("房间号 (RID)：$rid\n")
-            append("直播状态：$isLiveText\n")
-            append("清晰度流：$curQuality\n")
-            append("视频分辨率：$resText\n")
-            append("视频编码：$videoCodec\n")
-            append("音频编码：$audioCodec\n")
-            append("当前码率：$bitrateText\n")
-            append("缓冲时长：${bufferedMs} ms\n")
-            append("播放状态：$playbackStateStr\n\n")
-            append("（再次按 OK 或返回键关闭）")
-        }
-
-        infoOverlay.text = infoText
-        infoOverlay.visibility = View.VISIBLE
-        infoOverlay.bringToFront()
-    }
-
-    private fun hideLiveInfo() {
-        infoOverlay.visibility = View.GONE
-    }
+    // -------------------- 播放与切台核心逻辑 --------------------
 
     private fun setupPlayListAndStart() {
-        // 场景 A：直接指定了 HLS 媒体流 (.m3u8)
         val directStreamUrl = intent.getStringExtra(EXTRA_STREAM_URL)?.trim()
         if (!directStreamUrl.isNullOrBlank()) {
             playList = listOf(Channel(rid = "direct", name = "直接媒体流", isLive = true))
-            currentChannelIndex = 0
+            currentIndex = 0
             qualityList = listOf("默认流" to directStreamUrl)
-            currentQualityIndex = 0
-            playCurrentQuality()
+            qualityIndex = 0
+            playQuality(switchGen)
             return
         }
 
-        // 加载全部持久化/默认频道并按「在线优先」排序
         val loadedChannels = channelManager.loadChannels()
         val sortedChannels = loadedChannels.sortedBy { if (it.isLive) 0 else 1 }.toMutableList()
 
@@ -383,20 +285,17 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         if (targetRid.isNullOrBlank() && rawUrl.isNotBlank()) {
             if (rawUrl.endsWith(".m3u8") || rawUrl.contains(".m3u8?")) {
                 playList = listOf(Channel(rid = "direct", name = "直接流媒体", isLive = true))
-                currentChannelIndex = 0
+                currentIndex = 0
                 qualityList = listOf("默认流" to rawUrl)
-                currentQualityIndex = 0
-                playCurrentQuality()
+                qualityIndex = 0
+                playQuality(switchGen)
                 return
             }
             try {
                 val uri = Uri.parse(rawUrl)
                 val paramRid = uri.getQueryParameter("rid")
-                if (!paramRid.isNullOrBlank()) {
-                    targetRid = paramRid
-                }
-            } catch (_: Exception) {
-            }
+                if (!paramRid.isNullOrBlank()) targetRid = paramRid
+            } catch (_: Exception) {}
             if (targetRid.isNullOrBlank() && rawUrl.all { it.isDigit() }) {
                 targetRid = rawUrl
             }
@@ -405,67 +304,229 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         if (!targetRid.isNullOrBlank()) {
             val existingIndex = sortedChannels.indexOfFirst { it.rid == targetRid }
             if (existingIndex >= 0) {
-                currentChannelIndex = existingIndex
+                currentIndex = existingIndex
             } else {
                 sortedChannels.add(0, Channel(rid = targetRid, name = "自定义频道 ($targetRid)", isLive = true))
-                currentChannelIndex = 0
+                currentIndex = 0
             }
         } else {
-            currentChannelIndex = 0
+            currentIndex = 0
         }
 
         playList = sortedChannels
-        startCurrentChannel()
+        switchToChannel(currentIndex, force = true)
+
+        // 异步后台拉取最新批次在线状态，保证后续选台菜单为真实在线
+        val baseUrl = intent.getStringExtra(EXTRA_BASE_URL)?.trimEnd('/') ?: DEFAULT_BASE_URL
+        lifecycleScope.launch {
+            val updated = channelManager.checkLiveStatusViaWeb(baseUrl, playList)
+            playList = updated.sortedBy { if (it.isLive) 0 else 1 }
+            channelManager.saveChannels(playList)
+        }
     }
 
     /**
-     * 播放当前选中的频道（带缓存支持）
+     * 单飞换台（带 Job.cancel、switchGen 防竞态、出画绑定反馈）
      */
-    private fun startCurrentChannel() {
-        if (currentChannelIndex !in playList.indices) {
-            showTip("没有可用频道，按返回键退出")
-            return
-        }
+    private fun switchToChannel(index: Int, force: Boolean = false) {
+        if (index !in playList.indices) return
 
-        val channel = playList[currentChannelIndex]
-        val baseUrl = intent.getStringExtra(EXTRA_BASE_URL)?.trimEnd('/') ?: DEFAULT_BASE_URL
-        val channelTag = "【第 ${currentChannelIndex + 1}/${playList.size} 台】"
-        showTip("正在解析：$channelTag ${channel.name}")
-
-        // 优先检查 5 分钟内的有效流缓存
         val now = System.currentTimeMillis()
-        val cached = streamCache[channel.rid]
-        val cacheTime = streamCacheTime[channel.rid] ?: 0L
-        if (cached != null && now - cacheTime < CACHE_TTL && cached.isNotEmpty()) {
-            qualityList = cached
-            currentQualityIndex = 0
-            playCurrentQuality()
-            return
-        }
+        if (!force && now - lastSwitchAt < SWITCH_MIN_INTERVAL) return
+        lastSwitchAt = now
 
-        lifecycleScope.launch {
-            val fetched = fetchQualityList(baseUrl, channel.rid)
-            if (fetched.isEmpty()) {
-                switchToNextChannel("当前频道解析失败")
-                return@launch
+        // 1. 取消上一次未完成的换台协程
+        switchJob?.cancel()
+        val gen = ++switchGen
+        currentIndex = index
+        val channel = playList[index]
+
+        hideLiveInfo()
+        pendingTipForChannel = channel.name
+        showTip("正在切换到：${channel.name}", autoHide = false)
+
+        // 2. 立即打断当前播放，避免“听着旧台、看着新台提示”
+        try {
+            player?.pause()
+            player?.stop()
+            player?.clearMediaItems()
+        } catch (_: Exception) {}
+
+        val baseUrl = intent.getStringExtra(EXTRA_BASE_URL)?.trimEnd('/') ?: DEFAULT_BASE_URL
+
+        switchJob = lifecycleScope.launch {
+            try {
+                val list = withContext(Dispatchers.IO) {
+                    val cached = streamCache[channel.rid]
+                    val t = streamCacheTime[channel.rid] ?: 0L
+                    if (cached != null && now - t < CACHE_TTL && cached.isNotEmpty()) {
+                        cached
+                    } else {
+                        fetchQualities(baseUrl, channel.rid).also {
+                            if (it.isNotEmpty()) {
+                                streamCache[channel.rid] = it
+                                streamCacheTime[channel.rid] = System.currentTimeMillis()
+                            }
+                        }
+                    }
+                }
+
+                // 3. 已过期的换台请求直接丢弃
+                if (gen != switchGen || !isActive) return@launch
+
+                if (list.isEmpty()) {
+                    pendingTipForChannel = null
+                    showTip("「${channel.name}」暂无法播放", autoHide = true)
+                    // 可选自动尝试下一个可用频道
+                    if (currentIndex < playList.lastIndex) {
+                        fgPlayerView.postDelayed({
+                            if (gen == switchGen) switchToChannel(currentIndex + 1)
+                        }, 1200)
+                    }
+                    return@launch
+                }
+
+                qualityList = list
+                qualityIndex = 0
+                playQuality(gen)
+            } catch (_: CancellationException) {
+                // 正常被更新的换台动作取消
+            } catch (e: Exception) {
+                if (gen == switchGen) {
+                    pendingTipForChannel = null
+                    showTip("切换失败，请重试", autoHide = true)
+                }
             }
-            // 写入本地高速缓存
-            streamCache[channel.rid] = fetched
-            streamCacheTime[channel.rid] = System.currentTimeMillis()
-
-            qualityList = fetched
-            currentQualityIndex = 0
-            playCurrentQuality()
         }
     }
 
-    private suspend fun fetchQualityList(baseUrl: String, rid: String): List<Pair<String, String>> =
+    private fun playQuality(gen: Long) {
+        if (gen != switchGen) return
+        if (qualityIndex !in qualityList.indices) {
+            if (gen == switchGen) {
+                pendingTipForChannel = null
+                showTip("清晰度解析失败", autoHide = true)
+            }
+            return
+        }
+
+        val (qName, hls) = qualityList[qualityIndex]
+        val channel = playList.getOrNull(currentIndex)
+        val channelName = channel?.name ?: ""
+        if (pendingTipForChannel != null) {
+            showTip("正在切换到：$channelName · $qName", autoHide = false)
+        }
+
+        releasePlayerOnly()
+
+        // 针对电视盒子的专属解码与负载配置
+        val renderersFactory = DefaultRenderersFactory(this).apply {
+            setEnableDecoderFallback(true)
+            setExtensionRendererMode(DefaultRenderersFactory.EXTENSION_RENDERER_MODE_PREFER)
+        }
+        val loadControl = DefaultLoadControl.Builder()
+            .setBufferDurationsMs(10_000, 28_000, 2_000, 5_000)
+            .build()
+        val trackSelector = DefaultTrackSelector(this).apply {
+            parameters = buildUponParameters()
+                .setTunnelingEnabled(false)
+                .setAllowVideoMixedMimeTypeAdaptiveness(true)
+                .build()
+        }
+        val dataSourceFactory = DefaultHttpDataSource.Factory()
+            .setUserAgent(TV_UA)
+            .setAllowCrossProtocolRedirects(true)
+            .setConnectTimeoutMs(12_000)
+            .setReadTimeoutMs(15_000)
+        val mediaSourceFactory = DefaultMediaSourceFactory(this).setDataSourceFactory(dataSourceFactory)
+
+        player = ExoPlayer.Builder(this, renderersFactory)
+            .setTrackSelector(trackSelector)
+            .setLoadControl(loadControl)
+            .setMediaSourceFactory(mediaSourceFactory)
+            .build()
+            .also { exo ->
+                // 关键：同一 ExoPlayer 同时驱动磨砂背景与前景主播放器（只需一路解码，性能最强）
+                bgPlayerView.player = exo
+                fgPlayerView.player = exo
+
+                exo.addListener(object : Player.Listener {
+                    override fun onPlayerError(error: PlaybackException) {
+                        if (gen != switchGen) return
+                        Log.e(TAG, "播放异常: ${error.errorCodeName} | ${error.message}")
+                        val rid = playList.getOrNull(currentIndex)?.rid
+                        if (qualityIndex >= qualityList.lastIndex && rid != null) {
+                            streamCache.remove(rid)
+                            streamCacheTime.remove(rid)
+                        }
+                        qualityIndex++
+                        fgPlayerView.postDelayed({ playQuality(gen) }, 800)
+                    }
+
+                    override fun onPlaybackStateChanged(state: Int) {
+                        if (gen != switchGen) return
+                        when (state) {
+                            Player.STATE_BUFFERING -> {
+                                if (pendingTipForChannel != null) {
+                                    showTip("正在切换到：$pendingTipForChannel（缓冲中）", autoHide = false)
+                                } else {
+                                    showTip("正在缓冲 [$qName]...", autoHide = false)
+                                }
+                                scheduleBufferingTimeout(gen)
+                            }
+                            Player.STATE_READY -> {
+                                cancelBufferingTimeout()
+                                onSwitchCompleted(gen)
+                            }
+                            Player.STATE_ENDED -> {
+                                cancelBufferingTimeout()
+                                pendingTipForChannel = null
+                                showTip("直播已结束，按上下键换台或菜单键选台", autoHide = true)
+                            }
+                        }
+                    }
+
+                    override fun onRenderedFirstFrame() {
+                        if (gen != switchGen) return
+                        cancelBufferingTimeout()
+                        onSwitchCompleted(gen)
+                    }
+
+                    override fun onVideoSizeChanged(videoSize: VideoSize) {
+                        Log.d(TAG, "视频尺寸已更新: ${videoSize.width}x${videoSize.height}")
+                    }
+                })
+
+                if (gen != switchGen) {
+                    exo.release()
+                    return@also
+                }
+
+                exo.setMediaItem(MediaItem.fromUri(hls))
+                exo.prepare()
+                exo.playWhenReady = true
+                scheduleBufferingTimeout(gen)
+            }
+    }
+
+    private fun onSwitchCompleted(gen: Long) {
+        if (gen != switchGen) return
+        if (pendingTipForChannel != null) {
+            val name = pendingTipForChannel
+            pendingTipForChannel = null
+            showTip("已切换到：$name", autoHide = true)
+        } else {
+            tipView.visibility = View.GONE
+        }
+    }
+
+    private suspend fun fetchQualities(baseUrl: String, rid: String): List<Pair<String, String>> =
         withContext(Dispatchers.IO) {
             try {
-                val apiUrl = "$baseUrl/live.php?rid=${rid.trim()}"
+                val apiUrl = "${baseUrl.trimEnd('/')}/live.php?rid=${rid.trim()}"
                 val request = Request.Builder()
                     .url(apiUrl)
-                    .header("User-Agent", TV_USER_AGENT)
+                    .header("User-Agent", TV_UA)
                     .header("Referer", "$baseUrl/")
                     .get()
                     .build()
@@ -473,11 +534,9 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
                 okHttpClient.newCall(request).execute().use { response ->
                     if (!response.isSuccessful) return@withContext emptyList()
                     val body = response.body?.string() ?: return@withContext emptyList()
-
                     val json = JSONObject(body)
-                    val code = json.optInt("code", 0)
-                    val streamsObj = json.optJSONObject("streams")
-                    if (code != 200 || streamsObj == null) return@withContext emptyList()
+                    if (json.optInt("code", 0) != 200) return@withContext emptyList()
+                    val streamsObj = json.optJSONObject("streams") ?: return@withContext emptyList()
 
                     val priorityKeys = listOf("origin", "uhd", "hd", "sd", "ld", "default")
                     val result = mutableListOf<Pair<String, String>>()
@@ -506,305 +565,152 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
                     result
                 }
             } catch (e: Exception) {
-                e.printStackTrace()
+                Log.e(TAG, "解析流地址失败: $rid", e)
                 emptyList()
             }
         }
 
-    /**
-     * 播放当前频道的当前清晰度（针对 RK3528 盒子的硬件渲染加强配置）
-     */
-    private fun playCurrentQuality() {
-        if (currentQualityIndex !in qualityList.indices) {
-            switchToNextChannel("清晰度全部失败")
-            return
-        }
-
-        val (qualityName, hlsUrl) = qualityList[currentQualityIndex]
-        val channel = playList.getOrNull(currentChannelIndex)
-        val channelName = channel?.name ?: ""
-        val indexInfo = "【${currentChannelIndex + 1}/${playList.size}】"
-        showTip("$indexInfo $channelName · $qualityName")
-
-        releasePlayer()
-
-        // 关键：针对 H96 Max RK3528 的解码器回退与渲染器优化
-        val renderersFactory = DefaultRenderersFactory(this).apply {
-            setEnableDecoderFallback(true)
-            setExtensionRendererMode(DefaultRenderersFactory.EXTENSION_RENDERER_MODE_PREFER)
-            setMediaCodecSelector(MediaCodecSelector.DEFAULT)
-        }
-
-        // 关键：显式关闭隧道模式 (Tunneling Mode)，避免 RK 芯片视频图层锁死
-        val trackSelector = DefaultTrackSelector(this).apply {
-            parameters = buildUponParameters()
-                .setTunnelingEnabled(false)
-                .setAllowVideoMixedMimeTypeAdaptiveness(true)
-                .build()
-        }
-
-        val loadControl = DefaultLoadControl.Builder()
-            .setBufferDurationsMs(
-                15_000,   // 最小缓冲 15 秒
-                50_000,   // 最大缓冲 50 秒
-                3_000,    // 开播缓冲 3 秒
-                6_000     // 重新缓冲 6 秒
-            )
-            .build()
-
-        val dataSourceFactory = DefaultHttpDataSource.Factory()
-            .setUserAgent(TV_USER_AGENT)
-            .setAllowCrossProtocolRedirects(true)
-            .setConnectTimeoutMs(15_000)
-            .setReadTimeoutMs(20_000)
-
-        val mediaSourceFactory = DefaultMediaSourceFactory(this)
-            .setDataSourceFactory(dataSourceFactory)
-
-        player = ExoPlayer.Builder(this, renderersFactory)
-            .setTrackSelector(trackSelector)
-            .setLoadControl(loadControl)
-            .setMediaSourceFactory(mediaSourceFactory)
-            .build()
-            .also { exo ->
-                playerView.player = exo
-
-                exo.addListener(object : Player.Listener {
-                    override fun onPlayerError(error: PlaybackException) {
-                        Log.e(TAG, "播放异常: ${error.errorCodeName} | ${error.message}")
-                        switchToLowerQuality("播放异常: ${error.errorCodeName}")
-                    }
-
-                    override fun onPlaybackStateChanged(state: Int) {
-                        when (state) {
-                            Player.STATE_BUFFERING -> {
-                                showTip("正在缓冲 [$qualityName]...")
-                                scheduleBufferingTimeout()
-                            }
-                            Player.STATE_READY -> {
-                                cancelBufferingTimeout()
-                                playerView.bringToFront()
-                                tipView.bringToFront()
-                            }
-                            Player.STATE_ENDED -> {
-                                cancelBufferingTimeout()
-                                showTip("直播已结束，按上下键换台或菜单键选台")
-                            }
-                        }
-                    }
-
-                    override fun onVideoSizeChanged(videoSize: VideoSize) {
-                        Log.d(TAG, "视频尺寸已更新: ${videoSize.width}x${videoSize.height}")
-                        cancelBufferingTimeout()
-                        playerView.bringToFront()
-                        tipView.bringToFront()
-                    }
-
-                    override fun onRenderedFirstFrame() {
-                        Log.d(TAG, "第一帧画面已渲染")
-                        cancelBufferingTimeout()
-                        playerView.bringToFront()
-                        tipView.bringToFront()
-                    }
-                })
-
-                val mediaItem = MediaItem.fromUri(hlsUrl)
-                exo.setMediaItem(mediaItem)
-                exo.prepare()
-                exo.playWhenReady = true
-                scheduleBufferingTimeout()
-            }
-    }
-
-    private fun switchToLowerQuality(reason: String) {
-        cancelBufferingTimeout()
-        currentQualityIndex++
-
-        if (currentQualityIndex >= qualityList.size) {
-            switchToNextChannel("清晰度全部失败")
-            return
-        }
-
-        val (nextName, _) = qualityList[currentQualityIndex]
-        showTip("$reason，正在降级切换至: $nextName")
-
-        playerView.postDelayed({
-            playCurrentQuality()
-        }, 1200L)
-    }
-
-    /**
-     * 切换到指定索引的电视频道（带防抖、流缓存与即时文案反馈）
-     */
-    private fun switchToChannel(index: Int, force: Boolean = false) {
-        val now = System.currentTimeMillis()
-        if (!force && now - lastSwitchTime < SWITCH_DEBOUNCE) return
-        lastSwitchTime = now
-
-        if (index !in playList.indices) return
-        if (!force && index == currentChannelIndex) return
-
-        hideLiveInfo()
-        currentChannelIndex = index
-        val channel = playList[index]
-        showTip("已切换到：${channel.name}")
-
-        // 优先使用缓存实现毫秒级换台
-        val cached = streamCache[channel.rid]
-        val cacheTime = streamCacheTime[channel.rid] ?: 0L
-        if (cached != null && now - cacheTime < CACHE_TTL && cached.isNotEmpty()) {
-            qualityList = cached
-            currentQualityIndex = 0
-            playCurrentQuality()
-            return
-        }
-
-        startCurrentChannel()
-    }
-
-    /**
-     * 切换到下一个频道
-     */
-    private fun switchToNextChannel(reason: String = "") {
-        cancelBufferingTimeout()
-        if (currentChannelIndex >= playList.size - 1) {
-            showTip(if (reason.isNotEmpty()) "已是最后一个频道（$reason）" else "已经是最后一个频道")
-            return
-        }
-        val next = playList[currentChannelIndex + 1]
-        showTip("↓ 正在切换到：${next.name}")
-        switchToChannel(currentChannelIndex + 1)
-    }
-
-    /**
-     * 切换到上一个频道
-     */
-    private fun switchToPrevChannel() {
-        cancelBufferingTimeout()
-        if (currentChannelIndex <= 0) {
-            showTip("已经是第一个频道")
-            return
-        }
-        val prev = playList[currentChannelIndex - 1]
-        showTip("↑ 正在切换到：${prev.name}")
-        switchToChannel(currentChannelIndex - 1)
-    }
-
-    private fun scheduleBufferingTimeout() {
+    private fun scheduleBufferingTimeout(gen: Long) {
         cancelBufferingTimeout()
         bufferingTimeoutRunnable = Runnable {
-            if (player?.playbackState == Player.STATE_BUFFERING) {
-                switchToLowerQuality("缓冲超时")
+            if (gen == switchGen && player?.playbackState == Player.STATE_BUFFERING) {
+                qualityIndex++
+                playQuality(gen)
             }
         }.also {
-            playerView.postDelayed(it, BUFFERING_TIMEOUT_MS)
+            fgPlayerView.postDelayed(it, BUFFERING_TIMEOUT_MS)
         }
     }
 
     private fun cancelBufferingTimeout() {
-        bufferingTimeoutRunnable?.let { playerView.removeCallbacks(it) }
+        bufferingTimeoutRunnable?.let { fgPlayerView.removeCallbacks(it) }
         bufferingTimeoutRunnable = null
     }
 
-    /**
-     * 具备平滑淡入淡出动效的高层级屏幕提示（确保不被画面盖住）
-     */
-    private fun showTip(msg: String, autoHideMs: Long = 2500) {
-        tipView.bringToFront()
-        tipView.text = msg
-        tipView.visibility = View.VISIBLE
-        tipView.alpha = 0f
+    // -------------------- 选台菜单（仅展示在线频道） --------------------
 
-        tipView.animate()
-            .alpha(1f)
-            .setDuration(160)
-            .start()
+    private fun showMenu() {
+        if (isMenuShowing) return
+        hideLiveInfo()
 
-        tipHideRunnable?.let { tipView.removeCallbacks(it) }
-        if (autoHideMs > 0) {
-            tipHideRunnable = Runnable {
-                tipView.animate()
-                    .alpha(0f)
-                    .setDuration(250)
-                    .withEndAction {
-                        tipView.visibility = View.GONE
-                    }
-                    .start()
-            }
-            tipView.postDelayed(tipHideRunnable!!, autoHideMs)
+        // 仅筛选在线频道，同时绑定全局原始真实索引
+        val online = playList.mapIndexed { i, c -> i to c }.filter { it.second.isLive }
+        if (online.isEmpty()) {
+            showTip("当前没有在线直播", autoHide = true)
+            return
         }
-    }
 
-    private fun enterTrueFullscreen() {
-        WindowCompat.setDecorFitsSystemWindows(window, false)
-        val controller = WindowInsetsControllerCompat(window, window.decorView)
-        controller.hide(WindowInsetsCompat.Type.systemBars())
-        controller.systemBarsBehavior =
-            WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        isMenuShowing = true
+        channelMenuList.removeAllViews()
 
-        @Suppress("DEPRECATION")
-        window.decorView.systemUiVisibility = (
-            View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
-                or View.SYSTEM_UI_FLAG_FULLSCREEN
-                or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
-                or View.SYSTEM_UI_FLAG_LAYOUT_STABLE
-                or View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
-                or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
-            )
-        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        @Suppress("DEPRECATION")
-        window.statusBarColor = Color.TRANSPARENT
-        @Suppress("DEPRECATION")
-        window.navigationBarColor = Color.TRANSPARENT
-    }
+        online.forEach { (realIdx, ch) ->
+            val isCurrent = (realIdx == currentIndex)
+            val tv = TextView(this).apply {
+                text = (if (isCurrent) "▶ " else "   ") + ch.name
+                maxLines = 1
+                ellipsize = TextUtils.TruncateAt.END
+                setTextColor(if (isCurrent) Color.parseColor("#4FC3F7") else Color.WHITE)
+                textSize = 17f
+                setPadding(18, 14, 18, 14)
+                isFocusable = true
+                isClickable = true
+                tag = realIdx
 
-    private fun releasePlayer() {
-        cancelBufferingTimeout()
-        playerView.player = null
-        player?.stop()
-        player?.release()
-        player = null
-    }
+                setOnFocusChangeListener { v, hasFocus ->
+                    v.setBackgroundColor(if (hasFocus) Color.parseColor("#33FFFFFF") else Color.TRANSPARENT)
+                    (v as TextView).setTextColor(
+                        if (hasFocus || (v.tag as Int) == currentIndex) Color.parseColor("#4FC3F7")
+                        else Color.WHITE
+                    )
+                }
 
-    private fun exitPlayer() {
-        releasePlayer()
-        finish()
-    }
-
-    private fun Int.dpToPx(): Int = (this * resources.displayMetrics.density).toInt()
-
-    // 遥控器 D-pad 与 菜单键原生全适配
-    override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
-        // 播放系统导航音效
-        when (keyCode) {
-            KeyEvent.KEYCODE_DPAD_UP,
-            KeyEvent.KEYCODE_DPAD_DOWN,
-            KeyEvent.KEYCODE_DPAD_LEFT,
-            KeyEvent.KEYCODE_DPAD_RIGHT -> {
-                try {
-                    val am = getSystemService(AUDIO_SERVICE) as? AudioManager
-                    am?.playSoundEffect(AudioManager.FX_FOCUS_NAVIGATION_UP)
-                } catch (_: Exception) {
+                setOnClickListener { v ->
+                    val idx = v.tag as Int
+                    hideMenu()
+                    switchToChannel(idx, force = true)
                 }
             }
+            channelMenuList.addView(tv)
         }
 
-        // 1. 频道选择悬浮菜单开启时的按键优先拦截
-        if (isChannelMenuShowing) {
+        channelMenu.visibility = View.VISIBLE
+        channelMenu.bringToFront()
+        val focus = online.indexOfFirst { it.first == currentIndex }.coerceAtLeast(0)
+        channelMenuList.getChildAt(focus)?.requestFocus()
+    }
+
+    private fun hideMenu() {
+        isMenuShowing = false
+        channelMenu.visibility = View.GONE
+    }
+
+    // -------------------- OK 键流信息浮层 --------------------
+
+    private fun toggleInfo() {
+        if (isInfoShowing) {
+            hideLiveInfo()
+            return
+        }
+        val ch = playList.getOrNull(currentIndex) ?: return
+        val p = player
+        val vf = p?.videoFormat
+        val af = p?.audioFormat
+        val br = (vf?.bitrate?.takeIf { it > 0 } ?: vf?.averageBitrate?.takeIf { it > 0 } ?: 0) / 1000
+        val (curQuality, _) = qualityList.getOrNull(qualityIndex) ?: ("默认" to "")
+
+        infoOverlay.text = buildString {
+            append("【当前频道流信息】\n")
+            append("频道名称：${ch.name}\n")
+            append("房间号 (RID)：${ch.rid}\n")
+            append("直播状态：${if (ch.isLive) "在线" else "离线"}\n")
+            append("清晰度流：$curQuality\n")
+            append("────────────────\n")
+            append("分辨率：${vf?.width ?: "-"} × ${vf?.height ?: "-"}\n")
+            append("视频编码：${vf?.sampleMimeType ?: "-"}\n")
+            append("音频编码：${af?.sampleMimeType ?: "-"}\n")
+            append("当前码率：${if (br > 0) "$br kbps" else "自适应"}\n")
+            append("缓冲时长：${p?.totalBufferedDuration ?: 0} ms\n")
+            append("────────────────\n（再次按 OK 或返回键关闭）")
+        }
+        infoOverlay.visibility = View.VISIBLE
+        infoOverlay.bringToFront()
+        isInfoShowing = true
+    }
+
+    private fun hideLiveInfo() {
+        infoOverlay.visibility = View.GONE
+        isInfoShowing = false
+    }
+
+    // -------------------- 遥控器与按键交互 --------------------
+
+    private fun handleBack() {
+        when {
+            isMenuShowing -> hideMenu()
+            isInfoShowing -> hideLiveInfo()
+            else -> {
+                releaseAll()
+                finish()
+            }
+        }
+    }
+
+    override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
+        // 1. 频道选择菜单处于激活状态时的按键捕获
+        if (isMenuShowing) {
             when (keyCode) {
                 KeyEvent.KEYCODE_MENU,
                 KeyEvent.KEYCODE_INFO,
                 KeyEvent.KEYCODE_BACK -> {
-                    hideChannelMenu()
+                    hideMenu()
                     return true
                 }
                 KeyEvent.KEYCODE_DPAD_CENTER,
                 KeyEvent.KEYCODE_ENTER -> {
-                    // 主动获取当前获焦的项，直接执行跳转，防止部分电视盒子遥控器不向子 View 分发 performClick
                     val focusedView = currentFocus ?: channelMenuList.focusedChild
                     val target = (focusedView?.tag as? Int)
                     if (target != null) {
-                        hideChannelMenu()
+                        hideMenu()
                         switchToChannel(target, force = true)
                         return true
                     }
@@ -814,8 +720,8 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
             return super.onKeyDown(keyCode, event)
         }
 
-        // 2. 媒体流技术信息浮层开启时的按键拦截（按 OK、Enter、Back、Menu、Info 均关闭）
-        if (infoOverlay.visibility == View.VISIBLE) {
+        // 2. 信息面板处于激活状态时的按键拦截
+        if (isInfoShowing) {
             when (keyCode) {
                 KeyEvent.KEYCODE_DPAD_CENTER,
                 KeyEvent.KEYCODE_ENTER,
@@ -829,28 +735,36 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
             return super.onKeyDown(keyCode, event)
         }
 
-        // 3. 正常播放状态下的遥控器控制
+        // 3. 正常全屏播放下的遥控器控制
         when (keyCode) {
             KeyEvent.KEYCODE_BACK -> {
-                exitPlayer()
+                handleBack()
                 return true
             }
             KeyEvent.KEYCODE_MENU,
             KeyEvent.KEYCODE_INFO -> {
-                showChannelMenu()
+                showMenu()
                 return true
             }
             KeyEvent.KEYCODE_DPAD_UP -> {
-                switchToPrevChannel()
+                if (currentIndex > 0) {
+                    switchToChannel(currentIndex - 1)
+                } else {
+                    showTip("已经是第一个频道", autoHide = true)
+                }
                 return true
             }
             KeyEvent.KEYCODE_DPAD_DOWN -> {
-                switchToNextChannel()
+                if (currentIndex < playList.lastIndex) {
+                    switchToChannel(currentIndex + 1)
+                } else {
+                    showTip("已经是最后一个频道", autoHide = true)
+                }
                 return true
             }
             KeyEvent.KEYCODE_DPAD_CENTER,
             KeyEvent.KEYCODE_ENTER -> {
-                showLiveInfo()
+                toggleInfo()
                 return true
             }
             KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE -> {
@@ -863,21 +777,62 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         return super.onKeyDown(keyCode, event)
     }
 
-    override fun onResume() {
-        super.onResume()
-        enterTrueFullscreen()
-        player?.playWhenReady = true
+    private fun showTip(msg: String, autoHide: Boolean) {
+        tipView.bringToFront()
+        tipView.text = msg
+        tipView.visibility = View.VISIBLE
+        tipView.alpha = 1f
+        tipView.removeCallbacks(hideTipRunnable)
+        if (autoHide) {
+            tipView.postDelayed(hideTipRunnable, 1800)
+        }
     }
 
-    override fun onPause() {
-        super.onPause()
+    private val hideTipRunnable = Runnable {
+        tipView.animate().alpha(0f).setDuration(220).withEndAction {
+            tipView.visibility = View.GONE
+        }.start()
+    }
+
+    private fun enterFullscreen() {
+        WindowCompat.setDecorFitsSystemWindows(window, false)
+        WindowInsetsControllerCompat(window, window.decorView).let {
+            it.hide(WindowInsetsCompat.Type.systemBars())
+            it.systemBarsBehavior =
+                WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        }
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+    }
+
+    private fun releasePlayerOnly() {
+        cancelBufferingTimeout()
+        bgPlayerView.player = null
+        fgPlayerView.player = null
+        player?.release()
+        player = null
+    }
+
+    private fun releaseAll() {
+        switchJob?.cancel()
+        releasePlayerOnly()
+        streamCache.clear()
+        streamCacheTime.clear()
+    }
+
+    override fun onStop() {
+        super.onStop()
         player?.playWhenReady = false
     }
 
+    override fun onStart() {
+        super.onStart()
+        player?.playWhenReady = true
+    }
+
     override fun onDestroy() {
-        tipHideRunnable?.let { tipView.removeCallbacks(it) }
-        cancelBufferingTimeout()
-        releasePlayer()
+        releaseAll()
         super.onDestroy()
     }
+
+    private fun Int.dp(): Int = (this * resources.displayMetrics.density).toInt()
 }

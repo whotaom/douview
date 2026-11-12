@@ -204,11 +204,31 @@ fun ChannelManageDialog(
                     }
                 }
 
-                // 2. 导出与重置工具栏
+                // 2. 导出与测活重置工具栏
                 Row(
                     modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
+                    OutlinedButton(
+                        onClick = {
+                            isImporting = true
+                            coroutineScope.launch {
+                                val updated = channelManager.checkLiveStatus("https://tv.fuxiaoya.com", channels)
+                                channelManager.saveChannels(updated)
+                                channels = updated
+                                isImporting = false
+                                Toast.makeText(context, "测活完成：在线 ${updated.count { it.isLive }} 台", Toast.LENGTH_SHORT).show()
+                            }
+                        },
+                        enabled = !isImporting,
+                        shape = RoundedCornerShape(8.dp),
+                        modifier = Modifier.weight(1.1f)
+                    ) {
+                        Icon(imageVector = Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text(if (isImporting) "检测中" else "立即测活", fontSize = 12.sp)
+                    }
+
                     OutlinedButton(
                         onClick = {
                             val file = channelManager.exportJson(channels)
@@ -218,7 +238,7 @@ fun ChannelManageDialog(
                         modifier = Modifier.weight(1f)
                     ) {
                         Icon(imageVector = Icons.Default.FileDownload, contentDescription = null, modifier = Modifier.size(16.dp))
-                        Spacer(modifier = Modifier.width(6.dp))
+                        Spacer(modifier = Modifier.width(4.dp))
                         Text("导出 JSON", fontSize = 12.sp)
                     }
 
@@ -231,7 +251,7 @@ fun ChannelManageDialog(
                         modifier = Modifier.weight(1f)
                     ) {
                         Icon(imageVector = Icons.Default.Description, contentDescription = null, modifier = Modifier.size(16.dp))
-                        Spacer(modifier = Modifier.width(6.dp))
+                        Spacer(modifier = Modifier.width(4.dp))
                         Text("导出 TXT", fontSize = 12.sp)
                     }
 
@@ -243,10 +263,10 @@ fun ChannelManageDialog(
                         },
                         shape = RoundedCornerShape(8.dp),
                         colors = ButtonDefaults.outlinedButtonColors(contentColor = DouyinRed),
-                        modifier = Modifier.weight(1.2f)
+                        modifier = Modifier.weight(1.1f)
                     ) {
                         Icon(imageVector = Icons.Default.RestartAlt, contentDescription = null, modifier = Modifier.size(16.dp))
-                        Spacer(modifier = Modifier.width(6.dp))
+                        Spacer(modifier = Modifier.width(4.dp))
                         Text("恢复默认", fontSize = 12.sp)
                     }
                 }

@@ -204,78 +204,69 @@ class ChannelManager(private val context: Context) {
     }
 
     /**
-     * 批量或并发测活：检查各频道是否真正在线开播
+     * 与网页版一致的权威测活：
+     * GET live.php?batch=rid1,rid2,...
+     * 解析 batch 结果更新 isLive，以线上真实返回为准
      */
-    suspend fun checkLiveStatus(
+    suspend fun checkLiveStatusViaWeb(
         baseUrl: String = "https://tv.fuxiaoya.com",
         channels: List<Channel>
     ): List<Channel> = withContext(Dispatchers.IO) {
-        val result = channels.toMutableList()
-        var batchSupported = false
+        if (channels.isEmpty()) return@withContext channels
 
-        // 1. 尝试 batch 批量接口
-        channels.chunked(8).forEach { chunk ->
-            val ids = chunk.joinToString(",") { it.rid }
+        val resultMap = channels.associate { it.rid to it }.toMutableMap()
+
+        channels.chunked(15).forEach { chunk ->
             try {
+                val ids = chunk.joinToString(",") { it.rid }
                 val url = "${baseUrl.trimEnd('/')}/live.php?batch=$ids"
-                val request = Request.Builder()
+                val req = Request.Builder()
                     .url(url)
-                    .header("User-Agent", "Mozilla/5.0 (Linux; Android 13; TV) AppleWebKit/537.36")
+                    .header("User-Agent", "Mozilla/5.0 (Linux; Android 13; TV) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36")
+                    .header("Referer", "$baseUrl/")
                     .get()
                     .build()
 
-                okHttp.newCall(request).execute().use { resp ->
-                    if (resp.isSuccessful) {
-                        val body = resp.body?.string() ?: ""
-                        val json = JSONObject(body)
-                        val batchObj = json.optJSONObject("batch")
-                        if (batchObj != null) {
-                            batchSupported = true
-                            chunk.forEach { ch ->
-                                val chObj = batchObj.optJSONObject(ch.rid)
-                                if (chObj != null) {
-                                    val isLive = chObj.optBoolean("is_live", chObj.optBoolean("isLive", true))
-                                    val index = result.indexOfFirst { it.rid == ch.rid }
-                                    if (index >= 0) {
-                                        result[index] = result[index].copy(isLive = isLive)
-                                    }
+                okHttp.newCall(req).execute().use { resp ->
+                    if (!resp.isSuccessful) return@use
+                    val body = resp.body?.string() ?: return@use
+                    val root = JSONObject(body)
+                    if (root.optInt("code", 0) != 200) return@use
+
+                    val batch = root.optJSONObject("batch")
+                    if (batch != null) {
+                        chunk.forEach { ch ->
+                            val chObj = batch.optJSONObject(ch.rid)
+                            val old = resultMap[ch.rid] ?: ch
+                            if (chObj != null) {
+                                val streams = chObj.optJSONObject("streams")
+                                val status = chObj.optInt("status", -1)
+                                val hasLiveFlag = chObj.has("is_live") || chObj.has("isLive")
+                                val flag = when {
+                                    hasLiveFlag -> chObj.optBoolean("is_live", chObj.optBoolean("isLive", false))
+                                    status == 2 -> true // 抖音常见开播 status
+                                    streams != null && streams.length() > 0 -> true
+                                    else -> false
                                 }
+                                resultMap[ch.rid] = old.copy(isLive = flag)
+                            } else {
+                                resultMap[ch.rid] = old.copy(isLive = false)
                             }
                         }
                     }
                 }
             } catch (_: Exception) {}
         }
-
-        // 2. 若无 batch 接口，对首屏关键频道进行并发单房探活
-        if (!batchSupported) {
-            channels.take(12).forEach { ch ->
-                try {
-                    val url = "${baseUrl.trimEnd('/')}/live.php?rid=${ch.rid.trim()}"
-                    val request = Request.Builder()
-                        .url(url)
-                        .header("User-Agent", "Mozilla/5.0 (Linux; Android 13; TV) AppleWebKit/537.36")
-                        .get()
-                        .build()
-
-                    okHttp.newCall(request).execute().use { resp ->
-                        if (resp.isSuccessful) {
-                            val body = resp.body?.string() ?: ""
-                            val json = JSONObject(body)
-                            val code = json.optInt("code", 0)
-                            val streams = json.optJSONObject("streams")
-                            val isLive = (code == 200 && streams != null && streams.length() > 0)
-                            val index = result.indexOfFirst { it.rid == ch.rid }
-                            if (index >= 0) {
-                                result[index] = result[index].copy(isLive = isLive)
-                            }
-                        }
-                    }
-                } catch (_: Exception) {}
-            }
-        }
-        result
+        channels.map { resultMap[it.rid] ?: it }
     }
+
+    /**
+     * 兼容接口：调用与网页版一致的测活
+     */
+    suspend fun checkLiveStatus(
+        baseUrl: String = "https://tv.fuxiaoya.com",
+        channels: List<Channel>
+    ): List<Channel> = checkLiveStatusViaWeb(baseUrl, channels)
 
     private fun parseJsonArray(jsonStr: String): List<Channel> {
         return try {
