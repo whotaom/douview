@@ -145,7 +145,7 @@ fun TvTopBar(
 @Composable
 fun TvActionButton(
     text: String,
-    icon: ImageVector,
+    icon: ImageVector? = null,
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
     isPrimary: Boolean = false
@@ -153,15 +153,16 @@ fun TvActionButton(
     var isFocused by remember { mutableStateOf(false) }
     val scale by animateFloatAsState(if (isFocused) 1.08f else 1.0f, label = "btnScale")
     val bgColor = if (isFocused) {
-        if (isPrimary) DouyinRed else DouyinCyan
+        if (isPrimary) DouyinRed else Color(0xFF3A3A3A)
     } else {
-        if (isPrimary) DouyinRed.copy(alpha = 0.8f) else DarkSurfaceElevated
+        if (isPrimary) DouyinRed.copy(alpha = 0.85f) else Color(0xFF2A2A2A)
     }
 
     Surface(
         shape = RoundedCornerShape(10.dp),
         color = bgColor,
-        border = BorderStroke(if (isFocused) 2.dp else 1.dp, if (isFocused) Color.White else DarkSurfaceBorder),
+        border = BorderStroke(if (isFocused) 2.5.dp else 1.dp, if (isFocused) Color(0xFF4FC3F7) else DarkSurfaceBorder),
+        shadowElevation = if (isFocused) 12.dp else 0.dp,
         modifier = modifier
             .scale(scale)
             .onFocusChanged { isFocused = it.isFocused }
@@ -169,20 +170,22 @@ fun TvActionButton(
             .clickable(onClick = onClick)
     ) {
         Row(
-            modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp),
+            modifier = Modifier.padding(horizontal = 20.dp, vertical = 12.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            Icon(
-                imageVector = icon,
-                contentDescription = null,
-                tint = if (isFocused && !isPrimary) Color.Black else Color.White,
-                modifier = Modifier.size(20.dp)
-            )
+            if (icon != null) {
+                Icon(
+                    imageVector = icon,
+                    contentDescription = null,
+                    tint = if (isFocused) Color(0xFF4FC3F7) else Color.White,
+                    modifier = Modifier.size(20.dp)
+                )
+            }
             Text(
                 text = text,
-                color = if (isFocused && !isPrimary) Color.Black else Color.White,
-                fontSize = 14.sp,
+                color = Color.White,
+                fontSize = 15.sp,
                 fontWeight = FontWeight.Bold
             )
         }

@@ -99,10 +99,13 @@ fun TvHomeScreen(
                         fontSize = 14.sp,
                         fontWeight = FontWeight.SemiBold
                     )
+                    val total = channels.size
+                    val online = channels.count { it.isLive }
                     Text(
-                        text = "共 ${channels.size} 台 · 在线优先",
-                        color = DouyinCyan,
-                        fontSize = 12.sp
+                        text = "共 $total 台 · 在线 $online 台",
+                        color = Color.White.copy(alpha = 0.85f),
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.Bold
                     )
                 }
 

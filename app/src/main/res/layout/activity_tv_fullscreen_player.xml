@@ -18,18 +18,21 @@
         app:shutter_background_color="#000000"
         app:keep_content_on_player_reset="true" />
 
+    <!-- 顶部居中换台与状态提示，高 elevation 防止被底层 SurfaceView 或黑帧覆盖 -->
     <TextView
         android:id="@+id/tipView"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
-        android:layout_gravity="center"
-        android:background="#99000000"
+        android:layout_gravity="top|center_horizontal"
+        android:layout_marginTop="48dp"
+        android:background="#CC000000"
+        android:elevation="30dp"
         android:paddingLeft="32dp"
-        android:paddingTop="16dp"
+        android:paddingTop="14dp"
         android:paddingRight="32dp"
-        android:paddingBottom="16dp"
+        android:paddingBottom="14dp"
         android:text="正在连接直播服务..."
         android:textColor="#FFFFFF"
-        android:textSize="18sp"
-        android:visibility="visible" />
+        android:textSize="20sp"
+        android:visibility="gone" />
 </FrameLayout>
