@@ -6,33 +6,12 @@
     android:layout_height="match_parent"
     android:background="#000000">
 
-    <!-- 背景播放器（全屏动态磨砂，轻模糊 + 铺满） -->
+    <!-- 单一全屏播放器：铺满整个电视屏幕，FIT自适应比例保持不拉伸不畸变 -->
     <androidx.media3.ui.PlayerView
-        android:id="@+id/bgPlayerView"
+        android:id="@+id/playerView"
         android:layout_width="match_parent"
         android:layout_height="match_parent"
         android:background="#000000"
-        app:surface_type="surface_view"
-        app:use_controller="false"
-        app:resize_mode="zoom"
-        app:shutter_background_color="#000000"
-        app:keep_content_on_player_reset="true" />
-
-    <!-- 压暗层：约 40% 黑，保证前景清晰、背景动态人眼可辨 -->
-    <View
-        android:id="@+id/dimOverlay"
-        android:layout_width="match_parent"
-        android:layout_height="match_parent"
-        android:background="#66000000" />
-
-    <!-- 前景竖屏播放器（居中，9:16 竖屏，清晰主画面） -->
-    <androidx.media3.ui.PlayerView
-        android:id="@+id/fgPlayerView"
-        android:layout_width="wrap_content"
-        android:layout_height="match_parent"
-        android:layout_gravity="center"
-        android:background="#000000"
-        android:elevation="8dp"
         app:surface_type="surface_view"
         app:use_controller="false"
         app:resize_mode="fit"

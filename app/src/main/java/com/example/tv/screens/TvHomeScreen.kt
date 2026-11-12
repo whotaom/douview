@@ -53,7 +53,7 @@ fun TvHomeScreen(
 
     // 进入中控台后自动后台轻量探活，动态刷新在线台数
     LaunchedEffect(Unit) {
-        val updated = channelManager.checkLiveStatus(LivePreferences.DEFAULT_URL, channels)
+        val updated = channelManager.checkLiveStatusViaWeb(LivePreferences.DEFAULT_URL, channels)
         channels = updated
         channelManager.saveChannels(updated)
     }
@@ -66,26 +66,12 @@ fun TvHomeScreen(
         // 顶部大屏标题栏
         TvTopBar(
             title = "抖眸流控 · 电视大屏监控中控台",
-            subtitle = "当前中控服务: https://tv.fuxiaoya.com · 在线频道自动就绪"
+            subtitle = "当前中控服务: https://tv.fuxiaoya.com · 自动在线测活"
         ) {
-            TvActionButton(
-                text = "立即拉取",
-                icon = Icons.Default.Refresh,
-                isPrimary = true,
-                onClick = {
-                    Toast.makeText(context, "正在检测在线状态…", Toast.LENGTH_SHORT).show()
-                    coroutineScope.launch {
-                        val updated = channelManager.checkLiveStatus(LivePreferences.DEFAULT_URL, channelManager.loadChannels())
-                        channels = updated
-                        channelManager.saveChannels(updated)
-                        Toast.makeText(context, "检测完成：在线 ${updated.count { it.isLive }} 台", Toast.LENGTH_SHORT).show()
-                    }
-                }
-            )
-
             TvActionButton(
                 text = "频道管理",
                 icon = Icons.Default.LiveTv,
+                isPrimary = true,
                 onClick = { showChannelDialog = true }
             )
 

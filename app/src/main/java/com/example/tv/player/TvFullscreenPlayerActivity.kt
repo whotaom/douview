@@ -1,10 +1,7 @@
 package com.example.tv.player
 
 import android.graphics.Color
-import android.graphics.RenderEffect
-import android.graphics.Shader
 import android.net.Uri
-import android.os.Build
 import android.os.Bundle
 import android.text.TextUtils
 import android.util.Log
@@ -33,8 +30,8 @@ import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.exoplayer.trackselection.DefaultTrackSelector
-import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.PlayerView
+import com.example.R
 import com.example.tv.channel.Channel
 import com.example.tv.channel.ChannelManager
 import kotlinx.coroutines.CancellationException
@@ -49,9 +46,9 @@ import org.json.JSONObject
 import java.util.concurrent.TimeUnit
 
 /**
- * 电视大屏全屏竖屏直播播放器（顶级 TV 方案）
- * 1. 竖屏主画面 + 视频流动态磨砂背景（人眼可辩，轻模糊 14px + 40% 压暗，动态与轮廓清晰可感）
- * 2. 单 ExoPlayer 驱动背景 + 前景，省去一路解码，完美适配 RK3528 等 32 位电视盒子
+ * 电视大屏全屏直播播放器（TV 标准方案）
+ * 1. 单一全屏 PlayerView 铺满整个电视屏幕（RESIZE_MODE_FIT 保证画面不拉伸畸变，彻底杜绝“中间只有一小块”问题）
+ * 2. 单 ExoPlayer 驱动，硬件解码降级与电视低功耗缓冲策略，完美兼容 RK3528 等 32 位电视盒子
  * 3. 单飞 Job + switchGen 换台防竞态，先 stop/clear 再起播，避免连续换台失效或旧台覆盖新台
  * 4. 换台反馈与首帧渲染/就绪深度绑定，真正出画后才淡出
  * 5. 菜单仅筛选在线直播频道，左侧 400dp 无全屏遮罩
@@ -86,9 +83,7 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
 
     // UI 组件
     private lateinit var root: FrameLayout
-    private lateinit var bgPlayerView: PlayerView          // 磨砂背景播放层
-    private lateinit var dimOverlay: View                  // 压暗层，约 40% 黑，保证前景可读、背景动态人眼可辨
-    private lateinit var fgPlayerView: PlayerView          // 居中竖屏 9:16 前景主播放器
+    private lateinit var playerView: PlayerView            // 单一真全屏播放器
     private lateinit var tipView: TextView                 // 顶部高层级换台与状态提示
     private lateinit var channelMenu: FrameLayout          // 左侧在线选台悬浮面板
     private lateinit var channelMenuList: LinearLayout
@@ -139,82 +134,12 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
     // -------------------- UI 结构构建 --------------------
 
     private fun buildUi() {
-        root = FrameLayout(this).apply {
-            setBackgroundColor(Color.BLACK)
-            layoutParams = FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.MATCH_PARENT
-            )
-        }
-        setContentView(root)
+        setContentView(R.layout.activity_tv_fullscreen_player)
+        root = findViewById(R.id.rootContainer)
+        playerView = findViewById(R.id.playerView)
+        tipView = findViewById(R.id.tipView)
 
-        // 1. 背景播放器（全屏铺满 + 轻微磨砂模糊）
-        bgPlayerView = PlayerView(this).apply {
-            layoutParams = FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.MATCH_PARENT,
-                FrameLayout.LayoutParams.MATCH_PARENT
-            )
-            useController = false
-            resizeMode = AspectRatioFrameLayout.RESIZE_MODE_ZOOM
-            setBackgroundColor(Color.BLACK)
-            setShutterBackgroundColor(Color.BLACK)
-            setKeepContentOnPlayerReset(true)
-
-            // 人眼可辨：轻模糊 14px（Android 12+ 系统支持时开启）
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                setRenderEffect(
-                    RenderEffect.createBlurEffect(14f, 14f, Shader.TileMode.CLAMP)
-                )
-            }
-        }
-        root.addView(bgPlayerView)
-
-        // 2. 压暗遮罩层：约 40% 黑 (#66000000)，保证前景清晰锐利、背景动态与轮廓依然清晰可辨
-        dimOverlay = View(this).apply {
-            layoutParams = FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.MATCH_PARENT,
-                FrameLayout.LayoutParams.MATCH_PARENT
-            )
-            setBackgroundColor(Color.parseColor("#66000000"))
-        }
-        root.addView(dimOverlay)
-
-        // 3. 前景竖屏播放器（严格 9:16 居中显示，清晰主画面）
-        val screenW = resources.displayMetrics.widthPixels
-        val fgW = (screenW * 0.42f).toInt().coerceAtLeast(360)
-        val fgH = (fgW * 16f / 9f).toInt()
-        fgPlayerView = PlayerView(this).apply {
-            layoutParams = FrameLayout.LayoutParams(fgW, fgH).also {
-                it.gravity = Gravity.CENTER
-            }
-            useController = false
-            resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
-            setBackgroundColor(Color.BLACK)
-            setShutterBackgroundColor(Color.BLACK)
-            setKeepContentOnPlayerReset(true)
-            elevation = 8f
-        }
-        root.addView(fgPlayerView)
-
-        // 4. 换台提示（顶部居中，高 elevation 绝不被视频底层遮挡）
-        tipView = TextView(this).apply {
-            layoutParams = FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.WRAP_CONTENT,
-                FrameLayout.LayoutParams.WRAP_CONTENT
-            ).also {
-                it.gravity = Gravity.CENTER_HORIZONTAL or Gravity.TOP
-                it.topMargin = 40.dp()
-            }
-            setTextColor(Color.WHITE)
-            textSize = 18f
-            setPadding(28, 12, 28, 12)
-            setBackgroundColor(Color.parseColor("#CC111111"))
-            elevation = 40f
-            visibility = View.GONE
-        }
-        root.addView(tipView)
-
-        // 5. 左侧在线选台悬浮面板（仅占 400dp，无全屏遮罩）
+        // 1. 左侧在线选台悬浮面板（仅占 400dp，无全屏遮罩）
         channelMenu = FrameLayout(this).apply {
             layoutParams = FrameLayout.LayoutParams(400.dp(), FrameLayout.LayoutParams.MATCH_PARENT).also {
                 it.gravity = Gravity.START
@@ -247,7 +172,7 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         channelMenu.addView(scroll)
         root.addView(channelMenu)
 
-        // 6. OK 键技术参数信息面板
+        // 2. OK 键技术参数信息面板
         infoOverlay = TextView(this).apply {
             layoutParams = FrameLayout.LayoutParams(480.dp(), FrameLayout.LayoutParams.WRAP_CONTENT).also {
                 it.gravity = Gravity.CENTER
@@ -379,7 +304,7 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
                     showTip("「${channel.name}」暂无法播放", autoHide = true)
                     // 可选自动尝试下一个可用频道
                     if (currentIndex < playList.lastIndex) {
-                        fgPlayerView.postDelayed({
+                        playerView.postDelayed({
                             if (gen == switchGen) switchToChannel(currentIndex + 1)
                         }, 1200)
                     }
@@ -446,9 +371,8 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
             .setMediaSourceFactory(mediaSourceFactory)
             .build()
             .also { exo ->
-                // 关键：同一 ExoPlayer 同时驱动磨砂背景与前景主播放器（只需一路解码，性能最强）
-                bgPlayerView.player = exo
-                fgPlayerView.player = exo
+                // 全屏单播放器承载画面
+                playerView.player = exo
 
                 exo.addListener(object : Player.Listener {
                     override fun onPlayerError(error: PlaybackException) {
@@ -460,7 +384,7 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
                             streamCacheTime.remove(rid)
                         }
                         qualityIndex++
-                        fgPlayerView.postDelayed({ playQuality(gen) }, 800)
+                        playerView.postDelayed({ playQuality(gen) }, 800)
                     }
 
                     override fun onPlaybackStateChanged(state: Int) {
@@ -578,12 +502,12 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
                 playQuality(gen)
             }
         }.also {
-            fgPlayerView.postDelayed(it, BUFFERING_TIMEOUT_MS)
+            playerView.postDelayed(it, BUFFERING_TIMEOUT_MS)
         }
     }
 
     private fun cancelBufferingTimeout() {
-        bufferingTimeoutRunnable?.let { fgPlayerView.removeCallbacks(it) }
+        bufferingTimeoutRunnable?.let { playerView.removeCallbacks(it) }
         bufferingTimeoutRunnable = null
     }
 
@@ -806,8 +730,7 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
 
     private fun releasePlayerOnly() {
         cancelBufferingTimeout()
-        bgPlayerView.player = null
-        fgPlayerView.player = null
+        playerView.player = null
         player?.release()
         player = null
     }

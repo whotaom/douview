@@ -215,7 +215,9 @@ class ChannelManager(private val context: Context) {
         if (channels.isEmpty()) return@withContext channels
 
         val resultMap = channels.associate { it.rid to it }.toMutableMap()
+        var batchSuccessCount = 0
 
+        // 1. 优先尝试与网页版同源的 batch 接口 (15 个一组)
         channels.chunked(15).forEach { chunk ->
             try {
                 val ids = chunk.joinToString(",") { it.rid }
@@ -228,35 +230,63 @@ class ChannelManager(private val context: Context) {
                     .build()
 
                 okHttp.newCall(req).execute().use { resp ->
-                    if (!resp.isSuccessful) return@use
-                    val body = resp.body?.string() ?: return@use
-                    val root = JSONObject(body)
-                    if (root.optInt("code", 0) != 200) return@use
-
-                    val batch = root.optJSONObject("batch")
-                    if (batch != null) {
-                        chunk.forEach { ch ->
-                            val chObj = batch.optJSONObject(ch.rid)
-                            val old = resultMap[ch.rid] ?: ch
-                            if (chObj != null) {
-                                val streams = chObj.optJSONObject("streams")
-                                val status = chObj.optInt("status", -1)
-                                val hasLiveFlag = chObj.has("is_live") || chObj.has("isLive")
-                                val flag = when {
-                                    hasLiveFlag -> chObj.optBoolean("is_live", chObj.optBoolean("isLive", false))
-                                    status == 2 -> true // 抖音常见开播 status
-                                    streams != null && streams.length() > 0 -> true
-                                    else -> false
+                    if (resp.isSuccessful) {
+                        val body = resp.body?.string() ?: ""
+                        val root = JSONObject(body)
+                        if (root.optInt("code", 0) == 200) {
+                            val batch = root.optJSONObject("batch")
+                            if (batch != null && batch.length() > 0) {
+                                chunk.forEach { ch ->
+                                    val chObj = batch.optJSONObject(ch.rid)
+                                    val old = resultMap[ch.rid] ?: ch
+                                    if (chObj != null) {
+                                        batchSuccessCount++
+                                        val streams = chObj.optJSONObject("streams")
+                                        val status = chObj.optInt("status", -1)
+                                        val hasLiveFlag = chObj.has("is_live") || chObj.has("isLive")
+                                        val flag = when {
+                                            hasLiveFlag -> chObj.optBoolean("is_live", chObj.optBoolean("isLive", false))
+                                            status == 2 -> true // 抖音常见开播 status
+                                            streams != null && streams.length() > 0 -> true
+                                            else -> false
+                                        }
+                                        resultMap[ch.rid] = old.copy(isLive = flag)
+                                    }
                                 }
-                                resultMap[ch.rid] = old.copy(isLive = flag)
-                            } else {
-                                resultMap[ch.rid] = old.copy(isLive = false)
                             }
                         }
                     }
                 }
             } catch (_: Exception) {}
         }
+
+        // 2. 兜底回退：如果 batch 接口未返回结果（某些代理节点不支持 batch 参数），并发单房探测
+        if (batchSuccessCount == 0) {
+            channels.forEach { ch ->
+                try {
+                    val url = "${baseUrl.trimEnd('/')}/live.php?rid=${ch.rid.trim()}"
+                    val req = Request.Builder()
+                        .url(url)
+                        .header("User-Agent", "Mozilla/5.0 (Linux; Android 13; TV) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36")
+                        .header("Referer", "$baseUrl/")
+                        .get()
+                        .build()
+
+                    okHttp.newCall(req).execute().use { resp ->
+                        if (resp.isSuccessful) {
+                            val body = resp.body?.string() ?: ""
+                            val root = JSONObject(body)
+                            val code = root.optInt("code", 0)
+                            val streams = root.optJSONObject("streams")
+                            val isLive = (code == 200 && streams != null && streams.length() > 0)
+                            val old = resultMap[ch.rid] ?: ch
+                            resultMap[ch.rid] = old.copy(isLive = isLive)
+                        }
+                    }
+                } catch (_: Exception) {}
+            }
+        }
+
         channels.map { resultMap[it.rid] ?: it }
     }
 
