@@ -50,7 +50,6 @@ fun TvHomeScreen(
     var showClearCacheDialog by remember { mutableStateOf(false) }
     var showUpdateDialog by remember { mutableStateOf(false) }
     var showChannelDialog by remember { mutableStateOf(false) }
-    var dynamicBgEnabled by remember { mutableStateOf(preferences.dynamicBgEnabled) }
     var keepScreenOn by remember { mutableStateOf(preferences.keepScreenOn) }
     var channels by remember { mutableStateOf(channelManager.loadChannels()) }
     var probeStatusTip by remember { mutableStateOf("正在检测在线状态...") }
@@ -91,22 +90,6 @@ fun TvHomeScreen(
                 icon = Icons.Default.LiveTv,
                 isPrimary = true,
                 onClick = { showChannelDialog = true }
-            )
-
-            TvActionButton(
-                text = if (dynamicBgEnabled) "动态背景：开" else "动态背景：关",
-                icon = if (dynamicBgEnabled) Icons.Default.BlurOn else Icons.Default.BlurOff,
-                onClick = {
-                    val next = !dynamicBgEnabled
-                    dynamicBgEnabled = next
-                    preferences.dynamicBgEnabled = next
-                    val toastMsg = if (next) {
-                        "动态背景已开启（单层 ZOOM 铺满，无黑边）"
-                    } else {
-                        "动态背景已关闭（单层 FIT 完整竖屏 · 最稳）"
-                    }
-                    Toast.makeText(context, toastMsg, Toast.LENGTH_SHORT).show()
-                }
             )
 
             TvActionButton(
@@ -162,6 +145,7 @@ fun TvHomeScreen(
                                     putExtra(TvFullscreenPlayerActivity.EXTRA_LINE, currentLine)
                                     putExtra(TvFullscreenPlayerActivity.EXTRA_BASE_URL, activeBaseUrl)
                                     putExtra(TvFullscreenPlayerActivity.EXTRA_TITLE, channel.name)
+                                    putExtra(TvFullscreenPlayerActivity.EXTRA_AVATAR, channel.avatar)
                                 }
                                 context.startActivity(intent)
                             },
@@ -477,6 +461,7 @@ fun TvHomeScreen(
                     putExtra(TvFullscreenPlayerActivity.EXTRA_LINE, currentLine)
                     putExtra(TvFullscreenPlayerActivity.EXTRA_BASE_URL, activeBaseUrl)
                     putExtra(TvFullscreenPlayerActivity.EXTRA_TITLE, channel.name)
+                    putExtra(TvFullscreenPlayerActivity.EXTRA_AVATAR, channel.avatar)
                 }
                 context.startActivity(intent)
             }

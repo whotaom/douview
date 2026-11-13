@@ -6,16 +6,26 @@
     android:layout_height="match_parent"
     android:background="#000000">
 
-    <!-- 1. 唯一全屏主播放器：SurfaceView 直出，默认 RESIZE_MODE_FIT 稳定出画；开启动态背景时切为 RESIZE_MODE_ZOOM 铺满（无双 Surface / 无 RenderEffect） -->
+    <!-- 1. 主播头像铺满背景层（竖屏居中 FIT 时两侧露出轻微模糊头像；无头像或横屏时纯黑底） -->
+    <ImageView
+        android:id="@+id/avatarBg"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:background="#000000"
+        android:contentDescription="@null"
+        android:scaleType="centerCrop"
+        android:visibility="gone" />
+
+    <!-- 2. 唯一全屏主播放器：严格 RESIZE_MODE_FIT 按比例显示，不裁切不拉伸；背景透明以露出两侧头像 -->
     <androidx.media3.ui.PlayerView
         android:id="@+id/playerView"
         android:layout_width="match_parent"
         android:layout_height="match_parent"
-        android:background="#000000"
+        android:background="@android:color/transparent"
         app:surface_type="surface_view"
         app:use_controller="false"
         app:resize_mode="fit"
-        app:shutter_background_color="#000000"
+        app:shutter_background_color="@android:color/transparent"
         app:keep_content_on_player_reset="true" />
 
     <!-- 3. 顶部居中换台与状态提示，高 elevation 防止被视频底层遮挡 -->

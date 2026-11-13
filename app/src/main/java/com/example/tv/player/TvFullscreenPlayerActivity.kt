@@ -1,5 +1,7 @@
 package com.example.tv.player
 
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.Color
 import android.net.Uri
 import android.os.Build
@@ -8,11 +10,13 @@ import android.os.Handler
 import android.os.Looper
 import android.text.TextUtils
 import android.util.Log
+import android.util.LruCache
 import android.view.Gravity
 import android.view.KeyEvent
 import android.view.View
 import android.view.WindowManager
 import android.widget.FrameLayout
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
@@ -55,11 +59,11 @@ import java.util.concurrent.TimeUnit
 
 /**
  * 电视大屏全屏直播播放器（顶级 TV 直播客户端方案）
- * 1. 横屏全屏自适应：横屏源自动铺满；竖屏源居中清晰显示（RESIZE_MODE_FIT）+ 两侧单解码低耗动态磨砂背景 + 35% 压暗
- * 2. 「先备后切」(prepare-then-swap)：换台期间旧流不中断，新流 STATE_READY/首帧瞬间阻断旧流并上屏
- * 3. 离线/无法播放自动切换下一在线台，记录本轮失败集合彻底防死循环
- * 4. 菜单仅展示在线频道，标题带实时在线台数「在线频道（N）」
- * 5. OK 键信息面板每秒实时刷新码率、缓冲、分辨率、音视频编码、线路与播放状态
+ * 1. 唯一全屏 PlayerView（SurfaceView + RESIZE_MODE_FIT）：竖屏完整居中不变形，横屏按比例适配
+ * 2. 竖屏两侧由主播头像 CENTER_CROP + 轻微模糊铺满作为氛围背景；无头像或横屏时纯黑底
+ * 3. 「先备后切」(prepare-then-swap)：换台期间旧流不中断，新流 STATE_READY/首帧瞬间赋值切流再释放旧播放器
+ * 4. 离线/无法播放自动切换下一在线台，记录本轮失败集合彻底防死循环
+ * 5. 菜单仅展示在线频道，标题带实时在线台数「在线频道（N）」；OK 键技术面板 1 秒实时刷新
  */
 class TvFullscreenPlayerActivity : ComponentActivity() {
 
@@ -74,26 +78,31 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         const val EXTRA_BASE_URL = "extra_base_url"
         const val EXTRA_LINE = "extra_line"
         const val EXTRA_TITLE = "extra_title"
+        const val EXTRA_AVATAR = "extra_avatar"
 
         // 全局静态流缓存 (rid -> 清晰度列表)，支持 5 分钟有效时间
         val streamCache = mutableMapOf<String, List<Pair<String, String>>>()
         val streamCacheTime = mutableMapOf<String, Long>()
         const val CACHE_TTL = 5 * 60 * 1000L
 
+        // 轻微模糊头像内存缓存（避免重复下载与模糊计算）
+        private val blurredAvatarCache = LruCache<String, Bitmap>(16)
+
         fun clearStreamCache() {
             streamCache.clear()
             streamCacheTime.clear()
+            blurredAvatarCache.evictAll()
         }
     }
 
     private lateinit var channelManager: ChannelManager
     private lateinit var preferences: LivePreferences
     private var currentLine: Int = 1
-    private var dynamicBgEnabled: Boolean = false
 
     // UI 组件
     private lateinit var root: FrameLayout
-    private lateinit var playerView: PlayerView            // 唯一全屏主播放器（SurfaceView + FIT/ZOOM）
+    private lateinit var avatarBg: ImageView               // 主播头像铺满背景层（轻微模糊，无头像黑底）
+    private lateinit var playerView: PlayerView            // 唯一全屏主播放器（严格 RESIZE_MODE_FIT）
     private lateinit var tipView: TextView                 // 顶部高层级换台与状态提示
     private lateinit var channelMenu: FrameLayout          // 左侧在线选台悬浮面板
     private lateinit var menuTitleView: TextView           // 选台菜单标题：「在线频道（N）」
@@ -105,7 +114,11 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
     private var preparingPlayer: ExoPlayer? = null
     private var isMenuShowing = false
     private var isInfoShowing = false
-    private var hasRenderedFirstFrameForCurrent = false
+
+    // 头像背景状态
+    private var avatarLoadJob: Job? = null
+    private var currentAvatarUrl: String? = null
+    private var isPortraitStream: Boolean = true
 
     // 播放列表与当前索引
     private var playList: List<Channel> = emptyList()
@@ -120,11 +133,9 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
     private val SWITCH_MIN_INTERVAL = 250L
     private val failedRidsThisRound = mutableSetOf<String>()
 
-    // 缓冲超时监测 (12秒未就绪自动降清晰度) & 首帧看门狗 (开启 ZOOM 无首帧自动降级回 FIT)
+    // 缓冲超时监测 (12秒未就绪自动降清晰度)
     private var bufferingTimeoutRunnable: Runnable? = null
     private val BUFFERING_TIMEOUT_MS = 12_000L
-    private var firstFrameWatchdogRunnable: Runnable? = null
-    private val FIRST_FRAME_WATCHDOG_MS = 4_000L
 
     // OK 信息面板 1 秒实时刷新
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -151,8 +162,6 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         preferences = LivePreferences(this)
         channelManager = ChannelManager(this)
         currentLine = resolveInitialLine()
-        dynamicBgEnabled = preferences.dynamicBgEnabled
-        applyDynamicBackground(dynamicBgEnabled)
 
         setupPlayListAndStart()
 
@@ -185,11 +194,17 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
     private fun buildUi() {
         setContentView(R.layout.activity_tv_fullscreen_player)
         root = findViewById(R.id.rootContainer)
+        avatarBg = findViewById(R.id.avatarBg)
         playerView = findViewById(R.id.playerView)
         tipView = findViewById(R.id.tipView)
 
+        root.setBackgroundColor(Color.BLACK)
+        avatarBg.scaleType = ImageView.ScaleType.CENTER_CROP
+        avatarBg.setBackgroundColor(Color.BLACK)
+
         playerView.useController = false
         playerView.resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
+        playerView.setBackgroundColor(Color.TRANSPARENT)
 
         // 1. 左侧在线选台悬浮面板（仅占 400dp，无全屏遮罩）
         channelMenu = FrameLayout(this).apply {
@@ -280,12 +295,25 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
             }
         }
 
+        val extraAvatar = intent.getStringExtra(EXTRA_AVATAR)?.trim().orEmpty()
         if (!targetRid.isNullOrBlank()) {
             val existingIndex = sortedChannels.indexOfFirst { it.rid == targetRid }
             if (existingIndex >= 0) {
+                if (extraAvatar.isNotBlank() && sortedChannels[existingIndex].avatar.isBlank()) {
+                    sortedChannels[existingIndex] = sortedChannels[existingIndex].copy(avatar = extraAvatar)
+                }
                 currentIndex = existingIndex
             } else {
-                sortedChannels.add(0, Channel(rid = targetRid, name = "自定义频道 ($targetRid)", isLive = true, statusKnown = false))
+                sortedChannels.add(
+                    0,
+                    Channel(
+                        rid = targetRid,
+                        name = intent.getStringExtra(EXTRA_TITLE)?.takeIf { it.isNotBlank() } ?: "自定义频道 ($targetRid)",
+                        avatar = extraAvatar,
+                        isLive = true,
+                        statusKnown = false
+                    )
+                )
                 currentIndex = 0
             }
         } else {
@@ -295,7 +323,7 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         playList = sortedChannels
         switchToChannel(currentIndex, force = true)
 
-        // 异步与当前线路同源测活，保证菜单展示真实在线台数与状态，同时锁定 currentIndex 不偏移
+        // 异步与当前线路同源测活，保证菜单展示真实在线台数与状态，同步最新头像并锁定 currentIndex 不偏移
         val base = activeBaseUrl()
         lifecycleScope.launch {
             val outcome = channelManager.probeLiveStatus(base, playList)
@@ -307,7 +335,13 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
                 playList = sorted
                 if (playingRid != null) {
                     val syncedIdx = sorted.indexOfFirst { it.rid == playingRid }
-                    if (syncedIdx >= 0) currentIndex = syncedIdx
+                    if (syncedIdx >= 0) {
+                        currentIndex = syncedIdx
+                        val updatedAvatar = sorted[syncedIdx].avatar
+                        if (updatedAvatar.isNotBlank() && updatedAvatar != currentAvatarUrl) {
+                            bindChannelAvatar(updatedAvatar)
+                        }
+                    }
                 }
                 channelManager.saveChannels(sorted)
             }
@@ -355,20 +389,21 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         if (!fromAutoSkip) {
             showTip("正在切换到：${channel.name}", autoHide = false)
         }
+        bindChannelAvatar(channel.avatar)
 
         val base = activeBaseUrl()
 
         switchJob = lifecycleScope.launch {
             try {
-                val list = withContext(Dispatchers.IO) {
+                val fetched = withContext(Dispatchers.IO) {
                     val cached = streamCache[channel.rid]
                     val t = streamCacheTime[channel.rid] ?: 0L
                     if (cached != null && now - t < CACHE_TTL && cached.isNotEmpty()) {
-                        cached
+                        cached to null
                     } else {
-                        fetchQualities(base, channel.rid).also {
-                            if (it.isNotEmpty()) {
-                                streamCache[channel.rid] = it
+                        fetchQualitiesWithAvatar(base, channel.rid).also { (list, _) ->
+                            if (list.isNotEmpty()) {
+                                streamCache[channel.rid] = list
                                 streamCacheTime[channel.rid] = System.currentTimeMillis()
                             }
                         }
@@ -376,6 +411,16 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
                 }
 
                 if (gen != switchGen || !isActive) return@launch
+
+                val (list, fetchedAvatar) = fetched
+                if (!fetchedAvatar.isNullOrBlank() && fetchedAvatar != currentAvatarUrl) {
+                    val updated = playList.toMutableList()
+                    if (index in updated.indices) {
+                        updated[index] = updated[index].copy(avatar = fetchedAvatar)
+                        playList = updated
+                    }
+                    bindChannelAvatar(fetchedAvatar)
+                }
 
                 if (list.isEmpty()) {
                     onChannelUnplayable("无法播放")
@@ -479,18 +524,12 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
                         cancelBufferingTimeout()
                         if (preparingPlayer === next) {
                             swapTo(next, gen, name)
-                        } else if (player === next) {
-                            if (dynamicBgEnabled && !hasRenderedFirstFrameForCurrent) {
-                                scheduleFirstFrameWatchdog(gen, next)
-                            }
-                            if (tipView.visibility == View.VISIBLE) {
-                                tipView.postDelayed(hideTipRunnable, 600)
-                            }
+                        } else if (player === next && tipView.visibility == View.VISIBLE) {
+                            tipView.postDelayed(hideTipRunnable, 600)
                         }
                     }
                     Player.STATE_ENDED -> {
                         cancelBufferingTimeout()
-                        cancelFirstFrameWatchdog()
                         if (player === next) {
                             onChannelUnplayable("直播已结束")
                         }
@@ -503,19 +542,13 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
                 cancelBufferingTimeout()
                 Log.i(
                     TAG,
-                    "onRenderedFirstFrame model=${Build.MODEL} channel=$name size=${next.videoSize.width}x${next.videoSize.height} dynamicBg=$dynamicBgEnabled"
+                    "onRenderedFirstFrame model=${Build.MODEL} channel=$name size=${next.videoSize.width}x${next.videoSize.height}"
                 )
                 if (preparingPlayer === next) {
                     swapTo(next, gen, name)
-                    hasRenderedFirstFrameForCurrent = true
-                    cancelFirstFrameWatchdog()
-                } else if (player === next) {
-                    hasRenderedFirstFrameForCurrent = true
-                    cancelFirstFrameWatchdog()
-                    if (tipView.visibility == View.VISIBLE) {
-                        tipView.removeCallbacks(hideTipRunnable)
-                        tipView.postDelayed(hideTipRunnable, 600)
-                    }
+                } else if (player === next && tipView.visibility == View.VISIBLE) {
+                    tipView.removeCallbacks(hideTipRunnable)
+                    tipView.postDelayed(hideTipRunnable, 600)
                 }
             }
 
@@ -523,15 +556,9 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
                 if (gen != switchGen) return
                 Log.e(TAG, "播放异常: ${error.errorCodeName} | ${error.message}")
                 cancelBufferingTimeout()
-                cancelFirstFrameWatchdog()
 
                 if (preparingPlayer === next) {
                     releasePreparing()
-                }
-
-                // 若开启动态背景后发生异常，立即降级回最稳的 FIT 单层
-                if (dynamicBgEnabled) {
-                    fallbackDynamicBgToFit("播放异常自动降级 FIT")
                 }
 
                 // 自动降级尝试下一清晰度；若全部失败则触发自动切台
@@ -549,6 +576,9 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
             }
 
             override fun onVideoSizeChanged(videoSize: VideoSize) {
+                if (player === next && videoSize.width > 0 && videoSize.height > 0) {
+                    updateAvatarVisibilityForVideoSize(videoSize)
+                }
                 Log.d(TAG, "视频尺寸已更新: ${videoSize.width}x${videoSize.height} ratio=${videoSize.pixelWidthHeightRatio}")
             }
         })
@@ -571,6 +601,7 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
      * 2. 一次赋值 playerView.player = next（禁止中间置 null）
      * 3. 最后再停止并释放旧播放器
      */
+    @OptIn(UnstableApi::class)
     private fun swapTo(next: ExoPlayer, gen: Long, name: String) {
         if (gen != switchGen || isFinishing || isDestroyed) {
             if (preparingPlayer === next) preparingPlayer = null
@@ -581,13 +612,16 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         failedRidsThisRound.clear()
         val old = player
         player = next
-        hasRenderedFirstFrameForCurrent = false
         if (preparingPlayer === next) {
             preparingPlayer = null
         }
 
-        applyDynamicBackground(dynamicBgEnabled)
+        playerView.resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
         playerView.player = next
+        val vs = next.videoSize
+        if (vs.width > 0 && vs.height > 0) {
+            updateAvatarVisibilityForVideoSize(vs)
+        }
 
         try {
             old?.stop()
@@ -595,9 +629,6 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
             old?.release()
         } catch (_: Exception) {}
 
-        if (dynamicBgEnabled) {
-            scheduleFirstFrameWatchdog(gen, next)
-        }
         showTip("已切换到：$name", autoHide = true)
     }
 
@@ -610,46 +641,142 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         preparingPlayer = null
     }
 
-    // -------------------- 单 View 安全动态背景（FIT / ZOOM 切换 + 无首帧自动降级） --------------------
+    // -------------------- 竖屏主播头像铺满背景（轻微模糊，无头像或横屏纯黑底） --------------------
 
-    @OptIn(UnstableApi::class)
-    private fun applyDynamicBackground(enabled: Boolean) {
-        dynamicBgEnabled = enabled
-        playerView.resizeMode = if (enabled) {
-            AspectRatioFrameLayout.RESIZE_MODE_ZOOM
+    private fun updateAvatarVisibilityForVideoSize(videoSize: VideoSize) {
+        val effectiveW = (videoSize.width * videoSize.pixelWidthHeightRatio).toInt().coerceAtLeast(1)
+        isPortraitStream = videoSize.height > effectiveW
+        avatarBg.visibility = if (isPortraitStream && !currentAvatarUrl.isNullOrBlank() && avatarBg.drawable != null) {
+            View.VISIBLE
         } else {
-            AspectRatioFrameLayout.RESIZE_MODE_FIT
+            View.GONE
         }
     }
 
-    private fun scheduleFirstFrameWatchdog(gen: Long, targetPlayer: ExoPlayer) {
-        cancelFirstFrameWatchdog()
-        if (!dynamicBgEnabled || hasRenderedFirstFrameForCurrent) return
-        firstFrameWatchdogRunnable = Runnable {
-            if (gen != switchGen || isFinishing || isDestroyed) return@Runnable
-            if (player === targetPlayer && dynamicBgEnabled && !hasRenderedFirstFrameForCurrent) {
-                fallbackDynamicBgToFit("未收到 onRenderedFirstFrame，已自动关闭动态背景恢复主画面")
+    private fun bindChannelAvatar(avatarUrl: String?) {
+        val clean = avatarUrl?.trim().orEmpty()
+        if (clean.isBlank()) {
+            avatarLoadJob?.cancel()
+            currentAvatarUrl = null
+            avatarBg.setImageDrawable(null)
+            avatarBg.setBackgroundColor(Color.BLACK)
+            avatarBg.visibility = View.GONE
+            return
+        }
+
+        if (clean == currentAvatarUrl && avatarBg.drawable != null) {
+            avatarBg.visibility = if (isPortraitStream) View.VISIBLE else View.GONE
+            return
+        }
+
+        avatarLoadJob?.cancel()
+        currentAvatarUrl = clean
+
+        val cached = blurredAvatarCache.get(clean)
+        if (cached != null && !cached.isRecycled) {
+            avatarBg.setBackgroundColor(Color.BLACK)
+            avatarBg.setImageBitmap(cached)
+            avatarBg.visibility = if (isPortraitStream) View.VISIBLE else View.GONE
+            return
+        }
+
+        avatarLoadJob = lifecycleScope.launch {
+            val bmp = withContext(Dispatchers.IO) {
+                loadAndLightBlurAvatar(clean)
             }
-        }.also {
-            mainHandler.postDelayed(it, FIRST_FRAME_WATCHDOG_MS)
+            if (!isActive || clean != currentAvatarUrl || isFinishing || isDestroyed) return@launch
+            if (bmp != null) {
+                blurredAvatarCache.put(clean, bmp)
+                avatarBg.setBackgroundColor(Color.BLACK)
+                avatarBg.setImageBitmap(bmp)
+                avatarBg.visibility = if (isPortraitStream) View.VISIBLE else View.GONE
+            } else {
+                avatarBg.setImageDrawable(null)
+                avatarBg.setBackgroundColor(Color.BLACK)
+                avatarBg.visibility = View.GONE
+            }
         }
     }
 
-    private fun cancelFirstFrameWatchdog() {
-        firstFrameWatchdogRunnable?.let { mainHandler.removeCallbacks(it) }
-        firstFrameWatchdogRunnable = null
+    private fun loadAndLightBlurAvatar(url: String): Bitmap? {
+        return try {
+            val request = Request.Builder()
+                .url(url)
+                .header("User-Agent", TV_UA)
+                .get()
+                .build()
+            val bytes = okHttpClient.newCall(request).execute().use { resp ->
+                if (!resp.isSuccessful) return null
+                resp.body?.bytes()
+            } ?: return null
+
+            val boundsOpts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeByteArray(bytes, 0, bytes.size, boundsOpts)
+            val maxDim = maxOf(boundsOpts.outWidth, boundsOpts.outHeight)
+            var sampleSize = 1
+            while (maxDim / sampleSize > 160) {
+                sampleSize *= 2
+            }
+
+            val decodeOpts = BitmapFactory.Options().apply {
+                inSampleSize = sampleSize
+                inPreferredConfig = Bitmap.Config.ARGB_8888
+            }
+            val raw = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, decodeOpts) ?: return null
+            val blurred = lightBoxBlur(raw, passes = 2)
+            if (blurred !== raw) raw.recycle()
+            blurred
+        } catch (e: Exception) {
+            Log.w(TAG, "加载主播头像失败: $url", e)
+            null
+        }
     }
 
-    private fun fallbackDynamicBgToFit(reason: String) {
-        Log.w(TAG, "fallbackDynamicBgToFit: $reason model=${Build.MODEL}")
-        preferences.dynamicBgEnabled = false
-        applyDynamicBackground(false)
-        showTip("检测到渲染异常，已自动关闭动态背景恢复主画面", autoHide = true)
+    private fun lightBoxBlur(src: Bitmap, passes: Int = 2): Bitmap {
+        val w = src.width
+        val h = src.height
+        if (w <= 2 || h <= 2) return src
+        val pix = IntArray(w * h)
+        src.getPixels(pix, 0, w, 0, 0, w, h)
+        val tmp = IntArray(w * h)
+
+        repeat(passes) {
+            for (y in 0 until h) {
+                val row = y * w
+                for (x in 0 until w) {
+                    val p0 = pix[row + (x - 1).coerceAtLeast(0)]
+                    val p1 = pix[row + x]
+                    val p2 = pix[row + (x + 1).coerceAtMost(w - 1)]
+                    val r = (((p0 shr 16) and 0xFF) + ((p1 shr 16) and 0xFF) + ((p2 shr 16) and 0xFF)) / 3
+                    val g = (((p0 shr 8) and 0xFF) + ((p1 shr 8) and 0xFF) + ((p2 shr 8) and 0xFF)) / 3
+                    val b = ((p0 and 0xFF) + (p1 and 0xFF) + (p2 and 0xFF)) / 3
+                    tmp[row + x] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
+                }
+            }
+            for (y in 0 until h) {
+                val y0 = (y - 1).coerceAtLeast(0) * w
+                val y1 = y * w
+                val y2 = (y + 1).coerceAtMost(h - 1) * w
+                for (x in 0 until w) {
+                    val p0 = tmp[y0 + x]
+                    val p1 = tmp[y1 + x]
+                    val p2 = tmp[y2 + x]
+                    val r = (((p0 shr 16) and 0xFF) + ((p1 shr 16) and 0xFF) + ((p2 shr 16) and 0xFF)) / 3
+                    val g = (((p0 shr 8) and 0xFF) + ((p1 shr 8) and 0xFF) + ((p2 shr 8) and 0xFF)) / 3
+                    val b = ((p0 and 0xFF) + (p1 and 0xFF) + (p2 and 0xFF)) / 3
+                    pix[y1 + x] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
+                }
+            }
+        }
+        return Bitmap.createBitmap(pix, w, h, Bitmap.Config.ARGB_8888)
     }
 
     // -------------------- 取流与超时 --------------------
 
-    private suspend fun fetchQualities(baseUrl: String, rid: String): List<Pair<String, String>> =
+    private suspend fun fetchQualitiesWithAvatar(
+        baseUrl: String,
+        rid: String
+    ): Pair<List<Pair<String, String>>, String?> =
         withContext(Dispatchers.IO) {
             val base = ChannelManager.normalizeBaseUrl(baseUrl)
             val apiUrl = "$base/live.php?rid=${rid.trim()}"
@@ -666,10 +793,15 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
                     val httpCode = response.code
                     val body = response.body?.string().orEmpty()
                     Log.d(TAG, "fetchQualities url=$apiUrl code=$httpCode body=${body.take(200)}")
-                    if (!response.isSuccessful || body.isBlank()) return@withContext emptyList()
+                    if (!response.isSuccessful || body.isBlank()) return@withContext emptyList<Pair<String, String>>() to null
                     val json = JSONObject(body)
-                    if (json.optInt("code", 0) != 200) return@withContext emptyList()
-                    val streamsObj = json.optJSONObject("streams") ?: return@withContext emptyList()
+                    if (json.optInt("code", 0) != 200) return@withContext emptyList<Pair<String, String>>() to null
+
+                    val avatarUrl = json.optString("avatar", "").trim()
+                        .ifBlank { json.optJSONObject("room")?.optString("avatar", "")?.trim().orEmpty() }
+                        .takeIf { it.isNotBlank() }
+
+                    val streamsObj = json.optJSONObject("streams") ?: return@withContext emptyList<Pair<String, String>>() to avatarUrl
 
                     val priorityKeys = listOf("origin", "uhd", "hd", "sd", "ld", "default")
                     val result = mutableListOf<Pair<String, String>>()
@@ -695,11 +827,11 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
                             }
                         }
                     }
-                    result
+                    result to avatarUrl
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "解析流地址失败: $rid url=$apiUrl", e)
-                emptyList()
+                emptyList<Pair<String, String>>() to null
             }
         }
 
@@ -833,12 +965,6 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
             else -> "已离线"
         }
 
-        val bgStatusText = if (dynamicBgEnabled) {
-            "开启（单层 ZOOM 铺满 · 无双 Surface）"
-        } else {
-            "关闭（单层 FIT · 稳定主画面）"
-        }
-
         infoOverlay.text = buildString {
             append("频道：${ch.name}\n")
             append("房间：${ch.rid}\n")
@@ -851,7 +977,7 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
             append("码率：${if (kbps > 0) "约 $kbps kbps" else "自适应"}\n")
             append("缓冲：${p?.totalBufferedDuration ?: 0} ms\n")
             append("线路：$lineLabel\n")
-            append("动态背景：$bgStatusText\n")
+            append("画面模式：按比例适配（FIT 不拉伸）\n")
             append("播放状态：$playStateText\n")
             append("────────────────\n（再次按 OK 或返回键关闭）")
         }
@@ -1010,7 +1136,6 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
 
     private fun releasePlayerOnly() {
         cancelBufferingTimeout()
-        cancelFirstFrameWatchdog()
         playerView.player = null
         try {
             player?.stop()
@@ -1022,6 +1147,7 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
 
     private fun releaseAll() {
         switchJob?.cancel()
+        avatarLoadJob?.cancel()
         switchGen++
         hideLiveInfo()
         tipView.removeCallbacks(hideTipRunnable)
@@ -1035,13 +1161,10 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         player?.playWhenReady = false
         releasePreparing()
         cancelBufferingTimeout()
-        cancelFirstFrameWatchdog()
     }
 
     override fun onStart() {
         super.onStart()
-        dynamicBgEnabled = preferences.dynamicBgEnabled
-        applyDynamicBackground(dynamicBgEnabled)
         player?.playWhenReady = true
         if (isInfoShowing) {
             mainHandler.removeCallbacks(infoRefreshRunnable)
