@@ -241,12 +241,22 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         playList = sortedChannels
         switchToChannel(currentIndex, force = true)
 
-        // 异步后台拉取最新批次在线状态，保证后续选台菜单为真实在线
-        val baseUrl = intent.getStringExtra(EXTRA_BASE_URL)?.trimEnd('/') ?: DEFAULT_BASE_URL
+        // 异步后台拉取最新批次在线状态，保证后续选台菜单为真实在线，同时保持 currentIndex 锁定当前频道
+        val baseUrl = ChannelManager.normalizeBaseUrl(intent.getStringExtra(EXTRA_BASE_URL))
         lifecycleScope.launch {
-            val updated = channelManager.checkLiveStatusViaWeb(baseUrl, playList)
-            playList = updated.sortedBy { if (it.isLive) 0 else 1 }
-            channelManager.saveChannels(playList)
+            val outcome = channelManager.probeLiveStatus(baseUrl, playList)
+            if (!outcome.networkFailed) {
+                val playingRid = playList.getOrNull(currentIndex)?.rid
+                val sorted = outcome.channels.sortedWith(
+                    compareBy { if (it.isLive) 0 else if (!it.statusKnown) 1 else 2 }
+                )
+                playList = sorted
+                if (playingRid != null) {
+                    val syncedIdx = sorted.indexOfFirst { it.rid == playingRid }
+                    if (syncedIdx >= 0) currentIndex = syncedIdx
+                }
+                channelManager.saveChannels(sorted)
+            }
         }
     }
 
@@ -277,7 +287,7 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
             player?.clearMediaItems()
         } catch (_: Exception) {}
 
-        val baseUrl = intent.getStringExtra(EXTRA_BASE_URL)?.trimEnd('/') ?: DEFAULT_BASE_URL
+        val baseUrl = ChannelManager.normalizeBaseUrl(intent.getStringExtra(EXTRA_BASE_URL))
 
         switchJob = lifecycleScope.launch {
             try {
@@ -326,9 +336,13 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
     }
 
     private fun playQuality(gen: Long) {
-        if (gen != switchGen) return
+        if (gen != switchGen || isFinishing || isDestroyed) return
         if (qualityIndex !in qualityList.indices) {
             if (gen == switchGen) {
+                playList.getOrNull(currentIndex)?.rid?.let {
+                    streamCache.remove(it)
+                    streamCacheTime.remove(it)
+                }
                 pendingTipForChannel = null
                 showTip("清晰度解析失败", autoHide = true)
             }
@@ -378,8 +392,8 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
                     override fun onPlayerError(error: PlaybackException) {
                         if (gen != switchGen) return
                         Log.e(TAG, "播放异常: ${error.errorCodeName} | ${error.message}")
-                        val rid = playList.getOrNull(currentIndex)?.rid
-                        if (qualityIndex >= qualityList.lastIndex && rid != null) {
+                        // 播放失败立即失效该房间缓存，避免废流留在缓存里
+                        playList.getOrNull(currentIndex)?.rid?.let { rid ->
                             streamCache.remove(rid)
                             streamCacheTime.remove(rid)
                         }
@@ -446,18 +460,22 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
 
     private suspend fun fetchQualities(baseUrl: String, rid: String): List<Pair<String, String>> =
         withContext(Dispatchers.IO) {
+            val base = ChannelManager.normalizeBaseUrl(baseUrl)
+            val apiUrl = "$base/live.php?rid=${rid.trim()}"
             try {
-                val apiUrl = "${baseUrl.trimEnd('/')}/live.php?rid=${rid.trim()}"
                 val request = Request.Builder()
                     .url(apiUrl)
                     .header("User-Agent", TV_UA)
-                    .header("Referer", "$baseUrl/")
+                    .header("Referer", "$base/")
+                    .header("Accept", "application/json")
                     .get()
                     .build()
 
                 okHttpClient.newCall(request).execute().use { response ->
-                    if (!response.isSuccessful) return@withContext emptyList()
-                    val body = response.body?.string() ?: return@withContext emptyList()
+                    val httpCode = response.code
+                    val body = response.body?.string().orEmpty()
+                    Log.d(TAG, "fetchQualities url=$apiUrl code=$httpCode body=${body.take(200)}")
+                    if (!response.isSuccessful || body.isBlank()) return@withContext emptyList()
                     val json = JSONObject(body)
                     if (json.optInt("code", 0) != 200) return@withContext emptyList()
                     val streamsObj = json.optJSONObject("streams") ?: return@withContext emptyList()
@@ -586,7 +604,11 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
             append("【当前频道流信息】\n")
             append("频道名称：${ch.name}\n")
             append("房间号 (RID)：${ch.rid}\n")
-            append("直播状态：${if (ch.isLive) "在线" else "离线"}\n")
+            append("直播状态：${when {
+                ch.isLive -> "在线"
+                !ch.statusKnown -> "未知"
+                else -> "离线"
+            }}\n")
             append("清晰度流：$curQuality\n")
             append("────────────────\n")
             append("分辨率：${vf?.width ?: "-"} × ${vf?.height ?: "-"}\n")
@@ -737,9 +759,9 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
 
     private fun releaseAll() {
         switchJob?.cancel()
+        switchGen++
+        tipView.removeCallbacks(hideTipRunnable)
         releasePlayerOnly()
-        streamCache.clear()
-        streamCacheTime.clear()
     }
 
     override fun onStop() {

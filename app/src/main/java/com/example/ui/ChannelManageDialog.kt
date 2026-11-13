@@ -213,11 +213,20 @@ fun ChannelManageDialog(
                         onClick = {
                             isImporting = true
                             coroutineScope.launch {
-                                val updated = channelManager.checkLiveStatus("https://tv.fuxiaoya.com", channels)
-                                channelManager.saveChannels(updated)
-                                channels = updated
+                                val outcome = channelManager.probeLiveStatus(ChannelManager.DEFAULT_BASE_URL, channels)
                                 isImporting = false
-                                Toast.makeText(context, "测活完成：在线 ${updated.count { it.isLive }} 台", Toast.LENGTH_SHORT).show()
+                                if (outcome.networkFailed) {
+                                    Toast.makeText(context, "在线检测失败，请检查网络", Toast.LENGTH_SHORT).show()
+                                } else {
+                                    channelManager.saveChannels(outcome.channels)
+                                    channels = outcome.channels
+                                    val msg = if (outcome.unknownCount > 0) {
+                                        "测活完成：在线 ${outcome.liveCount} 台 · ${outcome.unknownCount} 台状态未知"
+                                    } else {
+                                        "测活完成：共 ${outcome.channels.size} 台 · 在线 ${outcome.liveCount} 台"
+                                    }
+                                    Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
+                                }
                             }
                         },
                         enabled = !isImporting,
@@ -308,7 +317,11 @@ fun ChannelManageDialog(
                                         modifier = Modifier
                                             .size(8.dp)
                                             .background(
-                                                if (channel.isLive) DouyinGreen else Color.Gray,
+                                                when {
+                                                    channel.isLive -> DouyinGreen
+                                                    !channel.statusKnown -> Color(0xFFFFB74D)
+                                                    else -> Color.Gray
+                                                },
                                                 CircleShape
                                             )
                                     )

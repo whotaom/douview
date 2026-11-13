@@ -50,12 +50,26 @@ fun TvHomeScreen(
     var showUpdateDialog by remember { mutableStateOf(false) }
     var showChannelDialog by remember { mutableStateOf(false) }
     var channels by remember { mutableStateOf(channelManager.loadChannels()) }
+    var probeStatusTip by remember { mutableStateOf("正在检测在线状态...") }
 
-    // 进入中控台后自动后台轻量探活，动态刷新在线台数
+    // 进入中控台后：先展示本地列表，再自动调用同源 live.php?batch= 探测真实在线状态
     LaunchedEffect(Unit) {
-        val updated = channelManager.checkLiveStatusViaWeb(LivePreferences.DEFAULT_URL, channels)
-        channels = updated
-        channelManager.saveChannels(updated)
+        try {
+            val outcome = channelManager.probeLiveStatus(ChannelManager.DEFAULT_BASE_URL, channels)
+            if (outcome.networkFailed) {
+                probeStatusTip = "在线检测失败，请检查网络"
+                Toast.makeText(context, "在线检测失败，请检查网络", Toast.LENGTH_SHORT).show()
+            } else {
+                channelManager.saveChannels(outcome.channels)
+                channels = outcome.channels
+                probeStatusTip = when {
+                    outcome.unknownCount > 0 -> "在线 ${outcome.liveCount} 台 · ${outcome.unknownCount} 台状态未知"
+                    else -> "状态已同步 · 在线 ${outcome.liveCount} 台"
+                }
+            }
+        } catch (_: Exception) {
+            probeStatusTip = "在线检测失败，请检查网络"
+        }
     }
 
     Column(
@@ -66,7 +80,7 @@ fun TvHomeScreen(
         // 顶部大屏标题栏
         TvTopBar(
             title = "抖眸流控 · 电视大屏监控中控台",
-            subtitle = "当前中控服务: https://tv.fuxiaoya.com · 自动在线测活"
+            subtitle = "当前中控服务: https://tv.fuxiaoya.com · $probeStatusTip"
         ) {
             TvActionButton(
                 text = "频道管理",
@@ -120,7 +134,7 @@ fun TvHomeScreen(
                     horizontalArrangement = Arrangement.spacedBy(14.dp),
                     modifier = Modifier.fillMaxWidth()
                 ) {
-                    items(channels.sortedBy { if (it.isLive) 0 else 1 }) { channel ->
+                    items(channels.sortedWith(compareBy<com.example.tv.channel.Channel>({ if (it.isLive) 0 else if (!it.statusKnown) 1 else 2 }))) { channel ->
                         TvFocusableCard(
                             onClick = {
                                 val intent = Intent(context, TvFullscreenPlayerActivity::class.java).apply {
@@ -137,7 +151,11 @@ fun TvHomeScreen(
                                         modifier = Modifier
                                             .size(8.dp)
                                             .background(
-                                                if (channel.isLive) DouyinGreen else Color.Gray,
+                                                when {
+                                                    channel.isLive -> DouyinGreen
+                                                    !channel.statusKnown -> Color(0xFFFFB74D)
+                                                    else -> Color.Gray
+                                                },
                                                 CircleShape
                                             )
                                     )

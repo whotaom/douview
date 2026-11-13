@@ -1,6 +1,7 @@
 package com.example.tv.channel
 
 import android.content.Context
+import android.util.Log
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
@@ -8,42 +9,138 @@ import okhttp3.Request
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.net.URI
 import java.net.URLEncoder
 import java.util.concurrent.TimeUnit
 
 /**
  * 电视端频道管理器（与 tv_fuxiaoya_com 网页版完全一致）
- * 1. 内置官方默认频道列表（央视网快看、电影频道云影院、央视频等）；
+ * 1. 内置官方默认频道列表（不写死 isLive，全部交由服务端测活确认）；
  * 2. 支持导出为 JSON / 纯房间号 TXT 文件；
  * 3. 支持本地导入（JSON / TXT / CSV）与远程导入（直接拉取或网页版安全代理）；
- * 4. 支持合并或替换现有列表，持久化保存。
+ * 4. 权威测活（与网页版 live.php?batch= 完全同源：只认 status=="live"，unknown 不强改离线）。
  */
 class ChannelManager(private val context: Context) {
 
     companion object {
+        private const val TAG = "Probe"
         private const val PREFS_NAME = "tv_channels_v1"
         private const val KEY_CHANNELS = "channels_json"
         private const val EXPORT_DIR_NAME = "DouyinLiveChannels"
+        const val DEFAULT_BASE_URL = "https://tv.fuxiaoya.com"
+        const val TV_UA =
+            "Mozilla/5.0 (Linux; Android 13; TV) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
+        private val RID_REGEX = Regex("^\\d{3,22}$")
+
+        /**
+         * 规范化基础域名，去除多余 path 与尾部斜杠，确保始终拼出 https://host/live.php
+         */
+        fun normalizeBaseUrl(rawUrl: String?): String {
+            val trimmed = rawUrl?.trim()?.trimEnd('/') ?: ""
+            if (trimmed.isBlank()) return DEFAULT_BASE_URL
+            return try {
+                val uri = URI(trimmed)
+                val scheme = uri.scheme
+                val authority = uri.authority
+                if (!scheme.isNullOrBlank() && !authority.isNullOrBlank()) {
+                    "$scheme://$authority"
+                } else {
+                    trimmed.removeSuffix("/live.php").trimEnd('/')
+                }
+            } catch (_: Exception) {
+                trimmed.removeSuffix("/live.php").trimEnd('/')
+            }
+        }
+
+        /**
+         * 解析网页版 live.php?batch= 返回的权威 JSON：
+         * {
+         *   "code": 200,
+         *   "batch": {
+         *     "127453393722": { "status": "live" | "offline" | "unknown", "title": "...", "avatar": "...", "name": "..." }
+         *   }
+         * }
+         * 规则：
+         * - "live" -> isLive = true, statusKnown = true
+         * - "offline" -> isLive = false, statusKnown = true
+         * - "unknown" / 其他 -> 绝不强改原 isLive，仅标 statusKnown = false
+         * 若 code != 200 或 batch 缺失/为空，返回 null（不破坏本地列表）。
+         */
+        fun applyBatchProbeJson(
+            currentMap: MutableMap<String, Channel>,
+            jsonBody: String
+        ): Boolean {
+            if (jsonBody.isBlank()) return false
+            val root = try {
+                JSONObject(jsonBody)
+            } catch (_: Exception) {
+                return false
+            }
+
+            val code = root.optInt("code", 0)
+            val batch = root.optJSONObject("batch")
+            if (code != 200 || batch == null || batch.length() == 0) {
+                return false
+            }
+
+            val keys = batch.keys()
+            while (keys.hasNext()) {
+                val rid = keys.next()
+                val old = currentMap[rid] ?: continue
+                val item = batch.optJSONObject(rid) ?: continue
+
+                val statusStr = item.optString("status", "").trim().lowercase()
+                val nextName = item.optString("name", "").trim().takeIf { it.isNotBlank() } ?: old.name
+                val nextTitle = item.optString("title", "").trim().takeIf { it.isNotBlank() } ?: old.title
+                val nextAvatar = item.optString("avatar", "").trim().takeIf { it.isNotBlank() } ?: old.avatar
+
+                currentMap[rid] = when (statusStr) {
+                    "live" -> old.copy(
+                        isLive = true,
+                        statusKnown = true,
+                        name = nextName,
+                        title = nextTitle,
+                        avatar = nextAvatar
+                    )
+                    "offline" -> old.copy(
+                        isLive = false,
+                        statusKnown = true,
+                        name = nextName,
+                        title = nextTitle,
+                        avatar = nextAvatar
+                    )
+                    else -> old.copy(
+                        // unknown：保留原 isLive，仅标记状态未知
+                        statusKnown = false,
+                        name = nextName,
+                        title = nextTitle,
+                        avatar = nextAvatar
+                    )
+                }
+            }
+            return true
+        }
     }
 
     private val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 
     private val okHttp = OkHttpClient.Builder()
-        .connectTimeout(15, TimeUnit.SECONDS)
-        .readTimeout(20, TimeUnit.SECONDS)
+        .connectTimeout(8, TimeUnit.SECONDS)
+        .readTimeout(12, TimeUnit.SECONDS)
         .followRedirects(true)
         .build()
 
-    // 与网页版完全一致的默认频道
+    // 与网页版完全一致的默认频道（不预设写死 isLive，由服务端 live.php?batch= 探测）
     fun getDefaultChannels(): List<Channel> = listOf(
-        Channel("127453393722", "央视网快看", "总台央视新闻频道正在播出", isLive = true),
-        Channel("232551178364", "电影频道云影院", "直播丨𝐂𝐂𝐓𝐕𝟔电影频道🎬", isLive = true),
-        Channel("50828500437", "央视频", "新闻正在直播", isLive = true),
-        Channel("783811579858", "央视三农", "CCTV-17节目真好看！", isLive = true),
-        Channel("193671986973", "安静听歌（24小时听歌）", "热门流行伤感经典好听伤感怀旧音乐老歌1000首！", isLive = true),
-        Channel("662843050230", "央视文艺", "金秋综艺特辑", isLive = false),
-        Channel("971054279946", "央视网美学", "央视纪录片频道直播", isLive = false),
-        Channel("296728101980", "央视网财经", "央视财经频道节目直播", isLive = false)
+        Channel("127453393722", "央视网快看", "总台央视新闻频道正在播出"),
+        Channel("232551178364", "电影频道云影院", "直播丨𝐂𝐂𝐓𝐕𝟔电影频道🎬"),
+        Channel("50828500437", "央视频", "新闻正在直播"),
+        Channel("783811579858", "央视三农", "CCTV-17节目真好看！"),
+        Channel("193671986973", "安静听歌（24小时听歌）", "热门流行伤感经典好听伤感怀旧音乐老歌1000首！"),
+        Channel("662843050230", "央视文艺", "金秋综艺特辑"),
+        Channel("971054279946", "央视网美学", "央视纪录片频道直播"),
+        Channel("296728101980", "央视网财经", "央视财经频道节目直播")
     )
 
     /**
@@ -116,10 +213,10 @@ class ChannelManager(private val context: Context) {
             .filter { it.isNotEmpty() && !it.startsWith("#") }
             .mapNotNull { line ->
                 val parts = line.split(",", "\t", " ").map { it.trim().removeSurrounding("\"") }
-                val rid = parts.firstOrNull { it.matches(Regex("\\d{3,22}")) } ?: return@mapNotNull null
+                val rid = parts.firstOrNull { it.matches(RID_REGEX) } ?: return@mapNotNull null
                 val name = parts.getOrNull(1)?.ifBlank { "房间 $rid" } ?: "房间 $rid"
                 val title = parts.getOrNull(2) ?: ""
-                Channel(rid = rid, name = name, title = title, isLive = true)
+                Channel(rid = rid, name = name, title = title, isLive = false, statusKnown = false)
             }
             .distinctBy { it.rid }
     }
@@ -131,10 +228,7 @@ class ChannelManager(private val context: Context) {
         try {
             val request = Request.Builder()
                 .url(url.trim())
-                .header(
-                    "User-Agent",
-                    "Mozilla/5.0 (Linux; Android 13; TV) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
-                )
+                .header("User-Agent", TV_UA)
                 .get()
                 .build()
 
@@ -161,11 +255,13 @@ class ChannelManager(private val context: Context) {
     suspend fun remoteImportViaProxy(baseUrl: String, remoteUrl: String): Result<List<Channel>> =
         withContext(Dispatchers.IO) {
             try {
+                val base = normalizeBaseUrl(baseUrl)
                 val encodedUrl = URLEncoder.encode(remoteUrl.trim(), "UTF-8")
-                val proxyUrl = "${baseUrl.trimEnd('/')}/live.php?action=remote_import&remote_url=$encodedUrl"
+                val proxyUrl = "$base/live.php?action=remote_import&remote_url=$encodedUrl"
                 val request = Request.Builder()
                     .url(proxyUrl)
-                    .header("User-Agent", "Mozilla/5.0 (Linux; Android 13; TV) AppleWebKit/537.36")
+                    .header("User-Agent", TV_UA)
+                    .header("Referer", "$base/")
                     .get()
                     .build()
 
@@ -204,99 +300,92 @@ class ChannelManager(private val context: Context) {
     }
 
     /**
-     * 与网页版一致的权威测活：
-     * GET live.php?batch=rid1,rid2,...
-     * 解析 batch 结果更新 isLive，以线上真实返回为准
+     * 与网页版 live.php?batch= 完全一致的权威测活：
+     * - 每批最多 20 个（与 PHP 一致）
+     * - status == "live" -> isLive = true, statusKnown = true
+     * - status == "offline" -> isLive = false, statusKnown = true
+     * - status == "unknown" / 失败 -> 不强改 isLive，仅标记 statusKnown = false
      */
-    suspend fun checkLiveStatusViaWeb(
-        baseUrl: String = "https://tv.fuxiaoya.com",
+    suspend fun probeLiveStatus(
+        baseUrl: String = DEFAULT_BASE_URL,
         channels: List<Channel>
-    ): List<Channel> = withContext(Dispatchers.IO) {
-        if (channels.isEmpty()) return@withContext channels
+    ): ProbeOutcome = withContext(Dispatchers.IO) {
+        if (channels.isEmpty()) {
+            return@withContext ProbeOutcome(channels = channels, networkFailed = false)
+        }
 
-        val resultMap = channels.associate { it.rid to it }.toMutableMap()
-        var batchSuccessCount = 0
+        val map = channels.associateBy { it.rid }.toMutableMap()
+        val base = normalizeBaseUrl(baseUrl)
+        var anySucceeded = false
+        var anyAttempted = false
 
-        // 1. 优先尝试与网页版同源的 batch 接口 (15 个一组)
-        channels.chunked(15).forEach { chunk ->
+        channels.chunked(20).forEach { chunk ->
+            val ids = chunk.map { it.rid.trim() }.filter { it.matches(RID_REGEX) }
+            if (ids.isEmpty()) return@forEach
+            anyAttempted = true
+
+            val url = "$base/live.php?batch=${ids.joinToString(",")}"
             try {
-                val ids = chunk.joinToString(",") { it.rid }
-                val url = "${baseUrl.trimEnd('/')}/live.php?batch=$ids"
                 val req = Request.Builder()
                     .url(url)
-                    .header("User-Agent", "Mozilla/5.0 (Linux; Android 13; TV) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36")
-                    .header("Referer", "$baseUrl/")
+                    .header("User-Agent", TV_UA)
+                    .header("Referer", "$base/")
+                    .header("Accept", "application/json")
                     .get()
                     .build()
 
                 okHttp.newCall(req).execute().use { resp ->
-                    if (resp.isSuccessful) {
-                        val body = resp.body?.string() ?: ""
-                        val root = JSONObject(body)
-                        if (root.optInt("code", 0) == 200) {
-                            val batch = root.optJSONObject("batch")
-                            if (batch != null && batch.length() > 0) {
-                                chunk.forEach { ch ->
-                                    val chObj = batch.optJSONObject(ch.rid)
-                                    val old = resultMap[ch.rid] ?: ch
-                                    if (chObj != null) {
-                                        batchSuccessCount++
-                                        val streams = chObj.optJSONObject("streams")
-                                        val status = chObj.optInt("status", -1)
-                                        val hasLiveFlag = chObj.has("is_live") || chObj.has("isLive")
-                                        val flag = when {
-                                            hasLiveFlag -> chObj.optBoolean("is_live", chObj.optBoolean("isLive", false))
-                                            status == 2 -> true // 抖音常见开播 status
-                                            streams != null && streams.length() > 0 -> true
-                                            else -> false
-                                        }
-                                        resultMap[ch.rid] = old.copy(isLive = flag)
-                                    }
-                                }
-                            }
-                        }
+                    val httpCode = resp.code
+                    if (httpCode == 304) {
+                        Log.d(TAG, "url=$url code=304 (unchanged)")
+                        anySucceeded = true
+                        return@use
+                    }
+                    val body = resp.body?.string().orEmpty()
+                    Log.d(TAG, "url=$url code=$httpCode body=${body.take(200)}")
+
+                    if (!resp.isSuccessful) {
+                        Log.w(TAG, "HTTP $httpCode for batch url=$url")
+                        return@use
+                    }
+
+                    val ok = applyBatchProbeJson(map, body)
+                    if (ok) {
+                        anySucceeded = true
+                    } else {
+                        Log.w(TAG, "bad batch response for url=$url body=${body.take(200)}")
                     }
                 }
-            } catch (_: Exception) {}
-        }
-
-        // 2. 兜底回退：如果 batch 接口未返回结果（某些代理节点不支持 batch 参数），并发单房探测
-        if (batchSuccessCount == 0) {
-            channels.forEach { ch ->
-                try {
-                    val url = "${baseUrl.trimEnd('/')}/live.php?rid=${ch.rid.trim()}"
-                    val req = Request.Builder()
-                        .url(url)
-                        .header("User-Agent", "Mozilla/5.0 (Linux; Android 13; TV) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36")
-                        .header("Referer", "$baseUrl/")
-                        .get()
-                        .build()
-
-                    okHttp.newCall(req).execute().use { resp ->
-                        if (resp.isSuccessful) {
-                            val body = resp.body?.string() ?: ""
-                            val root = JSONObject(body)
-                            val code = root.optInt("code", 0)
-                            val streams = root.optJSONObject("streams")
-                            val isLive = (code == 200 && streams != null && streams.length() > 0)
-                            val old = resultMap[ch.rid] ?: ch
-                            resultMap[ch.rid] = old.copy(isLive = isLive)
-                        }
-                    }
-                } catch (_: Exception) {}
+            } catch (e: Exception) {
+                Log.e(TAG, "batch failed url=$url", e)
             }
         }
 
-        channels.map { resultMap[it.rid] ?: it }
+        val updated = channels.map { map[it.rid] ?: it }
+        val liveCount = updated.count { it.isLive }
+        val unknownCount = updated.count { !it.statusKnown }
+        Log.d(TAG, "probe finished total=${updated.size} live=$liveCount unknown=$unknownCount anySucceeded=$anySucceeded")
+
+        ProbeOutcome(
+            channels = updated,
+            networkFailed = anyAttempted && !anySucceeded,
+            liveCount = liveCount,
+            unknownCount = unknownCount
+        )
     }
 
     /**
-     * 兼容接口：调用与网页版一致的测活
+     * 兼容接口：直接返回更新后的列表（失败时保留原列表不清空）
      */
-    suspend fun checkLiveStatus(
-        baseUrl: String = "https://tv.fuxiaoya.com",
+    suspend fun checkLiveStatusViaWeb(
+        baseUrl: String = DEFAULT_BASE_URL,
         channels: List<Channel>
-    ): List<Channel> = checkLiveStatusViaWeb(baseUrl, channels)
+    ): List<Channel> = probeLiveStatus(baseUrl, channels).channels
+
+    suspend fun checkLiveStatus(
+        baseUrl: String = DEFAULT_BASE_URL,
+        channels: List<Channel>
+    ): List<Channel> = probeLiveStatus(baseUrl, channels).channels
 
     private fun parseJsonArray(jsonStr: String): List<Channel> {
         return try {
@@ -305,14 +394,15 @@ class ChannelManager(private val context: Context) {
             for (i in 0 until array.length()) {
                 val obj = array.optJSONObject(i) ?: continue
                 val rid = obj.optString("rid").trim()
-                if (rid.matches(Regex("\\d{3,22}"))) {
+                if (rid.matches(RID_REGEX)) {
                     list.add(
                         Channel(
                             rid = rid,
                             name = obj.optString("name", "房间 $rid").ifBlank { "房间 $rid" },
                             title = obj.optString("title", ""),
                             avatar = obj.optString("avatar", ""),
-                            isLive = obj.optBoolean("isLive", true)
+                            isLive = obj.optBoolean("isLive", false),
+                            statusKnown = obj.optBoolean("statusKnown", false)
                         )
                     )
                 }
@@ -332,6 +422,7 @@ class ChannelManager(private val context: Context) {
                 put("title", c.title)
                 put("avatar", c.avatar)
                 put("isLive", c.isLive)
+                put("statusKnown", c.statusKnown)
             }
             array.put(obj)
         }
