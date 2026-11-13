@@ -1,7 +1,6 @@
 package com.example.tv.player
 
-import android.graphics.Bitmap
-import android.graphics.BitmapFactory
+import android.content.Intent
 import android.graphics.Color
 import android.net.Uri
 import android.os.Build
@@ -10,7 +9,6 @@ import android.os.Handler
 import android.os.Looper
 import android.text.TextUtils
 import android.util.Log
-import android.util.LruCache
 import android.view.Gravity
 import android.view.KeyEvent
 import android.view.View
@@ -22,19 +20,19 @@ import android.widget.ScrollView
 import android.widget.TextView
 import androidx.activity.ComponentActivity
 import androidx.activity.OnBackPressedCallback
-import android.view.LayoutInflater
 import androidx.annotation.OptIn
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.lifecycle.lifecycleScope
+import androidx.media3.common.AudioAttributes
+import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.common.VideoSize
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.DefaultHttpDataSource
-import android.content.Intent
 import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
@@ -61,12 +59,12 @@ import org.json.JSONObject
 import java.util.concurrent.TimeUnit
 
 /**
- * 电视大屏全屏直播播放器（顶级 TV 直播客户端方案）
- * 1. 主画面永远优先 SurfaceView 硬件直出（RESIZE_MODE_FIT 不拉伸），彻底规避 RK3528 / H96 等盒子 TextureView 黑屏
- * 2. 竖屏动态背景：未出首帧使用主播头像轻虚化占位；出首帧后通过 PixelCopy 异步采集 SurfaceView 实况帧 + 黑帧过滤 + 轻磨砂铺满左右
- * 3. 「先备后切」(prepare-then-swap)：冷启动直绑 Surface 避免丢首帧 IDR；切台后台静默缓冲至 READY 再瞬切并释放旧解码器，避免双路 VPU 抢占
- * 4. 硬件解码首帧超时（4.5s）或解码异常时自动降级软件兼容解码重试，彻底防止单台卡黑屏
- * 5. 菜单仅展示在线频道，标题带实时在线台数「在线频道（N）」；OK 键技术面板 1 秒实时刷新
+ * 电视大屏全屏直播播放器（极简高稳单个 PlayerView 架构）
+ * 1. 仅使用单个原生 SurfaceView PlayerView（RESIZE_MODE_FIT），彻底移除动态背景采样与头像背景，杜绝黑屏与表面冲突
+ * 2. 竖屏直播两侧展示符合系统暗夜霓虹风格的固定竖屏背景图，横屏直播自动隐藏显纯暗底
+ * 3. 「先备后切」(prepare-then-swap)：冷启动直绑 Surface；切台后台静默缓冲至 READY 再瞬切并立即释放旧解码器
+ * 4. 硬件解码首帧超时（4.5s）或解码异常自动切软件兼容解码；支持直播窗口落后（BEHIND_LIVE_WINDOW）无缝回拉直播前沿
+ * 5. 菜单仅展示在线频道并带实时在线台数「在线频道（N）」；OK 键技术参数面板 1 秒实时刷新
  */
 class TvFullscreenPlayerActivity : ComponentActivity() {
 
@@ -82,20 +80,26 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         const val EXTRA_BASE_URL = "extra_base_url"
         const val EXTRA_LINE = "extra_line"
         const val EXTRA_TITLE = "extra_title"
-        const val EXTRA_AVATAR = "extra_avatar"
 
         // 全局静态流缓存 (rid -> 清晰度列表)，支持 5 分钟有效时间
         val streamCache = mutableMapOf<String, List<Pair<String, String>>>()
         val streamCacheTime = mutableMapOf<String, Long>()
         const val CACHE_TTL = 5 * 60 * 1000L
 
-        // 轻微模糊头像内存缓存（未出首帧或采样退避时占位用）
-        private val blurredAvatarCache = LruCache<String, Bitmap>(16)
-
         fun clearStreamCache() {
             streamCache.clear()
             streamCacheTime.clear()
-            blurredAvatarCache.evictAll()
+        }
+
+        fun isPortraitVideo(videoWidth: Int, videoHeight: Int, pixelWidthHeightRatio: Float = 1f): Boolean {
+            if (videoWidth <= 0 || videoHeight <= 0) return true
+            val effectiveW = (videoWidth * pixelWidthHeightRatio).toInt().coerceAtLeast(1)
+            return videoHeight > effectiveW
+        }
+
+        fun normalizeStreamUrl(raw: String?): String {
+            val trimmed = raw?.trim().orEmpty()
+            return if (trimmed.startsWith("//")) "https:$trimmed" else trimmed
         }
     }
 
@@ -103,11 +107,9 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
     private lateinit var preferences: LivePreferences
     private var currentLine: Int = 1
 
-    // UI 组件
+    // UI 组件（单个 PlayerView + 固定竖屏背景图）
     private lateinit var root: FrameLayout
-    private lateinit var posterBg: ImageView               // 未出首帧（及采样退避时）主播头像虚化占位
-    private lateinit var liveBg: ImageView                 // 出首帧后 PixelCopy 实况采样双缓冲背景
-    private lateinit var playerHost: FrameLayout           // 唯一全屏主播放器宿主容器
+    private lateinit var portraitBackdrop: ImageView       // 固定系统风格竖屏背景图
     private lateinit var playerView: PlayerView            // 唯一全屏主播放器（SurfaceView + RESIZE_MODE_FIT）
     private lateinit var tipView: TextView                 // 顶部高层级换台与状态提示
     private lateinit var channelMenu: FrameLayout          // 左侧在线选台悬浮面板
@@ -120,12 +122,9 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
     private var preparingPlayer: ExoPlayer? = null
     private var isMenuShowing = false
     private var isInfoShowing = false
+    private var wasStoppedInBackground = false
 
-    // 竖屏动态背景与黑屏自愈状态
-    private var currentSurfaceMode: PlayerSurfaceMode = PlayerSurfaceMode.SURFACE_VIEW
-    private lateinit var dynamicBgController: LiveDynamicBackgroundController
-    private var avatarLoadJob: Job? = null
-    private var currentAvatarUrl: String? = null
+    // 画面比例与解码自愈状态
     private var isPortraitStream: Boolean = true
     private var hasRenderedFirstFrameForCurrent: Boolean = false
     private var preferSoftwareDecoderForCurrent: Boolean = false
@@ -141,6 +140,7 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
 
     // 单飞 Job、防竞态、自动跳台防死循环
     private var switchJob: Job? = null
+    private var probeJob: Job? = null
     private var switchGen = 0L
     private var lastSwitchAt = 0L
     private val SWITCH_MIN_INTERVAL = 250L
@@ -209,49 +209,24 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         return StreamLines.baseUrl(currentLine)
     }
 
-    // -------------------- UI 结构构建与动态背景控制 --------------------
+    // -------------------- UI 结构构建 --------------------
 
     @OptIn(UnstableApi::class)
     private fun buildUi() {
         setContentView(R.layout.activity_tv_fullscreen_player)
         root = findViewById(R.id.rootContainer)
-        posterBg = findViewById(R.id.posterBg)
-        liveBg = findViewById(R.id.liveBg)
-        playerHost = findViewById(R.id.playerHost)
+        portraitBackdrop = findViewById(R.id.portraitBackdrop)
+        playerView = findViewById(R.id.playerView)
         tipView = findViewById(R.id.tipView)
 
-        root.setBackgroundColor(Color.BLACK)
-        posterBg.scaleType = ImageView.ScaleType.CENTER_CROP
-        posterBg.setBackgroundColor(Color.BLACK)
-        posterBg.alpha = LiveDynamicBackgroundConfig.POSTER_ALPHA
+        root.setBackgroundColor(Color.parseColor("#09090C"))
+        portraitBackdrop.visibility = if (isPortraitStream) View.VISIBLE else View.GONE
 
-        liveBg.scaleType = ImageView.ScaleType.CENTER_CROP
-        liveBg.scaleX = LiveDynamicBackgroundConfig.LIVE_SCALE
-        liveBg.scaleY = LiveDynamicBackgroundConfig.LIVE_SCALE
-        liveBg.alpha = LiveDynamicBackgroundConfig.LIVE_ALPHA
-
-        currentSurfaceMode = LiveDynamicBackgroundConfig.resolveSurfaceType(
-            preferDynamicBg = true,
-            textureViewBlacklisted = preferences.textureViewBlacklisted
-        )
-        inflatePlayerView(currentSurfaceMode)
-
-        dynamicBgController = LiveDynamicBackgroundController(
-            scope = lifecycleScope,
-            targetHeight = LiveDynamicBackgroundConfig.resolveTargetHeight(this)
-        ) { frame ->
-            if (isFinishing || isDestroyed) return@LiveDynamicBackgroundController
-            if (frame != null && !frame.isRecycled && isPortraitStream) {
-                liveBg.setImageBitmap(frame)
-                liveBg.visibility = View.VISIBLE
-                posterBg.visibility = View.GONE
-            } else {
-                liveBg.setImageDrawable(null)
-                liveBg.visibility = View.GONE
-                refreshPosterVisibility()
-            }
-        }
-        dynamicBgController.attachPlayerView(playerView)
+        playerView.useController = false
+        playerView.resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
+        playerView.setBackgroundColor(Color.TRANSPARENT)
+        playerView.setShutterBackgroundColor(Color.TRANSPARENT)
+        playerView.keepScreenOn = true
 
         // 1. 左侧在线选台悬浮面板（仅占 400dp，无全屏遮罩）
         channelMenu = FrameLayout(this).apply {
@@ -302,35 +277,17 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         root.addView(infoOverlay)
     }
 
-    @OptIn(UnstableApi::class)
-    private fun inflatePlayerView(mode: PlayerSurfaceMode) {
-        val layoutRes = if (mode == PlayerSurfaceMode.TEXTURE_VIEW) {
-            R.layout.view_player_texture
-        } else {
-            R.layout.view_player_surface
-        }
-        playerHost.removeAllViews()
-        val inflated = LayoutInflater.from(this).inflate(layoutRes, playerHost, false) as PlayerView
-        inflated.useController = false
-        inflated.resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
-        inflated.setBackgroundColor(Color.TRANSPARENT)
-        inflated.setShutterBackgroundColor(Color.TRANSPARENT)
-        playerHost.addView(inflated)
-        playerView = inflated
-    }
-
     // -------------------- 播放与切台核心逻辑 --------------------
 
     private fun setupPlayListAndStart() {
-        val directStreamUrl = intent.getStringExtra(EXTRA_STREAM_URL)?.trim()
-        if (!directStreamUrl.isNullOrBlank()) {
-            val extraAvatar = intent.getStringExtra(EXTRA_AVATAR)?.trim().orEmpty()
-            playList = listOf(Channel(rid = "direct", name = "直接媒体流", avatar = extraAvatar, isLive = true, statusKnown = true))
+        probeJob?.cancel()
+
+        val directStreamUrl = normalizeStreamUrl(intent.getStringExtra(EXTRA_STREAM_URL))
+        if (directStreamUrl.isNotBlank()) {
+            playList = listOf(Channel(rid = "direct", name = "直接媒体流", isLive = true, statusKnown = true))
             currentIndex = 0
             qualityList = listOf("默认流" to directStreamUrl)
             qualityIndex = 0
-            dynamicBgController.onChannelChanged("direct")
-            bindPosterPlaceholder(extraAvatar)
             prepareThenSwap(++switchGen, directStreamUrl, "直接媒体流")
             return
         }
@@ -345,14 +302,12 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
 
         if (targetRid.isNullOrBlank() && rawUrl.isNotBlank()) {
             if (rawUrl.endsWith(".m3u8") || rawUrl.contains(".m3u8?")) {
-                val extraAvatar = intent.getStringExtra(EXTRA_AVATAR)?.trim().orEmpty()
-                playList = listOf(Channel(rid = "direct", name = "直接流媒体", avatar = extraAvatar, isLive = true, statusKnown = true))
+                val normalized = normalizeStreamUrl(rawUrl)
+                playList = listOf(Channel(rid = "direct", name = "直接流媒体", isLive = true, statusKnown = true))
                 currentIndex = 0
-                qualityList = listOf("默认流" to rawUrl)
+                qualityList = listOf("默认流" to normalized)
                 qualityIndex = 0
-                dynamicBgController.onChannelChanged("direct")
-                bindPosterPlaceholder(extraAvatar)
-                prepareThenSwap(++switchGen, rawUrl, "直接流媒体")
+                prepareThenSwap(++switchGen, normalized, "直接流媒体")
                 return
             }
             try {
@@ -365,13 +320,9 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
             }
         }
 
-        val extraAvatar = intent.getStringExtra(EXTRA_AVATAR)?.trim().orEmpty()
         if (!targetRid.isNullOrBlank()) {
             val existingIndex = sortedChannels.indexOfFirst { it.rid == targetRid }
             if (existingIndex >= 0) {
-                if (extraAvatar.isNotBlank() && sortedChannels[existingIndex].avatar.isBlank()) {
-                    sortedChannels[existingIndex] = sortedChannels[existingIndex].copy(avatar = extraAvatar)
-                }
                 currentIndex = existingIndex
             } else {
                 sortedChannels.add(
@@ -379,7 +330,6 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
                     Channel(
                         rid = targetRid,
                         name = intent.getStringExtra(EXTRA_TITLE)?.takeIf { it.isNotBlank() } ?: "自定义频道 ($targetRid)",
-                        avatar = extraAvatar,
                         isLive = true,
                         statusKnown = false
                     )
@@ -393,36 +343,31 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         playList = sortedChannels
         switchToChannel(currentIndex, force = true)
 
-        // 异步与当前线路同源测活，保证菜单展示真实在线台数与状态，同步最新头像并锁定 currentIndex 不偏移
+        // 异步与当前线路同源测活，保证菜单展示真实在线台数与状态并锁定 currentIndex 不偏移
         val base = activeBaseUrl()
-        lifecycleScope.launch {
+        probeJob = lifecycleScope.launch {
             val outcome = channelManager.probeLiveStatus(base, playList)
-            if (!outcome.networkFailed) {
-                val playingRid = playList.getOrNull(currentIndex)?.rid
-                val sorted = outcome.channels.sortedWith(
-                    compareBy { if (it.isLive) 0 else if (!it.statusKnown) 1 else 2 }
-                )
-                playList = sorted
-                if (playingRid != null) {
-                    val syncedIdx = sorted.indexOfFirst { it.rid == playingRid }
-                    if (syncedIdx >= 0) {
-                        currentIndex = syncedIdx
-                        val updatedAvatar = sorted[syncedIdx].avatar
-                        if (updatedAvatar.isNotBlank() && updatedAvatar != currentAvatarUrl) {
-                            bindPosterPlaceholder(updatedAvatar)
-                        }
-                    }
+            if (!isActive || outcome.networkFailed) return@launch
+            val playingRid = playList.getOrNull(currentIndex)?.rid
+            val sorted = outcome.channels.sortedWith(
+                compareBy { if (it.isLive) 0 else if (!it.statusKnown) 1 else 2 }
+            )
+            playList = sorted
+            if (playingRid != null) {
+                val syncedIdx = sorted.indexOfFirst { it.rid == playingRid }
+                if (syncedIdx >= 0) {
+                    currentIndex = syncedIdx
                 }
-                channelManager.saveChannels(sorted)
             }
+            channelManager.saveChannels(sorted)
         }
     }
 
     /**
      * 单飞换台（「先备后切」）：
      * 1. 取消未完成的换台协程并释放未上屏的备播 Player
-     * 2. 换台过程中 **不停止当前正在播放的旧流**，杜绝黑场/断音
-     * 3. 新流在后台 ExoPlayer 准备至 STATE_READY 后，瞬间阻断旧流并切换上屏
+     * 2. 换台过程中不停止当前正在播放的旧流，避免中途黑场或断音
+     * 3. 新流在后台备播至 STATE_READY 后，瞬时切换并释放旧播放器
      */
     private fun switchToChannel(
         index: Int,
@@ -460,23 +405,20 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
             showTip("正在切换到：${channel.name}", autoHide = false)
         }
         preferSoftwareDecoderForCurrent = false
-        // 切台时立即清空上一频道的实况背景帧，并以未出首帧海报占位
-        dynamicBgController.onChannelChanged(channel.rid)
-        bindPosterPlaceholder(channel.avatar)
 
         val base = activeBaseUrl()
 
         switchJob = lifecycleScope.launch {
             try {
-                val fetched = withContext(Dispatchers.IO) {
+                val list = withContext(Dispatchers.IO) {
                     val cached = streamCache[channel.rid]
                     val t = streamCacheTime[channel.rid] ?: 0L
                     if (cached != null && now - t < CACHE_TTL && cached.isNotEmpty()) {
-                        cached to null
+                        cached
                     } else {
-                        fetchQualitiesWithAvatar(base, channel.rid).also { (list, _) ->
-                            if (list.isNotEmpty()) {
-                                streamCache[channel.rid] = list
+                        fetchQualities(base, channel.rid).also { fetched ->
+                            if (fetched.isNotEmpty()) {
+                                streamCache[channel.rid] = fetched
                                 streamCacheTime[channel.rid] = System.currentTimeMillis()
                             }
                         }
@@ -484,16 +426,6 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
                 }
 
                 if (gen != switchGen || !isActive) return@launch
-
-                val (list, fetchedAvatar) = fetched
-                if (!fetchedAvatar.isNullOrBlank() && fetchedAvatar != currentAvatarUrl) {
-                    val updated = playList.toMutableList()
-                    if (index in updated.indices) {
-                        updated[index] = updated[index].copy(avatar = fetchedAvatar)
-                        playList = updated
-                    }
-                    bindPosterPlaceholder(fetchedAvatar)
-                }
 
                 if (list.isEmpty()) {
                     onChannelUnplayable("无法播放")
@@ -547,9 +479,9 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
 
     /**
      * 准备新流并切换：
-     * - 冷启动（player == null）：直接绑定 playerView 再 prepare，保证首帧 IDR 直接落到 SurfaceView，杜绝无 Surface 丢帧黑屏
-     * - 换台（player != null）：新播放器以 playWhenReady = false 后台静默缓冲至 STATE_READY，保持旧流不中断；
-     *   就绪瞬间切流并立即释放旧播放器，防止低端 TV 盒子双路硬件 VPU 内存抢占导致的黑屏
+     * - 冷启动（player == null）：直接绑定 playerView 再 prepare，确保首帧 IDR 直接落到 SurfaceView
+     * - 换台（player != null）：新播放器以 playWhenReady = false 后台静默缓冲至 STATE_READY，保持旧流不断；
+     *   就绪瞬间切流并立即释放旧播放器，避免低端 TV 盒子双路硬件 VPU 内存抢占导致的黑屏
      */
     @OptIn(UnstableApi::class)
     private fun prepareThenSwap(
@@ -586,10 +518,17 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
             .setReadTimeoutMs(15_000)
         val mediaSourceFactory = DefaultMediaSourceFactory(this).setDataSourceFactory(dataSourceFactory)
 
+        val audioAttributes = AudioAttributes.Builder()
+            .setUsage(C.USAGE_MEDIA)
+            .setContentType(C.AUDIO_CONTENT_TYPE_MOVIE)
+            .build()
+
         val next = ExoPlayer.Builder(this, renderersFactory)
             .setTrackSelector(trackSelector)
             .setLoadControl(loadControl)
             .setMediaSourceFactory(mediaSourceFactory)
+            .setAudioAttributes(audioAttributes, true)
+            .setWakeMode(C.WAKE_MODE_NETWORK)
             .build()
 
         val isColdStart = (player == null)
@@ -597,26 +536,13 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
             player = next
             preparingPlayer = null
             hasRenderedFirstFrameForCurrent = false
-            val currentRid = playList.getOrNull(currentIndex)?.rid ?: name
-            dynamicBgController.onChannelChanged(currentRid)
-            dynamicBgController.setHasRenderedFirstFrame(false)
             playerView.resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
             playerView.player = next
-            dynamicBgController.attachPlayerView(playerView)
-            dynamicBgController.setPlaying(true)
         } else {
             preparingPlayer = next
         }
 
         next.addListener(object : Player.Listener {
-            override fun onIsPlayingChanged(isPlaying: Boolean) {
-                if (player === next) {
-                    dynamicBgController.setPlaying(
-                        isPlaying || (next.playbackState == Player.STATE_READY && next.playWhenReady)
-                    )
-                }
-            }
-
             override fun onPlaybackStateChanged(state: Int) {
                 if (gen != switchGen) return
                 when (state) {
@@ -625,7 +551,6 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
                         if (preparingPlayer === next) {
                             showTip("正在切换到：$name（缓冲中）", autoHide = false)
                         } else if (player === next) {
-                            dynamicBgController.setPlaying(false)
                             val qLabel = qualityList.getOrNull(qualityIndex)?.first ?: "默认"
                             showTip("正在缓冲 [$qLabel]...", autoHide = false)
                         }
@@ -635,7 +560,6 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
                         if (preparingPlayer === next) {
                             swapTo(next, gen, name)
                         } else if (player === next) {
-                            dynamicBgController.setPlaying(next.isPlaying || next.playWhenReady)
                             if (!hasRenderedFirstFrameForCurrent &&
                                 next.playWhenReady &&
                                 next.videoFormat != null
@@ -650,7 +574,6 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
                     Player.STATE_ENDED -> {
                         cancelBufferingTimeout()
                         if (player === next) {
-                            dynamicBgController.setPlaying(false)
                             onChannelUnplayable("直播已结束")
                         }
                     }
@@ -662,7 +585,7 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
                 cancelBufferingTimeout()
                 Log.i(
                     TAG,
-                    "onRenderedFirstFrame model=${Build.MODEL} surface=$currentSurfaceMode sw=$preferSoftwareDecoderForCurrent channel=$name size=${next.videoSize.width}x${next.videoSize.height}"
+                    "onRenderedFirstFrame model=${Build.MODEL} sw=$preferSoftwareDecoderForCurrent channel=$name size=${next.videoSize.width}x${next.videoSize.height}"
                 )
                 if (preparingPlayer === next) {
                     swapTo(next, gen, name)
@@ -671,11 +594,8 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
                     cancelFirstFrameWatchdog()
                     hasRenderedFirstFrameForCurrent = true
                     if (next.videoSize.width > 0 && next.videoSize.height > 0) {
-                        updateBackgroundForVideoSize(next.videoSize)
+                        updateBackdropForVideoSize(next.videoSize)
                     }
-                    dynamicBgController.attachPlayerView(playerView)
-                    dynamicBgController.setPlaying(next.isPlaying || next.playWhenReady)
-                    dynamicBgController.setHasRenderedFirstFrame(true)
                     if (tipView.visibility == View.VISIBLE) {
                         tipView.removeCallbacks(hideTipRunnable)
                         tipView.postDelayed(hideTipRunnable, 600)
@@ -688,6 +608,14 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
                 Log.e(TAG, "播放异常: ${error.errorCodeName} | ${error.message}")
                 cancelBufferingTimeout()
                 cancelFirstFrameWatchdog()
+
+                // 直播分片窗口过期时自动拉回最新直播前沿继续播，绝不误判下播
+                if (error.errorCode == PlaybackException.ERROR_CODE_BEHIND_LIVE_WINDOW && player === next) {
+                    next.seekToDefaultPosition()
+                    next.prepare()
+                    next.playWhenReady = true
+                    return
+                }
 
                 if (!preferSoftwareDecoderForCurrent && isLikelyDecoderOrRenderError(error)) {
                     retryWithSoftwareDecoder(gen, "解码器异常自动切软件兼容解码")
@@ -717,7 +645,7 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
 
             override fun onVideoSizeChanged(videoSize: VideoSize) {
                 if (player === next && videoSize.width > 0 && videoSize.height > 0) {
-                    updateBackgroundForVideoSize(videoSize)
+                    updateBackdropForVideoSize(videoSize)
                 }
                 Log.d(TAG, "视频尺寸已更新: ${videoSize.width}x${videoSize.height} ratio=${videoSize.pixelWidthHeightRatio}")
             }
@@ -738,7 +666,7 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
 
     /**
      * 瞬间切换（零黑屏空窗且避免双 VPU 解码抢占）：
-     * 1. 先让 playerView.player = next（内部自动解除旧 Surface，零 player = null 空窗）
+     * 1. 先赋值 playerView.player = next（内部自动解除旧 Surface，零 null 空窗）
      * 2. 立即释放旧播放器，腾出硬件 VPU 解码通道与 CMA 内存
      * 3. 置 next.playWhenReady = true，使新流从首关键帧直接解码渲染到 SurfaceView
      */
@@ -759,13 +687,8 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         }
 
         hasRenderedFirstFrameForCurrent = false
-        val currentRid = playList.getOrNull(currentIndex)?.rid ?: name
-        dynamicBgController.onChannelChanged(currentRid)
-        dynamicBgController.setHasRenderedFirstFrame(false)
-
         playerView.resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
         playerView.player = next
-        dynamicBgController.attachPlayerView(playerView)
 
         try {
             old?.stop()
@@ -774,15 +697,13 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         } catch (_: Exception) {}
 
         next.playWhenReady = true
-        dynamicBgController.setPlaying(true)
 
         val vs = next.videoSize
         if (vs.width > 0 && vs.height > 0) {
-            updateBackgroundForVideoSize(vs)
+            updateBackdropForVideoSize(vs)
         } else {
             isPortraitStream = true
-            dynamicBgController.setPortraitStream(true)
-            refreshPosterVisibility()
+            portraitBackdrop.visibility = View.VISIBLE
         }
 
         if (next.playbackState == Player.STATE_READY &&
@@ -868,123 +789,23 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         prepareThenSwap(gen, url, name, preferSoftwareDecoder = true)
     }
 
-    // -------------------- 竖屏动态背景：未出首帧头像占位 + 出首帧后实况采样 --------------------
+    // -------------------- 固定竖屏背景图控制 --------------------
 
-    private fun updateBackgroundForVideoSize(videoSize: VideoSize) {
-        val effectiveW = (videoSize.width * videoSize.pixelWidthHeightRatio).toInt().coerceAtLeast(1)
-        isPortraitStream = videoSize.height > effectiveW
-        dynamicBgController.setPortraitStream(isPortraitStream)
-        if (!isPortraitStream) {
-            liveBg.setImageDrawable(null)
-            liveBg.visibility = View.GONE
-            posterBg.visibility = View.GONE
-        } else if (liveBg.visibility != View.VISIBLE) {
-            refreshPosterVisibility()
-        }
-    }
-
-    private fun refreshPosterVisibility() {
-        posterBg.visibility = if (
-            isPortraitStream &&
-            liveBg.visibility != View.VISIBLE &&
-            !currentAvatarUrl.isNullOrBlank() &&
-            posterBg.drawable != null
-        ) {
-            View.VISIBLE
-        } else {
-            View.GONE
-        }
-    }
-
-    private fun bindPosterPlaceholder(avatarUrl: String?) {
-        val rawTrimmed = avatarUrl?.trim().orEmpty()
-        val clean = if (rawTrimmed.startsWith("//")) "https:$rawTrimmed" else rawTrimmed
-        if (clean.isBlank()) {
-            avatarLoadJob?.cancel()
-            currentAvatarUrl = null
-            posterBg.setImageDrawable(null)
-            posterBg.setBackgroundColor(Color.BLACK)
-            posterBg.visibility = View.GONE
-            return
-        }
-
-        if (clean == currentAvatarUrl && posterBg.drawable != null) {
-            refreshPosterVisibility()
-            return
-        }
-
-        avatarLoadJob?.cancel()
-        currentAvatarUrl = clean
-
-        val cached = blurredAvatarCache.get(clean)
-        if (cached != null && !cached.isRecycled) {
-            posterBg.setBackgroundColor(Color.BLACK)
-            posterBg.setImageBitmap(cached)
-            refreshPosterVisibility()
-            return
-        }
-
-        avatarLoadJob = lifecycleScope.launch {
-            val bmp = withContext(Dispatchers.IO) {
-                loadAndLightBlurPoster(clean)
-            }
-            if (!isActive || clean != currentAvatarUrl || isFinishing || isDestroyed) return@launch
-            if (bmp != null) {
-                blurredAvatarCache.put(clean, bmp)
-                posterBg.setBackgroundColor(Color.BLACK)
-                posterBg.setImageBitmap(bmp)
-                refreshPosterVisibility()
-            } else {
-                posterBg.setImageDrawable(null)
-                posterBg.setBackgroundColor(Color.BLACK)
-                posterBg.visibility = View.GONE
-            }
-        }
-    }
-
-    private fun loadAndLightBlurPoster(url: String): Bitmap? {
-        return try {
-            val request = Request.Builder()
-                .url(url)
-                .header("User-Agent", TV_UA)
-                .get()
-                .build()
-            val bytes = okHttpClient.newCall(request).execute().use { resp ->
-                if (!resp.isSuccessful) return null
-                resp.body?.bytes()
-            } ?: return null
-
-            val boundsOpts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-            BitmapFactory.decodeByteArray(bytes, 0, bytes.size, boundsOpts)
-            val maxDim = maxOf(boundsOpts.outWidth, boundsOpts.outHeight)
-            var sampleSize = 1
-            while (maxDim / sampleSize > 540) {
-                sampleSize *= 2
-            }
-
-            val decodeOpts = BitmapFactory.Options().apply {
-                inSampleSize = sampleSize
-                inPreferredConfig = Bitmap.Config.ARGB_8888
-            }
-            val raw = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, decodeOpts) ?: return null
-            val blurred = LiveDynamicBackgroundConfig.applyBoxBlur(
-                src = raw,
-                passes = LiveDynamicBackgroundConfig.POSTER_BLUR_PASSES
-            )
-            if (blurred !== raw) raw.recycle()
-            blurred
-        } catch (e: Exception) {
-            Log.w(TAG, "加载主播海报背景失败: $url", e)
-            null
-        }
+    private fun updateBackdropForVideoSize(videoSize: VideoSize) {
+        isPortraitStream = isPortraitVideo(
+            videoWidth = videoSize.width,
+            videoHeight = videoSize.height,
+            pixelWidthHeightRatio = videoSize.pixelWidthHeightRatio
+        )
+        portraitBackdrop.visibility = if (isPortraitStream) View.VISIBLE else View.GONE
     }
 
     // -------------------- 取流与超时 --------------------
 
-    private suspend fun fetchQualitiesWithAvatar(
+    private suspend fun fetchQualities(
         baseUrl: String,
         rid: String
-    ): Pair<List<Pair<String, String>>, String?> =
+    ): List<Pair<String, String>> =
         withContext(Dispatchers.IO) {
             val base = ChannelManager.normalizeBaseUrl(baseUrl)
             val apiUrl = "$base/live.php?rid=${rid.trim()}"
@@ -1001,31 +822,23 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
                     val httpCode = response.code
                     val body = response.body?.string().orEmpty()
                     Log.d(TAG, "fetchQualities url=$apiUrl code=$httpCode body=${body.take(200)}")
-                    if (!response.isSuccessful || body.isBlank()) return@withContext emptyList<Pair<String, String>>() to null
+                    if (!response.isSuccessful || body.isBlank()) return@withContext emptyList()
                     val json = JSONObject(body)
-                    if (json.optInt("code", 0) != 200) return@withContext emptyList<Pair<String, String>>() to null
+                    if (json.optInt("code", 0) != 200) return@withContext emptyList()
 
-                    val avatarUrl = listOf(
-                        json,
-                        json.optJSONObject("room"),
-                        json.optJSONObject("anchor"),
-                        json.optJSONObject("data"),
-                        json.optJSONObject("info")
-                    ).firstNotNullOfOrNull { obj ->
-                        ChannelManager.extractAvatarUrl(obj).takeIf { it.isNotBlank() }
-                    }
-
-                    val streamsObj = json.optJSONObject("streams") ?: return@withContext emptyList<Pair<String, String>>() to avatarUrl
-
+                    val streamsObj = json.optJSONObject("streams") ?: return@withContext emptyList()
                     val priorityKeys = listOf("origin", "uhd", "hd", "sd", "ld", "default")
                     val result = mutableListOf<Pair<String, String>>()
 
                     for (key in priorityKeys) {
                         val streamItem = streamsObj.optJSONObject(key)
-                        val hlsUrl = streamItem?.optString("hls")?.trim()
-                        if (!hlsUrl.isNullOrBlank()) {
-                            val name = streamItem.optString("name", key).ifBlank { key }
-                            result.add(name to hlsUrl)
+                        val streamUrl = normalizeStreamUrl(
+                            streamItem?.optString("hls")?.takeIf { it.isNotBlank() }
+                                ?: streamItem?.optString("url")
+                        )
+                        if (streamUrl.isNotBlank()) {
+                            val name = streamItem?.optString("name", key)?.ifBlank { key } ?: key
+                            result.add(name to streamUrl)
                         }
                     }
 
@@ -1034,18 +847,21 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
                         val key = keysIterator.next()
                         if (key !in priorityKeys) {
                             val streamItem = streamsObj.optJSONObject(key)
-                            val hlsUrl = streamItem?.optString("hls")?.trim()
-                            if (!hlsUrl.isNullOrBlank() && result.none { it.second == hlsUrl }) {
-                                val name = streamItem.optString("name", key).ifBlank { key }
-                                result.add(name to hlsUrl)
+                            val streamUrl = normalizeStreamUrl(
+                                streamItem?.optString("hls")?.takeIf { it.isNotBlank() }
+                                    ?: streamItem?.optString("url")
+                            )
+                            if (streamUrl.isNotBlank() && result.none { it.second == streamUrl }) {
+                                val name = streamItem?.optString("name", key)?.ifBlank { key } ?: key
+                                result.add(name to streamUrl)
                             }
                         }
                     }
-                    result to avatarUrl
+                    result
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "解析流地址失败: $rid url=$apiUrl", e)
-                emptyList<Pair<String, String>>() to null
+                emptyList()
             }
         }
 
@@ -1059,7 +875,8 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
                 val nextQIdx = qualityIndex + 1
                 if (nextQIdx in qualityList.indices) {
                     qualityIndex = nextQIdx
-                    prepareThenSwap(gen, qualityList[nextQIdx].second, name)
+                    preferSoftwareDecoderForCurrent = false
+                    prepareThenSwap(gen, qualityList[nextQIdx].second, name, preferSoftwareDecoder = false)
                 } else {
                     if (preparingPlayer === targetPlayer) releasePreparing()
                     playList.getOrNull(currentIndex)?.rid?.let { rid ->
@@ -1179,6 +996,13 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
             else -> "已离线"
         }
 
+        val screenDesc = if (isPortraitStream) {
+            "竖屏 FIT（固定背景图）"
+        } else {
+            "横屏 FIT（纯暗底）"
+        }
+        val decodeDesc = if (preferSoftwareDecoderForCurrent) "软件兼容解码" else "硬件直出解码"
+
         infoOverlay.text = buildString {
             append("频道：${ch.name}\n")
             append("房间：${ch.rid}\n")
@@ -1190,16 +1014,8 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
             append("音频编码：${af?.sampleMimeType ?: "-"}\n")
             append("码率：${if (kbps > 0) "约 $kbps kbps" else "自适应"}\n")
             append("缓冲：${p?.totalBufferedDuration ?: 0} ms\n")
-            val bgState = dynamicBgController.currentState
-            val bgDesc = when {
-                !isPortraitStream -> "SurfaceView 横屏直出（纯黑底 · FIT）"
-                bgState.samplerBackedOff -> "SurfaceView 直出 + 头像占位（采样已退避）"
-                bgState.shouldSample -> "SurfaceView 直出 + PixelCopy 实况背景"
-                else -> "SurfaceView 直出 + 头像占位（待首帧）"
-            }
-            val decodeDesc = if (preferSoftwareDecoderForCurrent) "软件兼容解码" else "硬件直出解码"
             append("线路：$lineLabel\n")
-            append("背景模式：$bgDesc\n")
+            append("画面模式：$screenDesc\n")
             append("解码引擎：$decodeDesc（首帧：${if (hasRenderedFirstFrameForCurrent) "已出画" else "等待中"}）\n")
             append("播放状态：$playStateText\n")
             append("────────────────\n（再次按 OK 或返回键关闭）")
@@ -1371,11 +1187,8 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
 
     private fun releaseAll() {
         switchJob?.cancel()
-        avatarLoadJob?.cancel()
+        probeJob?.cancel()
         cancelFirstFrameWatchdog()
-        if (::dynamicBgController.isInitialized) {
-            dynamicBgController.release()
-        }
         switchGen++
         hideLiveInfo()
         tipView.removeCallbacks(hideTipRunnable)
@@ -1387,9 +1200,7 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         super.onStop()
         mainHandler.removeCallbacks(infoRefreshRunnable)
         cancelFirstFrameWatchdog()
-        if (::dynamicBgController.isInitialized) {
-            dynamicBgController.setLifecycleBackground(true)
-        }
+        wasStoppedInBackground = true
         player?.playWhenReady = false
         releasePreparing()
         cancelBufferingTimeout()
@@ -1397,10 +1208,21 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
 
     override fun onStart() {
         super.onStart()
-        if (::dynamicBgController.isInitialized) {
-            dynamicBgController.setLifecycleBackground(false)
+        player?.let { active ->
+            if (wasStoppedInBackground) {
+                wasStoppedInBackground = false
+                if (active.isCurrentMediaItemLive) {
+                    active.seekToDefaultPosition()
+                }
+            }
+            active.playWhenReady = true
+            if (!hasRenderedFirstFrameForCurrent &&
+                active.playbackState == Player.STATE_READY &&
+                active.videoFormat != null
+            ) {
+                scheduleFirstFrameWatchdog(switchGen, active)
+            }
         }
-        player?.playWhenReady = true
         if (isInfoShowing) {
             mainHandler.removeCallbacks(infoRefreshRunnable)
             mainHandler.postDelayed(infoRefreshRunnable, 1000L)

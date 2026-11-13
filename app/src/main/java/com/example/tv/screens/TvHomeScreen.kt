@@ -145,7 +145,6 @@ fun TvHomeScreen(
                                     putExtra(TvFullscreenPlayerActivity.EXTRA_LINE, currentLine)
                                     putExtra(TvFullscreenPlayerActivity.EXTRA_BASE_URL, activeBaseUrl)
                                     putExtra(TvFullscreenPlayerActivity.EXTRA_TITLE, channel.name)
-                                    putExtra(TvFullscreenPlayerActivity.EXTRA_AVATAR, channel.avatar)
                                 }
                                 context.startActivity(intent)
                             },
@@ -461,7 +460,6 @@ fun TvHomeScreen(
                     putExtra(TvFullscreenPlayerActivity.EXTRA_LINE, currentLine)
                     putExtra(TvFullscreenPlayerActivity.EXTRA_BASE_URL, activeBaseUrl)
                     putExtra(TvFullscreenPlayerActivity.EXTRA_TITLE, channel.name)
-                    putExtra(TvFullscreenPlayerActivity.EXTRA_AVATAR, channel.avatar)
                 }
                 context.startActivity(intent)
             }
@@ -474,7 +472,6 @@ fun TvHomeScreen(
             onConfirm = {
                 showClearCacheDialog = false
                 preferences.recordCacheCleared()
-                preferences.textureViewBlacklisted = false
                 TvFullscreenPlayerActivity.clearStreamCache()
                 Toast.makeText(context, "电视端缓存与流地址缓存已彻底清空", Toast.LENGTH_SHORT).show()
             }

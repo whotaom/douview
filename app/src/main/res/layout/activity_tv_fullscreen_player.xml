@@ -1,42 +1,34 @@
 <?xml version="1.0" encoding="utf-8"?>
 <FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
     android:id="@+id/rootContainer"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
-    android:background="#000000">
+    android:background="#09090C">
 
-    <!-- 1. 未出首帧占位：主播头像/封面轻虚化底（alpha 0.90，无头像纯黑） -->
+    <!-- 1. 符合系统风格的固定竖屏背景图（仅竖屏直播两侧展示，横屏隐藏显纯暗底） -->
     <ImageView
-        android:id="@+id/posterBg"
+        android:id="@+id/portraitBackdrop"
         android:layout_width="match_parent"
         android:layout_height="match_parent"
-        android:alpha="0.90"
-        android:background="#000000"
         android:contentDescription="@null"
         android:scaleType="centerCrop"
-        android:visibility="gone" />
+        android:src="@drawable/img_tv_portrait_backdrop"
+        android:visibility="visible" />
 
-    <!-- 2. 出首帧后：TextureView 双缓冲采样实况帧铺满左右（scale 1.08 + 轻磨砂 + alpha 0.92） -->
-    <ImageView
-        android:id="@+id/liveBg"
+    <!-- 2. 唯一全屏主播放器（SurfaceView 原生硬件直出 + RESIZE_MODE_FIT 完整不变形） -->
+    <androidx.media3.ui.PlayerView
+        android:id="@+id/playerView"
         android:layout_width="match_parent"
         android:layout_height="match_parent"
-        android:alpha="0.92"
         android:background="@android:color/transparent"
-        android:contentDescription="@null"
-        android:scaleType="centerCrop"
-        android:scaleX="1.08"
-        android:scaleY="1.08"
-        android:visibility="gone" />
+        app:keep_content_on_player_reset="true"
+        app:resize_mode="fit"
+        app:shutter_background_color="@android:color/transparent"
+        app:surface_type="surface_view"
+        app:use_controller="false" />
 
-    <!-- 3. 唯一全屏主播放器容器（优先 TextureView 采样，异常自动降级 SurfaceView，始终 RESIZE_MODE_FIT） -->
-    <FrameLayout
-        android:id="@+id/playerHost"
-        android:layout_width="match_parent"
-        android:layout_height="match_parent"
-        android:background="@android:color/transparent" />
-
-    <!-- 4. 顶部居中换台与状态提示，高 elevation 防止被视频遮挡 -->
+    <!-- 3. 顶部居中换台与状态提示 -->
     <TextView
         android:id="@+id/tipView"
         android:layout_width="wrap_content"
