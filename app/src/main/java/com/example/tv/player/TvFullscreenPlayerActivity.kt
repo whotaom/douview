@@ -22,6 +22,7 @@ import android.widget.ScrollView
 import android.widget.TextView
 import androidx.activity.ComponentActivity
 import androidx.activity.OnBackPressedCallback
+import android.view.LayoutInflater
 import androidx.annotation.OptIn
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
@@ -59,9 +60,9 @@ import java.util.concurrent.TimeUnit
 
 /**
  * 电视大屏全屏直播播放器（顶级 TV 直播客户端方案）
- * 1. 唯一全屏 PlayerView（SurfaceView + RESIZE_MODE_FIT）：竖屏完整居中不变形，横屏按比例适配
- * 2. 竖屏两侧由主播头像 CENTER_CROP + 轻微模糊铺满作为氛围背景；无头像或横屏时纯黑底
- * 3. 「先备后切」(prepare-then-swap)：换台期间旧流不中断，新流 STATE_READY/首帧瞬间赋值切流再释放旧播放器
+ * 1. 唯一全屏 PlayerView（优先 TextureView 采样，异常自动降级 SurfaceView，始终 RESIZE_MODE_FIT 不拉伸）
+ * 2. 竖屏动态背景：未出首帧使用主播头像轻虚化占位；出首帧后由 TextureView 双缓冲采样实况帧轻磨砂铺满左右
+ * 3. 「先备后切」(prepare-then-swap)：换台期间旧流不中断，新流 READY/首帧切换并立刻清空旧台实况背景帧
  * 4. 离线/无法播放自动切换下一在线台，记录本轮失败集合彻底防死循环
  * 5. 菜单仅展示在线频道，标题带实时在线台数「在线频道（N）」；OK 键技术面板 1 秒实时刷新
  */
@@ -71,6 +72,7 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         const val DEFAULT_BASE_URL = StreamLines.LINE_1
         private const val TAG = "TVPlayer"
         private const val TV_UA = ChannelManager.TV_UA
+        private const val FIRST_FRAME_WATCHDOG_MS = 4_000L
 
         const val EXTRA_URL = "extra_url"
         const val EXTRA_RID = "extra_rid"
@@ -85,7 +87,7 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         val streamCacheTime = mutableMapOf<String, Long>()
         const val CACHE_TTL = 5 * 60 * 1000L
 
-        // 轻微模糊头像内存缓存（避免重复下载与模糊计算）
+        // 轻微模糊头像内存缓存（未出首帧占位用）
         private val blurredAvatarCache = LruCache<String, Bitmap>(16)
 
         fun clearStreamCache() {
@@ -101,7 +103,9 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
 
     // UI 组件
     private lateinit var root: FrameLayout
-    private lateinit var avatarBg: ImageView               // 主播头像铺满背景层（轻微模糊，无头像黑底）
+    private lateinit var posterBg: ImageView               // 未出首帧（及兼容降级时）主播头像虚化占位
+    private lateinit var liveBg: ImageView                 // 出首帧后 TextureView 实况采样双缓冲背景
+    private lateinit var playerHost: FrameLayout           // 动态承载 TextureView / SurfaceView 版 PlayerView
     private lateinit var playerView: PlayerView            // 唯一全屏主播放器（严格 RESIZE_MODE_FIT）
     private lateinit var tipView: TextView                 // 顶部高层级换台与状态提示
     private lateinit var channelMenu: FrameLayout          // 左侧在线选台悬浮面板
@@ -115,10 +119,14 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
     private var isMenuShowing = false
     private var isInfoShowing = false
 
-    // 头像背景状态
+    // 竖屏动态背景与 Surface 黑屏降级状态
+    private var currentSurfaceMode: PlayerSurfaceMode = PlayerSurfaceMode.TEXTURE_VIEW
+    private lateinit var dynamicBgController: LiveDynamicBackgroundController
     private var avatarLoadJob: Job? = null
     private var currentAvatarUrl: String? = null
     private var isPortraitStream: Boolean = true
+    private var hasRenderedFirstFrameForCurrent: Boolean = false
+    private var firstFrameWatchdogRunnable: Runnable? = null
 
     // 播放列表与当前索引
     private var playList: List<Channel> = emptyList()
@@ -157,12 +165,11 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enterFullscreen()
-        buildUi()
-
         preferences = LivePreferences(this)
         channelManager = ChannelManager(this)
-        currentLine = resolveInitialLine()
+        buildUi()
 
+        currentLine = resolveInitialLine()
         setupPlayListAndStart()
 
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
@@ -188,23 +195,50 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         return StreamLines.baseUrl(currentLine)
     }
 
-    // -------------------- UI 结构构建 --------------------
+    // -------------------- UI 结构构建与动态背景控制 --------------------
 
     @OptIn(UnstableApi::class)
     private fun buildUi() {
         setContentView(R.layout.activity_tv_fullscreen_player)
         root = findViewById(R.id.rootContainer)
-        avatarBg = findViewById(R.id.avatarBg)
-        playerView = findViewById(R.id.playerView)
+        posterBg = findViewById(R.id.posterBg)
+        liveBg = findViewById(R.id.liveBg)
+        playerHost = findViewById(R.id.playerHost)
         tipView = findViewById(R.id.tipView)
 
         root.setBackgroundColor(Color.BLACK)
-        avatarBg.scaleType = ImageView.ScaleType.CENTER_CROP
-        avatarBg.setBackgroundColor(Color.BLACK)
+        posterBg.scaleType = ImageView.ScaleType.CENTER_CROP
+        posterBg.setBackgroundColor(Color.BLACK)
+        posterBg.alpha = LiveDynamicBackgroundConfig.POSTER_ALPHA
 
-        playerView.useController = false
-        playerView.resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
-        playerView.setBackgroundColor(Color.TRANSPARENT)
+        liveBg.scaleType = ImageView.ScaleType.CENTER_CROP
+        liveBg.scaleX = LiveDynamicBackgroundConfig.LIVE_SCALE
+        liveBg.scaleY = LiveDynamicBackgroundConfig.LIVE_SCALE
+        liveBg.alpha = LiveDynamicBackgroundConfig.LIVE_ALPHA
+
+        currentSurfaceMode = LiveDynamicBackgroundConfig.resolveSurfaceType(
+            preferDynamicBg = true,
+            textureViewBlacklisted = preferences.textureViewBlacklisted
+        )
+        inflatePlayerView(currentSurfaceMode)
+
+        dynamicBgController = LiveDynamicBackgroundController(
+            scope = lifecycleScope,
+            targetHeight = LiveDynamicBackgroundConfig.resolveTargetHeight(this)
+        ) { frame ->
+            if (isFinishing || isDestroyed) return@LiveDynamicBackgroundController
+            if (frame != null && !frame.isRecycled && isPortraitStream) {
+                liveBg.setImageBitmap(frame)
+                liveBg.visibility = View.VISIBLE
+                posterBg.visibility = View.GONE
+            } else {
+                liveBg.setImageDrawable(null)
+                liveBg.visibility = View.GONE
+                refreshPosterVisibility()
+            }
+        }
+        dynamicBgController.attachPlayerView(playerView)
+        dynamicBgController.setSurfaceIsTextureView(currentSurfaceMode == PlayerSurfaceMode.TEXTURE_VIEW)
 
         // 1. 左侧在线选台悬浮面板（仅占 400dp，无全屏遮罩）
         channelMenu = FrameLayout(this).apply {
@@ -255,15 +289,35 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         root.addView(infoOverlay)
     }
 
+    @OptIn(UnstableApi::class)
+    private fun inflatePlayerView(mode: PlayerSurfaceMode) {
+        val layoutRes = if (mode == PlayerSurfaceMode.TEXTURE_VIEW) {
+            R.layout.view_player_texture
+        } else {
+            R.layout.view_player_surface
+        }
+        playerHost.removeAllViews()
+        val inflated = LayoutInflater.from(this).inflate(layoutRes, playerHost, false) as PlayerView
+        inflated.useController = false
+        inflated.resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
+        inflated.setBackgroundColor(Color.TRANSPARENT)
+        inflated.setShutterBackgroundColor(Color.TRANSPARENT)
+        playerHost.addView(inflated)
+        playerView = inflated
+    }
+
     // -------------------- 播放与切台核心逻辑 --------------------
 
     private fun setupPlayListAndStart() {
         val directStreamUrl = intent.getStringExtra(EXTRA_STREAM_URL)?.trim()
         if (!directStreamUrl.isNullOrBlank()) {
-            playList = listOf(Channel(rid = "direct", name = "直接媒体流", isLive = true, statusKnown = true))
+            val extraAvatar = intent.getStringExtra(EXTRA_AVATAR)?.trim().orEmpty()
+            playList = listOf(Channel(rid = "direct", name = "直接媒体流", avatar = extraAvatar, isLive = true, statusKnown = true))
             currentIndex = 0
             qualityList = listOf("默认流" to directStreamUrl)
             qualityIndex = 0
+            dynamicBgController.onChannelChanged("direct")
+            bindPosterPlaceholder(extraAvatar)
             prepareThenSwap(++switchGen, directStreamUrl, "直接媒体流")
             return
         }
@@ -278,10 +332,13 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
 
         if (targetRid.isNullOrBlank() && rawUrl.isNotBlank()) {
             if (rawUrl.endsWith(".m3u8") || rawUrl.contains(".m3u8?")) {
-                playList = listOf(Channel(rid = "direct", name = "直接流媒体", isLive = true, statusKnown = true))
+                val extraAvatar = intent.getStringExtra(EXTRA_AVATAR)?.trim().orEmpty()
+                playList = listOf(Channel(rid = "direct", name = "直接流媒体", avatar = extraAvatar, isLive = true, statusKnown = true))
                 currentIndex = 0
                 qualityList = listOf("默认流" to rawUrl)
                 qualityIndex = 0
+                dynamicBgController.onChannelChanged("direct")
+                bindPosterPlaceholder(extraAvatar)
                 prepareThenSwap(++switchGen, rawUrl, "直接流媒体")
                 return
             }
@@ -339,7 +396,7 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
                         currentIndex = syncedIdx
                         val updatedAvatar = sorted[syncedIdx].avatar
                         if (updatedAvatar.isNotBlank() && updatedAvatar != currentAvatarUrl) {
-                            bindChannelAvatar(updatedAvatar)
+                            bindPosterPlaceholder(updatedAvatar)
                         }
                     }
                 }
@@ -389,7 +446,9 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         if (!fromAutoSkip) {
             showTip("正在切换到：${channel.name}", autoHide = false)
         }
-        bindChannelAvatar(channel.avatar)
+        // 切台时立即清空上一频道的实况背景帧，并以未出首帧海报占位
+        dynamicBgController.onChannelChanged(channel.rid)
+        bindPosterPlaceholder(channel.avatar)
 
         val base = activeBaseUrl()
 
@@ -419,7 +478,7 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
                         updated[index] = updated[index].copy(avatar = fetchedAvatar)
                         playList = updated
                     }
-                    bindChannelAvatar(fetchedAvatar)
+                    bindPosterPlaceholder(fetchedAvatar)
                 }
 
                 if (list.isEmpty()) {
@@ -508,6 +567,14 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         preparingPlayer = next
 
         next.addListener(object : Player.Listener {
+            override fun onIsPlayingChanged(isPlaying: Boolean) {
+                if (player === next) {
+                    dynamicBgController.setPlaying(
+                        isPlaying || (next.playbackState == Player.STATE_READY && next.playWhenReady)
+                    )
+                }
+            }
+
             override fun onPlaybackStateChanged(state: Int) {
                 if (gen != switchGen) return
                 when (state) {
@@ -516,6 +583,7 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
                         if (preparingPlayer === next) {
                             showTip("正在切换到：$name（缓冲中）", autoHide = false)
                         } else if (player === next) {
+                            dynamicBgController.setPlaying(false)
                             val qLabel = qualityList.getOrNull(qualityIndex)?.first ?: "默认"
                             showTip("正在缓冲 [$qLabel]...", autoHide = false)
                         }
@@ -524,13 +592,24 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
                         cancelBufferingTimeout()
                         if (preparingPlayer === next) {
                             swapTo(next, gen, name)
-                        } else if (player === next && tipView.visibility == View.VISIBLE) {
-                            tipView.postDelayed(hideTipRunnable, 600)
+                        } else if (player === next) {
+                            dynamicBgController.setPlaying(next.isPlaying || next.playWhenReady)
+                            if (currentSurfaceMode == PlayerSurfaceMode.TEXTURE_VIEW &&
+                                !hasRenderedFirstFrameForCurrent &&
+                                next.playWhenReady &&
+                                next.videoFormat != null
+                            ) {
+                                scheduleFirstFrameWatchdog(next)
+                            }
+                            if (tipView.visibility == View.VISIBLE) {
+                                tipView.postDelayed(hideTipRunnable, 600)
+                            }
                         }
                     }
                     Player.STATE_ENDED -> {
                         cancelBufferingTimeout()
                         if (player === next) {
+                            dynamicBgController.setPlaying(false)
                             onChannelUnplayable("直播已结束")
                         }
                     }
@@ -542,13 +621,23 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
                 cancelBufferingTimeout()
                 Log.i(
                     TAG,
-                    "onRenderedFirstFrame model=${Build.MODEL} channel=$name size=${next.videoSize.width}x${next.videoSize.height}"
+                    "onRenderedFirstFrame model=${Build.MODEL} surface=$currentSurfaceMode channel=$name size=${next.videoSize.width}x${next.videoSize.height}"
                 )
                 if (preparingPlayer === next) {
                     swapTo(next, gen, name)
-                } else if (player === next && tipView.visibility == View.VISIBLE) {
-                    tipView.removeCallbacks(hideTipRunnable)
-                    tipView.postDelayed(hideTipRunnable, 600)
+                }
+                if (player === next) {
+                    cancelFirstFrameWatchdog()
+                    hasRenderedFirstFrameForCurrent = true
+                    if (next.videoSize.width > 0 && next.videoSize.height > 0) {
+                        updateBackgroundForVideoSize(next.videoSize)
+                    }
+                    dynamicBgController.setPlaying(next.isPlaying || next.playWhenReady)
+                    dynamicBgController.setHasRenderedFirstFrame(true)
+                    if (tipView.visibility == View.VISIBLE) {
+                        tipView.removeCallbacks(hideTipRunnable)
+                        tipView.postDelayed(hideTipRunnable, 600)
+                    }
                 }
             }
 
@@ -556,6 +645,15 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
                 if (gen != switchGen) return
                 Log.e(TAG, "播放异常: ${error.errorCodeName} | ${error.message}")
                 cancelBufferingTimeout()
+
+                if (player === next &&
+                    currentSurfaceMode == PlayerSurfaceMode.TEXTURE_VIEW &&
+                    !hasRenderedFirstFrameForCurrent &&
+                    isLikelySurfaceOrRenderError(error)
+                ) {
+                    fallbackToSurfaceView("TextureView 渲染异常降级")
+                    return
+                }
 
                 if (preparingPlayer === next) {
                     releasePreparing()
@@ -577,7 +675,7 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
 
             override fun onVideoSizeChanged(videoSize: VideoSize) {
                 if (player === next && videoSize.width > 0 && videoSize.height > 0) {
-                    updateAvatarVisibilityForVideoSize(videoSize)
+                    updateBackgroundForVideoSize(videoSize)
                 }
                 Log.d(TAG, "视频尺寸已更新: ${videoSize.width}x${videoSize.height} ratio=${videoSize.pixelWidthHeightRatio}")
             }
@@ -599,7 +697,7 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
      * 瞬间切换（零黑屏空窗）：
      * 1. 旧播放器一直保留在 playerView 上直到新流 READY
      * 2. 一次赋值 playerView.player = next（禁止中间置 null）
-     * 3. 最后再停止并释放旧播放器
+     * 3. 立即重置首帧与采样状态，绑定新流后再释放旧播放器
      */
     @OptIn(UnstableApi::class)
     private fun swapTo(next: ExoPlayer, gen: Long, name: String) {
@@ -609,6 +707,7 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
             return
         }
 
+        cancelFirstFrameWatchdog()
         failedRidsThisRound.clear()
         val old = player
         player = next
@@ -616,18 +715,32 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
             preparingPlayer = null
         }
 
+        hasRenderedFirstFrameForCurrent = false
+        val currentRid = playList.getOrNull(currentIndex)?.rid ?: name
+        dynamicBgController.onChannelChanged(currentRid)
+        dynamicBgController.setHasRenderedFirstFrame(false)
+
         playerView.resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
         playerView.player = next
+        dynamicBgController.attachPlayerView(playerView)
+        dynamicBgController.setSurfaceIsTextureView(currentSurfaceMode == PlayerSurfaceMode.TEXTURE_VIEW)
+        dynamicBgController.setPlaying(next.isPlaying || next.playWhenReady)
+
         val vs = next.videoSize
         if (vs.width > 0 && vs.height > 0) {
-            updateAvatarVisibilityForVideoSize(vs)
+            updateBackgroundForVideoSize(vs)
         } else {
             isPortraitStream = true
-            avatarBg.visibility = if (!currentAvatarUrl.isNullOrBlank() && avatarBg.drawable != null) {
-                View.VISIBLE
-            } else {
-                View.GONE
-            }
+            dynamicBgController.setPortraitStream(true)
+            refreshPosterVisibility()
+        }
+
+        if (currentSurfaceMode == PlayerSurfaceMode.TEXTURE_VIEW &&
+            next.playbackState == Player.STATE_READY &&
+            next.playWhenReady &&
+            next.videoFormat != null
+        ) {
+            scheduleFirstFrameWatchdog(next)
         }
 
         try {
@@ -648,32 +761,107 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         preparingPlayer = null
     }
 
-    // -------------------- 竖屏主播头像铺满背景（轻微模糊，无头像或横屏纯黑底） --------------------
+    private fun isLikelySurfaceOrRenderError(error: PlaybackException): Boolean {
+        return when (error.errorCode) {
+            PlaybackException.ERROR_CODE_DECODER_INIT_FAILED,
+            PlaybackException.ERROR_CODE_DECODING_FAILED,
+            PlaybackException.ERROR_CODE_VIDEO_FRAME_PROCESSOR_INIT_FAILED,
+            PlaybackException.ERROR_CODE_VIDEO_FRAME_PROCESSING_FAILED -> true
+            else -> error.message?.contains("surface", ignoreCase = true) == true
+        }
+    }
 
-    private fun updateAvatarVisibilityForVideoSize(videoSize: VideoSize) {
+    private fun scheduleFirstFrameWatchdog(targetPlayer: ExoPlayer) {
+        cancelFirstFrameWatchdog()
+        if (currentSurfaceMode != PlayerSurfaceMode.TEXTURE_VIEW || hasRenderedFirstFrameForCurrent) return
+        firstFrameWatchdogRunnable = Runnable {
+            if (isFinishing || isDestroyed) return@Runnable
+            if (player === targetPlayer &&
+                currentSurfaceMode == PlayerSurfaceMode.TEXTURE_VIEW &&
+                !hasRenderedFirstFrameForCurrent &&
+                targetPlayer.playbackState == Player.STATE_READY &&
+                targetPlayer.playWhenReady &&
+                targetPlayer.videoFormat != null
+            ) {
+                fallbackToSurfaceView("TextureView 首帧超时(${FIRST_FRAME_WATCHDOG_MS}ms)")
+            }
+        }.also {
+            mainHandler.postDelayed(it, FIRST_FRAME_WATCHDOG_MS)
+        }
+    }
+
+    private fun cancelFirstFrameWatchdog() {
+        firstFrameWatchdogRunnable?.let { mainHandler.removeCallbacks(it) }
+        firstFrameWatchdogRunnable = null
+    }
+
+    /**
+     * H96 / RK3528 等硬件平台 TextureView 首帧异常时，持久化降级标记并热切至 SurfaceView
+     */
+    @OptIn(UnstableApi::class)
+    private fun fallbackToSurfaceView(reason: String) {
+        if (currentSurfaceMode == PlayerSurfaceMode.SURFACE_VIEW || isFinishing || isDestroyed) return
+        Log.w(TAG, "自动降级至 SurfaceView: reason=$reason model=${Build.MODEL}")
+        cancelFirstFrameWatchdog()
+        preferences.textureViewBlacklisted = true
+        currentSurfaceMode = PlayerSurfaceMode.SURFACE_VIEW
+
+        dynamicBgController.setSurfaceIsTextureView(false)
+        liveBg.setImageDrawable(null)
+        liveBg.visibility = View.GONE
+        refreshPosterVisibility()
+
+        val activePlayer = player
+        activePlayer?.clearVideoSurface()
+        inflatePlayerView(PlayerSurfaceMode.SURFACE_VIEW)
+        playerView.player = activePlayer
+        dynamicBgController.attachPlayerView(playerView)
+        dynamicBgController.setSurfaceIsTextureView(false)
+        showTip("已切换至兼容播放模式（SurfaceView）", autoHide = true)
+    }
+
+    // -------------------- 竖屏动态背景：未出首帧头像占位 + 出首帧后实况采样 --------------------
+
+    private fun updateBackgroundForVideoSize(videoSize: VideoSize) {
         val effectiveW = (videoSize.width * videoSize.pixelWidthHeightRatio).toInt().coerceAtLeast(1)
         isPortraitStream = videoSize.height > effectiveW
-        avatarBg.visibility = if (isPortraitStream && !currentAvatarUrl.isNullOrBlank() && avatarBg.drawable != null) {
+        dynamicBgController.setPortraitStream(isPortraitStream)
+        if (!isPortraitStream) {
+            liveBg.setImageDrawable(null)
+            liveBg.visibility = View.GONE
+            posterBg.visibility = View.GONE
+        } else if (liveBg.visibility != View.VISIBLE) {
+            refreshPosterVisibility()
+        }
+    }
+
+    private fun refreshPosterVisibility() {
+        posterBg.visibility = if (
+            isPortraitStream &&
+            liveBg.visibility != View.VISIBLE &&
+            !currentAvatarUrl.isNullOrBlank() &&
+            posterBg.drawable != null
+        ) {
             View.VISIBLE
         } else {
             View.GONE
         }
     }
 
-    private fun bindChannelAvatar(avatarUrl: String?) {
+    private fun bindPosterPlaceholder(avatarUrl: String?) {
         val rawTrimmed = avatarUrl?.trim().orEmpty()
         val clean = if (rawTrimmed.startsWith("//")) "https:$rawTrimmed" else rawTrimmed
         if (clean.isBlank()) {
             avatarLoadJob?.cancel()
             currentAvatarUrl = null
-            avatarBg.setImageDrawable(null)
-            avatarBg.setBackgroundColor(Color.BLACK)
-            avatarBg.visibility = View.GONE
+            posterBg.setImageDrawable(null)
+            posterBg.setBackgroundColor(Color.BLACK)
+            posterBg.visibility = View.GONE
             return
         }
 
-        if (clean == currentAvatarUrl && avatarBg.drawable != null) {
-            avatarBg.visibility = if (isPortraitStream) View.VISIBLE else View.GONE
+        if (clean == currentAvatarUrl && posterBg.drawable != null) {
+            refreshPosterVisibility()
             return
         }
 
@@ -682,31 +870,31 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
 
         val cached = blurredAvatarCache.get(clean)
         if (cached != null && !cached.isRecycled) {
-            avatarBg.setBackgroundColor(Color.BLACK)
-            avatarBg.setImageBitmap(cached)
-            avatarBg.visibility = if (isPortraitStream) View.VISIBLE else View.GONE
+            posterBg.setBackgroundColor(Color.BLACK)
+            posterBg.setImageBitmap(cached)
+            refreshPosterVisibility()
             return
         }
 
         avatarLoadJob = lifecycleScope.launch {
             val bmp = withContext(Dispatchers.IO) {
-                loadAndLightBlurAvatar(clean)
+                loadAndLightBlurPoster(clean)
             }
             if (!isActive || clean != currentAvatarUrl || isFinishing || isDestroyed) return@launch
             if (bmp != null) {
                 blurredAvatarCache.put(clean, bmp)
-                avatarBg.setBackgroundColor(Color.BLACK)
-                avatarBg.setImageBitmap(bmp)
-                avatarBg.visibility = if (isPortraitStream) View.VISIBLE else View.GONE
+                posterBg.setBackgroundColor(Color.BLACK)
+                posterBg.setImageBitmap(bmp)
+                refreshPosterVisibility()
             } else {
-                avatarBg.setImageDrawable(null)
-                avatarBg.setBackgroundColor(Color.BLACK)
-                avatarBg.visibility = View.GONE
+                posterBg.setImageDrawable(null)
+                posterBg.setBackgroundColor(Color.BLACK)
+                posterBg.visibility = View.GONE
             }
         }
     }
 
-    private fun loadAndLightBlurAvatar(url: String): Bitmap? {
+    private fun loadAndLightBlurPoster(url: String): Bitmap? {
         return try {
             val request = Request.Builder()
                 .url(url)
@@ -722,7 +910,7 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
             BitmapFactory.decodeByteArray(bytes, 0, bytes.size, boundsOpts)
             val maxDim = maxOf(boundsOpts.outWidth, boundsOpts.outHeight)
             var sampleSize = 1
-            while (maxDim / sampleSize > 720) {
+            while (maxDim / sampleSize > 540) {
                 sampleSize *= 2
             }
 
@@ -731,52 +919,16 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
                 inPreferredConfig = Bitmap.Config.ARGB_8888
             }
             val raw = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, decodeOpts) ?: return null
-            val blurred = lightBoxBlur(raw, passes = 1)
+            val blurred = LiveDynamicBackgroundConfig.applyBoxBlur(
+                src = raw,
+                passes = LiveDynamicBackgroundConfig.POSTER_BLUR_PASSES
+            )
             if (blurred !== raw) raw.recycle()
             blurred
         } catch (e: Exception) {
-            Log.w(TAG, "加载主播头像失败: $url", e)
+            Log.w(TAG, "加载主播海报背景失败: $url", e)
             null
         }
-    }
-
-    private fun lightBoxBlur(src: Bitmap, passes: Int = 2): Bitmap {
-        val w = src.width
-        val h = src.height
-        if (w <= 2 || h <= 2) return src
-        val pix = IntArray(w * h)
-        src.getPixels(pix, 0, w, 0, 0, w, h)
-        val tmp = IntArray(w * h)
-
-        repeat(passes) {
-            for (y in 0 until h) {
-                val row = y * w
-                for (x in 0 until w) {
-                    val p0 = pix[row + (x - 1).coerceAtLeast(0)]
-                    val p1 = pix[row + x]
-                    val p2 = pix[row + (x + 1).coerceAtMost(w - 1)]
-                    val r = (((p0 shr 16) and 0xFF) + ((p1 shr 16) and 0xFF) + ((p2 shr 16) and 0xFF)) / 3
-                    val g = (((p0 shr 8) and 0xFF) + ((p1 shr 8) and 0xFF) + ((p2 shr 8) and 0xFF)) / 3
-                    val b = ((p0 and 0xFF) + (p1 and 0xFF) + (p2 and 0xFF)) / 3
-                    tmp[row + x] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
-                }
-            }
-            for (y in 0 until h) {
-                val y0 = (y - 1).coerceAtLeast(0) * w
-                val y1 = y * w
-                val y2 = (y + 1).coerceAtMost(h - 1) * w
-                for (x in 0 until w) {
-                    val p0 = tmp[y0 + x]
-                    val p1 = tmp[y1 + x]
-                    val p2 = tmp[y2 + x]
-                    val r = (((p0 shr 16) and 0xFF) + ((p1 shr 16) and 0xFF) + ((p2 shr 16) and 0xFF)) / 3
-                    val g = (((p0 shr 8) and 0xFF) + ((p1 shr 8) and 0xFF) + ((p2 shr 8) and 0xFF)) / 3
-                    val b = ((p0 and 0xFF) + (p1 and 0xFF) + (p2 and 0xFF)) / 3
-                    pix[y1 + x] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
-                }
-            }
-        }
-        return Bitmap.createBitmap(pix, w, h, Bitmap.Config.ARGB_8888)
     }
 
     // -------------------- 取流与超时 --------------------
@@ -990,8 +1142,13 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
             append("音频编码：${af?.sampleMimeType ?: "-"}\n")
             append("码率：${if (kbps > 0) "约 $kbps kbps" else "自适应"}\n")
             append("缓冲：${p?.totalBufferedDuration ?: 0} ms\n")
+            val bgDesc = if (currentSurfaceMode == PlayerSurfaceMode.TEXTURE_VIEW) {
+                "TextureView 实况采样（FIT 不拉伸）"
+            } else {
+                "SurfaceView 兼容模式（FIT 不拉伸）"
+            }
             append("线路：$lineLabel\n")
-            append("画面模式：按比例适配（FIT 不拉伸）\n")
+            append("背景模式：$bgDesc\n")
             append("播放状态：$playStateText\n")
             append("────────────────\n（再次按 OK 或返回键关闭）")
         }
@@ -1150,6 +1307,7 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
 
     private fun releasePlayerOnly() {
         cancelBufferingTimeout()
+        cancelFirstFrameWatchdog()
         playerView.player = null
         try {
             player?.stop()
@@ -1162,6 +1320,10 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
     private fun releaseAll() {
         switchJob?.cancel()
         avatarLoadJob?.cancel()
+        cancelFirstFrameWatchdog()
+        if (::dynamicBgController.isInitialized) {
+            dynamicBgController.release()
+        }
         switchGen++
         hideLiveInfo()
         tipView.removeCallbacks(hideTipRunnable)
@@ -1172,6 +1334,10 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
     override fun onStop() {
         super.onStop()
         mainHandler.removeCallbacks(infoRefreshRunnable)
+        cancelFirstFrameWatchdog()
+        if (::dynamicBgController.isInitialized) {
+            dynamicBgController.setLifecycleBackground(true)
+        }
         player?.playWhenReady = false
         releasePreparing()
         cancelBufferingTimeout()
@@ -1179,6 +1345,9 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
 
     override fun onStart() {
         super.onStart()
+        if (::dynamicBgController.isInitialized) {
+            dynamicBgController.setLifecycleBackground(false)
+        }
         player?.playWhenReady = true
         if (isInfoShowing) {
             mainHandler.removeCallbacks(infoRefreshRunnable)

@@ -1,34 +1,42 @@
 <?xml version="1.0" encoding="utf-8"?>
 <FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
-    xmlns:app="http://schemas.android.com/apk/res-auto"
     android:id="@+id/rootContainer"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
     android:background="#000000">
 
-    <!-- 1. 主播头像铺满背景层（竖屏居中 FIT 时两侧露出轻微模糊头像；无头像或横屏时纯黑底） -->
+    <!-- 1. 未出首帧占位：主播头像/封面轻虚化底（alpha 0.90，无头像纯黑） -->
     <ImageView
-        android:id="@+id/avatarBg"
+        android:id="@+id/posterBg"
         android:layout_width="match_parent"
         android:layout_height="match_parent"
+        android:alpha="0.90"
         android:background="#000000"
         android:contentDescription="@null"
         android:scaleType="centerCrop"
         android:visibility="gone" />
 
-    <!-- 2. 唯一全屏主播放器：严格 RESIZE_MODE_FIT 按比例显示，不裁切不拉伸；背景透明以露出两侧头像 -->
-    <androidx.media3.ui.PlayerView
-        android:id="@+id/playerView"
+    <!-- 2. 出首帧后：TextureView 双缓冲采样实况帧铺满左右（scale 1.08 + 轻磨砂 + alpha 0.92） -->
+    <ImageView
+        android:id="@+id/liveBg"
         android:layout_width="match_parent"
         android:layout_height="match_parent"
+        android:alpha="0.92"
         android:background="@android:color/transparent"
-        app:surface_type="surface_view"
-        app:use_controller="false"
-        app:resize_mode="fit"
-        app:shutter_background_color="@android:color/transparent"
-        app:keep_content_on_player_reset="true" />
+        android:contentDescription="@null"
+        android:scaleType="centerCrop"
+        android:scaleX="1.08"
+        android:scaleY="1.08"
+        android:visibility="gone" />
 
-    <!-- 3. 顶部居中换台与状态提示，高 elevation 防止被视频底层遮挡 -->
+    <!-- 3. 唯一全屏主播放器容器（优先 TextureView 采样，异常自动降级 SurfaceView，始终 RESIZE_MODE_FIT） -->
+    <FrameLayout
+        android:id="@+id/playerHost"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:background="@android:color/transparent" />
+
+    <!-- 4. 顶部居中换台与状态提示，高 elevation 防止被视频遮挡 -->
     <TextView
         android:id="@+id/tipView"
         android:layout_width="wrap_content"
