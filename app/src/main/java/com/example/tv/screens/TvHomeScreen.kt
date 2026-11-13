@@ -21,6 +21,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.data.LivePreferences
+import com.example.data.StreamLines
 import com.example.tv.channel.ChannelManager
 import com.example.tv.components.TvActionButton
 import com.example.tv.components.TvFocusableCard
@@ -41,21 +42,22 @@ fun TvHomeScreen(
     val context = LocalContext.current
     val preferences = remember { LivePreferences(context) }
     val channelManager = remember { ChannelManager(context) }
-    val coroutineScope = rememberCoroutineScope()
 
     var currentTargetUrl by remember { mutableStateOf(preferences.targetUrl) }
-    var historyUrls by remember { mutableStateOf(preferences.getHistoryUrls()) }
-    var isDesktopUa by remember { mutableStateOf(preferences.isDesktopUa) }
+    val currentLine = remember(currentTargetUrl) { StreamLines.detectLine(currentTargetUrl) }
+    val activeBaseUrl = remember(currentLine) { StreamLines.baseUrl(currentLine) }
+
     var showClearCacheDialog by remember { mutableStateOf(false) }
     var showUpdateDialog by remember { mutableStateOf(false) }
     var showChannelDialog by remember { mutableStateOf(false) }
     var channels by remember { mutableStateOf(channelManager.loadChannels()) }
     var probeStatusTip by remember { mutableStateOf("正在检测在线状态...") }
 
-    // 进入中控台后：先展示本地列表，再自动调用同源 live.php?batch= 探测真实在线状态
-    LaunchedEffect(Unit) {
+    // 进页及切换主备线路时：先展示本地列表，再自动调用当前线路的 live.php?batch= 探测真实在线状态
+    LaunchedEffect(activeBaseUrl) {
+        probeStatusTip = "正在检测在线状态..."
         try {
-            val outcome = channelManager.probeLiveStatus(ChannelManager.DEFAULT_BASE_URL, channels)
+            val outcome = channelManager.probeLiveStatus(activeBaseUrl, channels)
             if (outcome.networkFailed) {
                 probeStatusTip = "在线检测失败，请检查网络"
                 Toast.makeText(context, "在线检测失败，请检查网络", Toast.LENGTH_SHORT).show()
@@ -80,7 +82,7 @@ fun TvHomeScreen(
         // 顶部大屏标题栏
         TvTopBar(
             title = "抖眸流控 · 电视大屏监控中控台",
-            subtitle = "当前中控服务: https://tv.fuxiaoya.com · $probeStatusTip"
+            subtitle = "当前中控服务: $activeBaseUrl · $probeStatusTip"
         ) {
             TvActionButton(
                 text = "频道管理",
@@ -139,6 +141,8 @@ fun TvHomeScreen(
                             onClick = {
                                 val intent = Intent(context, TvFullscreenPlayerActivity::class.java).apply {
                                     putExtra(TvFullscreenPlayerActivity.EXTRA_RID, channel.rid)
+                                    putExtra(TvFullscreenPlayerActivity.EXTRA_LINE, currentLine)
+                                    putExtra(TvFullscreenPlayerActivity.EXTRA_BASE_URL, activeBaseUrl)
                                     putExtra(TvFullscreenPlayerActivity.EXTRA_TITLE, channel.name)
                                 }
                                 context.startActivity(intent)
@@ -226,9 +230,10 @@ fun TvHomeScreen(
                             onClick = {
                                 preferences.targetUrl = LivePreferences.DEFAULT_URL
                                 currentTargetUrl = LivePreferences.DEFAULT_URL
-                                Toast.makeText(context, "已设为默认中控（tv.fuxiaoya.com）", Toast.LENGTH_SHORT).show()
+                                TvFullscreenPlayerActivity.clearStreamCache()
+                                Toast.makeText(context, "已切至主线（tv.fuxiaoya.com）", Toast.LENGTH_SHORT).show()
                             },
-                            isHighlighted = currentTargetUrl == LivePreferences.DEFAULT_URL,
+                            isHighlighted = currentLine == 1,
                             modifier = Modifier.width(220.dp)
                         ) { isFocused ->
                             Column {
@@ -236,11 +241,11 @@ fun TvHomeScreen(
                                     Box(
                                         modifier = Modifier
                                             .size(8.dp)
-                                            .background(if (currentTargetUrl == LivePreferences.DEFAULT_URL) DouyinGreen else Color.Gray, CircleShape)
+                                            .background(if (currentLine == 1) DouyinGreen else Color.Gray, CircleShape)
                                     )
                                     Spacer(modifier = Modifier.width(8.dp))
                                     Text(
-                                        text = "官方主线 (默认)",
+                                        text = "官方主线 (线路一)",
                                         color = if (isFocused) DouyinCyan else TextPrimary,
                                         fontWeight = FontWeight.Bold,
                                         fontSize = 14.sp
@@ -248,7 +253,7 @@ fun TvHomeScreen(
                                 }
                                 Spacer(modifier = Modifier.height(4.dp))
                                 Text(
-                                    text = LivePreferences.DEFAULT_URL,
+                                    text = StreamLines.LINE_1,
                                     color = TextSecondary,
                                     fontSize = 11.sp,
                                     maxLines = 1,
@@ -261,11 +266,12 @@ fun TvHomeScreen(
                     item {
                         TvFocusableCard(
                             onClick = {
-                                preferences.targetUrl = LivePreferences.LINE_TWO_URL
-                                currentTargetUrl = LivePreferences.LINE_TWO_URL
-                                Toast.makeText(context, "已设为备用线路", Toast.LENGTH_SHORT).show()
+                                preferences.targetUrl = StreamLines.LINE_2
+                                currentTargetUrl = StreamLines.LINE_2
+                                TvFullscreenPlayerActivity.clearStreamCache()
+                                Toast.makeText(context, "已切至线路二（dy.whomao.com）", Toast.LENGTH_SHORT).show()
                             },
-                            isHighlighted = currentTargetUrl == LivePreferences.LINE_TWO_URL,
+                            isHighlighted = currentLine == 2,
                             modifier = Modifier.width(220.dp)
                         ) { isFocused ->
                             Column {
@@ -273,11 +279,11 @@ fun TvHomeScreen(
                                     Box(
                                         modifier = Modifier
                                             .size(8.dp)
-                                            .background(if (currentTargetUrl == LivePreferences.LINE_TWO_URL) DouyinGreen else Color.Gray, CircleShape)
+                                            .background(if (currentLine == 2) DouyinGreen else Color.Gray, CircleShape)
                                     )
                                     Spacer(modifier = Modifier.width(8.dp))
                                     Text(
-                                        text = "备用线路",
+                                        text = "备用线路 (线路二)",
                                         color = if (isFocused) DouyinCyan else TextPrimary,
                                         fontWeight = FontWeight.Bold,
                                         fontSize = 14.sp
@@ -285,7 +291,7 @@ fun TvHomeScreen(
                                 }
                                 Spacer(modifier = Modifier.height(4.dp))
                                 Text(
-                                    text = LivePreferences.LINE_TWO_URL,
+                                    text = StreamLines.LINE_2,
                                     color = TextSecondary,
                                     fontSize = 11.sp,
                                     maxLines = 1,
@@ -440,6 +446,7 @@ fun TvHomeScreen(
 
     if (showChannelDialog) {
         ChannelManageDialog(
+            activeBaseUrl = activeBaseUrl,
             onDismiss = {
                 showChannelDialog = false
                 channels = channelManager.loadChannels()
@@ -448,6 +455,8 @@ fun TvHomeScreen(
                 showChannelDialog = false
                 val intent = Intent(context, TvFullscreenPlayerActivity::class.java).apply {
                     putExtra(TvFullscreenPlayerActivity.EXTRA_RID, channel.rid)
+                    putExtra(TvFullscreenPlayerActivity.EXTRA_LINE, currentLine)
+                    putExtra(TvFullscreenPlayerActivity.EXTRA_BASE_URL, activeBaseUrl)
                     putExtra(TvFullscreenPlayerActivity.EXTRA_TITLE, channel.name)
                 }
                 context.startActivity(intent)

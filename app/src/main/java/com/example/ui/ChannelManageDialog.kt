@@ -20,6 +20,8 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.example.data.LivePreferences
+import com.example.data.StreamLines
 import com.example.tv.channel.Channel
 import com.example.tv.channel.ChannelManager
 import com.example.ui.theme.*
@@ -34,12 +36,15 @@ import kotlinx.coroutines.launch
  */
 @Composable
 fun ChannelManageDialog(
+    activeBaseUrl: String? = null,
     onDismiss: () -> Unit,
     onSelectChannelToPlay: (Channel) -> Unit
 ) {
     val context = LocalContext.current
     val coroutineScope = rememberCoroutineScope()
     val channelManager = remember { ChannelManager(context) }
+    val preferences = remember { LivePreferences(context) }
+    val resolvedBaseUrl = activeBaseUrl?.takeIf { it.isNotBlank() } ?: preferences.activeBaseUrl
 
     var channels by remember { mutableStateOf(channelManager.loadChannels()) }
     var remoteUrlInput by remember { mutableStateOf("") }
@@ -129,7 +134,7 @@ fun ChannelManageDialog(
                                     isImporting = true
                                     coroutineScope.launch {
                                         val res = channelManager.remoteImportViaProxy(
-                                            baseUrl = "https://tv.fuxiaoya.com",
+                                            baseUrl = resolvedBaseUrl,
                                             remoteUrl = remoteUrlInput
                                         )
                                         isImporting = false
@@ -177,8 +182,8 @@ fun ChannelManageDialog(
                                 color = TextSecondary
                             )
                             SuggestionChip(
-                                onClick = { remoteUrlInput = "https://tv.fuxiaoya.com/dy.json" },
-                                label = { Text("官方主线 (dy.json)", fontSize = 11.sp) },
+                                onClick = { remoteUrlInput = "${StreamLines.LINE_1}/dy.json" },
+                                label = { Text("主线 (tv.fuxiaoya.com)", fontSize = 11.sp) },
                                 colors = SuggestionChipDefaults.suggestionChipColors(
                                     containerColor = DarkBg,
                                     labelColor = DouyinCyan
@@ -189,8 +194,8 @@ fun ChannelManageDialog(
                                 )
                             )
                             SuggestionChip(
-                                onClick = { remoteUrlInput = "https://tt.fuxiaoya.com/dy.json" },
-                                label = { Text("备用加速 (tt.fuxiaoya.com)", fontSize = 11.sp) },
+                                onClick = { remoteUrlInput = "${StreamLines.LINE_2}/dy.json" },
+                                label = { Text("线路二 (dy.whomao.com)", fontSize = 11.sp) },
                                 colors = SuggestionChipDefaults.suggestionChipColors(
                                     containerColor = DarkBg,
                                     labelColor = DouyinGreen
@@ -213,7 +218,7 @@ fun ChannelManageDialog(
                         onClick = {
                             isImporting = true
                             coroutineScope.launch {
-                                val outcome = channelManager.probeLiveStatus(ChannelManager.DEFAULT_BASE_URL, channels)
+                                val outcome = channelManager.probeLiveStatus(resolvedBaseUrl, channels)
                                 isImporting = false
                                 if (outcome.networkFailed) {
                                     Toast.makeText(context, "在线检测失败，请检查网络", Toast.LENGTH_SHORT).show()

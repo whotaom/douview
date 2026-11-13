@@ -20,6 +20,8 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.example.data.LivePreferences
+import com.example.data.StreamLines
 import com.example.ui.theme.*
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -178,10 +180,10 @@ fun ControlBottomSheet(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
-                        val isLine1 = currentUrl.startsWith("https://tv.fuxiaoya.com")
-                        val isLine2 = currentUrl.startsWith("https://www.whomao.com")
+                        val isLine1 = currentUrl.startsWith(StreamLines.LINE_1)
+                        val isLine2 = currentUrl.startsWith(StreamLines.LINE_2)
                         SuggestionChip(
-                            onClick = { onSwitchLine("https://tv.fuxiaoya.com/") },
+                            onClick = { onSwitchLine(LivePreferences.DEFAULT_URL) },
                             label = { Text("线路一 (主线)", fontSize = 11.sp) },
                             colors = SuggestionChipDefaults.suggestionChipColors(
                                 containerColor = if (isLine1) DouyinCyan.copy(alpha = 0.2f) else DarkSurface,
@@ -193,7 +195,7 @@ fun ControlBottomSheet(
                             )
                         )
                         SuggestionChip(
-                            onClick = { onSwitchLine("https://www.whomao.com") },
+                            onClick = { onSwitchLine(StreamLines.LINE_2) },
                             label = { Text("线路二 (备用)", fontSize = 11.sp) },
                             colors = SuggestionChipDefaults.suggestionChipColors(
                                 containerColor = if (isLine2) DouyinRed.copy(alpha = 0.2f) else DarkSurface,

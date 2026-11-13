@@ -8,9 +8,10 @@ class LivePreferences(context: Context) {
         context.getSharedPreferences("douyin_live_prefs", Context.MODE_PRIVATE)
 
     companion object {
-        const val DEFAULT_URL = "https://tv.fuxiaoya.com/"
-        const val LINE_TWO_URL = "https://www.whomao.com"
-        const val API_ENDPOINT_URL = "https://tv.fuxiaoya.com/live.php"
+        const val DEFAULT_URL = "${StreamLines.LINE_1}/"
+        const val LINE_TWO_URL = StreamLines.LINE_2
+        const val API_ENDPOINT_URL = "${StreamLines.LINE_1}/live.php"
+        private const val LEGACY_LINE_TWO_URL = "https://www.whomao.com"
         private const val KEY_TARGET_URL = "target_url"
         private const val KEY_KEEP_SCREEN_ON = "keep_screen_on"
         private const val KEY_DESKTOP_UA = "desktop_ua"
@@ -26,13 +27,23 @@ class LivePreferences(context: Context) {
     var targetUrl: String
         get() {
             val url = prefs.getString(KEY_TARGET_URL, DEFAULT_URL) ?: DEFAULT_URL
-            // 向下兼容与平滑迁移：若此前曾选中 live.php 纯接口地址，自动回退至综合前端界面
-            return if (url == API_ENDPOINT_URL) DEFAULT_URL else url
+            // 向下兼容与平滑迁移：旧版 live.php 或旧线路二域名自动迁移到新地址
+            return when {
+                url == API_ENDPOINT_URL -> DEFAULT_URL
+                url.trimEnd('/').equals(LEGACY_LINE_TWO_URL, ignoreCase = true) -> LINE_TWO_URL
+                else -> url
+            }
         }
         set(value) {
             prefs.edit().putString(KEY_TARGET_URL, value).apply()
             recordHistoryUrl(value)
         }
+
+    val currentLine: Int
+        get() = StreamLines.detectLine(targetUrl)
+
+    val activeBaseUrl: String
+        get() = StreamLines.baseUrl(currentLine)
 
     /**
      * 获取记忆的切换地址列表（限定最多 5 个，最近使用的排在最前）
