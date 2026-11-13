@@ -621,6 +621,13 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         val vs = next.videoSize
         if (vs.width > 0 && vs.height > 0) {
             updateAvatarVisibilityForVideoSize(vs)
+        } else {
+            isPortraitStream = true
+            avatarBg.visibility = if (!currentAvatarUrl.isNullOrBlank() && avatarBg.drawable != null) {
+                View.VISIBLE
+            } else {
+                View.GONE
+            }
         }
 
         try {
@@ -654,7 +661,8 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
     }
 
     private fun bindChannelAvatar(avatarUrl: String?) {
-        val clean = avatarUrl?.trim().orEmpty()
+        val rawTrimmed = avatarUrl?.trim().orEmpty()
+        val clean = if (rawTrimmed.startsWith("//")) "https:$rawTrimmed" else rawTrimmed
         if (clean.isBlank()) {
             avatarLoadJob?.cancel()
             currentAvatarUrl = null
@@ -714,7 +722,7 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
             BitmapFactory.decodeByteArray(bytes, 0, bytes.size, boundsOpts)
             val maxDim = maxOf(boundsOpts.outWidth, boundsOpts.outHeight)
             var sampleSize = 1
-            while (maxDim / sampleSize > 160) {
+            while (maxDim / sampleSize > 720) {
                 sampleSize *= 2
             }
 
@@ -723,7 +731,7 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
                 inPreferredConfig = Bitmap.Config.ARGB_8888
             }
             val raw = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, decodeOpts) ?: return null
-            val blurred = lightBoxBlur(raw, passes = 2)
+            val blurred = lightBoxBlur(raw, passes = 1)
             if (blurred !== raw) raw.recycle()
             blurred
         } catch (e: Exception) {
@@ -797,8 +805,8 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
                     val json = JSONObject(body)
                     if (json.optInt("code", 0) != 200) return@withContext emptyList<Pair<String, String>>() to null
 
-                    val avatarUrl = json.optString("avatar", "").trim()
-                        .ifBlank { json.optJSONObject("room")?.optString("avatar", "")?.trim().orEmpty() }
+                    val avatarUrl = ChannelManager.extractAvatarUrl(json)
+                        .ifBlank { ChannelManager.extractAvatarUrl(json.optJSONObject("room")) }
                         .takeIf { it.isNotBlank() }
 
                     val streamsObj = json.optJSONObject("streams") ?: return@withContext emptyList<Pair<String, String>>() to avatarUrl

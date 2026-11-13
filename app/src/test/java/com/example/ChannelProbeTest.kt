@@ -120,4 +120,33 @@ class ChannelProbeTest {
         assertFalse(loaded[1].isLive)
         assertFalse(loaded[1].statusKnown)
     }
+
+    @Test
+    fun `applyBatchProbeJson supports avatarUrl and posterUrl fallbacks and protocol-relative urls`() {
+        val channels = listOf(
+            Channel(rid = "1001", name = "频道A"),
+            Channel(rid = "1002", name = "频道B")
+        )
+        val map = channels.associateBy { it.rid }.toMutableMap()
+
+        val json = """
+            {
+              "code": 200,
+              "batch": {
+                "1001": {
+                  "status": "live",
+                  "avatarUrl": "//img.example.com/a.jpg"
+                },
+                "1002": {
+                  "status": "live",
+                  "posterUrl": "https://img.example.com/b.jpg"
+                }
+              }
+            }
+        """.trimIndent()
+
+        assertTrue(ChannelManager.applyBatchProbeJson(map, json))
+        assertEquals("https://img.example.com/a.jpg", map["1001"]!!.avatar)
+        assertEquals("https://img.example.com/b.jpg", map["1002"]!!.avatar)
+    }
 }

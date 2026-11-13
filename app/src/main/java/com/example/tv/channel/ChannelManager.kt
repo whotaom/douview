@@ -67,6 +67,15 @@ class ChannelManager(private val context: Context) {
          * - "unknown" / 其他 -> 绝不强改原 isLive，仅标 statusKnown = false
          * 若 code != 200 或 batch 缺失/为空，返回 null（不破坏本地列表）。
          */
+        fun extractAvatarUrl(obj: JSONObject?): String {
+            if (obj == null) return ""
+            val raw = listOf("avatar", "avatarUrl", "posterUrl", "cover")
+                .firstNotNullOfOrNull { key ->
+                    obj.optString(key, "").trim().takeIf { it.isNotBlank() }
+                } ?: ""
+            return if (raw.startsWith("//")) "https:$raw" else raw
+        }
+
         fun applyBatchProbeJson(
             currentMap: MutableMap<String, Channel>,
             jsonBody: String
@@ -93,7 +102,7 @@ class ChannelManager(private val context: Context) {
                 val statusStr = item.optString("status", "").trim().lowercase()
                 val nextName = item.optString("name", "").trim().takeIf { it.isNotBlank() } ?: old.name
                 val nextTitle = item.optString("title", "").trim().takeIf { it.isNotBlank() } ?: old.title
-                val nextAvatar = item.optString("avatar", "").trim().takeIf { it.isNotBlank() } ?: old.avatar
+                val nextAvatar = extractAvatarUrl(item).takeIf { it.isNotBlank() } ?: old.avatar
 
                 currentMap[rid] = when (statusStr) {
                     "live" -> old.copy(
@@ -400,7 +409,7 @@ class ChannelManager(private val context: Context) {
                             rid = rid,
                             name = obj.optString("name", "房间 $rid").ifBlank { "房间 $rid" },
                             title = obj.optString("title", ""),
-                            avatar = obj.optString("avatar", ""),
+                            avatar = extractAvatarUrl(obj),
                             isLive = obj.optBoolean("isLive", false),
                             statusKnown = obj.optBoolean("statusKnown", false)
                         )
