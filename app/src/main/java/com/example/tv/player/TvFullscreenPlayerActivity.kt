@@ -1,25 +1,17 @@
 package com.example.tv.player
 
-import android.graphics.Bitmap
 import android.graphics.Color
-import android.graphics.RenderEffect
-import android.graphics.Shader
 import android.net.Uri
-import android.os.Build
 import android.os.Bundle
 import android.os.Handler
-import android.os.HandlerThread
 import android.os.Looper
 import android.text.TextUtils
 import android.util.Log
 import android.view.Gravity
 import android.view.KeyEvent
-import android.view.PixelCopy
-import android.view.SurfaceView
 import android.view.View
 import android.view.WindowManager
 import android.widget.FrameLayout
-import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
@@ -40,7 +32,6 @@ import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.exoplayer.trackselection.DefaultTrackSelector
 import androidx.media3.exoplayer.upstream.DefaultBandwidthMeter
-import androidx.media3.ui.PlayerView
 import com.example.R
 import com.example.data.LivePreferences
 import com.example.data.StreamLines
@@ -84,10 +75,6 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         val streamCacheTime = mutableMapOf<String, Long>()
         const val CACHE_TTL = 5 * 60 * 1000L
 
-        private const val AMBIENT_SAMPLE_W = 144
-        private const val AMBIENT_SAMPLE_H = 256
-        private const val AMBIENT_INTERVAL_MS = 220L
-
         fun clearStreamCache() {
             streamCache.clear()
             streamCacheTime.clear()
@@ -98,11 +85,11 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
     private lateinit var preferences: LivePreferences
     private var currentLine: Int = 1
     private var dynamicBgEnabled: Boolean = true
+    private var allowBlur: Boolean = false
 
     // UI 组件
     private lateinit var root: FrameLayout
-    private lateinit var ambientBgView: ImageView          // 竖屏两侧动态轻磨砂背景（零压暗，1.06x 防露边）
-    private lateinit var playerView: PlayerView            // 单一全屏主播放器
+    private lateinit var videoStageView: AmbientVideoStageView // 单解码双层直出舞台（默认清晰 ZOOM，可选 ≤5px 轻磨砂，零压暗）
     private lateinit var tipView: TextView                 // 顶部高层级换台与状态提示
     private lateinit var channelMenu: FrameLayout          // 左侧在线选台悬浮面板
     private lateinit var menuTitleView: TextView           // 选台菜单标题：「在线频道（N）」
@@ -144,21 +131,6 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         }
     }
 
-    // 单解码动态背景轻采样线程（仅竖屏直播启用，48×85 像素几乎零开销）
-    private var ambientThread: HandlerThread? = null
-    private var ambientHandler: Handler? = null
-    private var ambientSampleBitmap: Bitmap? = null
-    private var ambientErrorCount = 0
-    private var isAmbientSampling = false
-
-    private val ambientTickRunnable = object : Runnable {
-        override fun run() {
-            if (!isAmbientSampling || isFinishing || isDestroyed) return
-            captureAmbientFrame()
-            mainHandler.postDelayed(this, AMBIENT_INTERVAL_MS)
-        }
-    }
-
     private val okHttpClient = OkHttpClient.Builder()
         .connectTimeout(12, TimeUnit.SECONDS)
         .readTimeout(15, TimeUnit.SECONDS)
@@ -174,7 +146,8 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         channelManager = ChannelManager(this)
         currentLine = resolveInitialLine()
         dynamicBgEnabled = preferences.dynamicBgEnabled
-        applyDynamicBg(dynamicBgEnabled)
+        allowBlur = preferences.dynamicBgBlurEnabled
+        applyDynamicBackground()
 
         setupPlayListAndStart()
 
@@ -206,14 +179,14 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
     private fun buildUi() {
         setContentView(R.layout.activity_tv_fullscreen_player)
         root = findViewById(R.id.rootContainer)
-        ambientBgView = findViewById(R.id.ambientBgView)
-        playerView = findViewById(R.id.playerView)
+        videoStageView = findViewById(R.id.videoStageView)
         tipView = findViewById(R.id.tipView)
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            ambientBgView.setRenderEffect(
-                RenderEffect.createBlurEffect(8f, 8f, Shader.TileMode.CLAMP)
-            )
+        videoStageView.onFirstFrameRendered = {
+            if (!isFinishing && !isDestroyed && tipView.visibility == View.VISIBLE) {
+                tipView.removeCallbacks(hideTipRunnable)
+                tipView.postDelayed(hideTipRunnable, 600)
+            }
         }
 
         // 1. 左侧在线选台悬浮面板（仅占 400dp，无全屏遮罩）
@@ -522,9 +495,10 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
                 cancelBufferingTimeout()
                 if (preparingPlayer === next) {
                     swapTo(next, gen, name)
+                } else if (player === next && tipView.visibility == View.VISIBLE) {
+                    tipView.removeCallbacks(hideTipRunnable)
+                    tipView.postDelayed(hideTipRunnable, 600)
                 }
-                // 首帧出画后将 shutter 改为透明，以便竖屏流透出两侧动态氛围背景
-                playerView.setShutterBackgroundColor(Color.TRANSPARENT)
             }
 
             override fun onPlayerError(error: PlaybackException) {
@@ -552,7 +526,9 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
 
             override fun onVideoSizeChanged(videoSize: VideoSize) {
                 if (player === next && videoSize.width > 0 && videoSize.height > 0) {
-                    updateAmbientModeForVideoSize(videoSize.width, videoSize.height)
+                    val effectiveW = (videoSize.width * videoSize.pixelWidthHeightRatio).toInt().coerceAtLeast(1)
+                    isVideoPortrait = videoSize.height > effectiveW
+                    videoStageView.setVideoSize(effectiveW, videoSize.height)
                 }
                 Log.d(TAG, "视频尺寸已更新: ${videoSize.width}x${videoSize.height}")
             }
@@ -571,7 +547,7 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
     }
 
     /**
-     * 瞬间切换：新流上屏，同时阻断并释放旧播放器
+     * 瞬间切换：先解绑并释放旧播放器，再把新流绑定到单一 SurfaceTexture 舞台
      */
     private fun swapTo(next: ExoPlayer, gen: Long, name: String) {
         if (gen != switchGen || isFinishing || isDestroyed) {
@@ -582,23 +558,18 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
 
         failedRidsThisRound.clear()
         val old = player
-        player = next
         if (preparingPlayer === next) {
             preparingPlayer = null
         }
 
-        playerView.player = next
-        val vs = next.videoSize
-        if (vs.width > 0 && vs.height > 0) {
-            updateAmbientModeForVideoSize(vs.width, vs.height)
-        }
-
+        videoStageView.detachPlayer(old)
         try {
             old?.stop()
             old?.clearMediaItems()
             old?.release()
         } catch (_: Exception) {}
 
+        onPlayerBound(next)
         showTip("已切换到：$name", autoHide = true)
     }
 
@@ -611,131 +582,25 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         preparingPlayer = null
     }
 
-    // -------------------- 单解码动态轻磨砂背景（仅竖屏且开关开启时启用，零压暗） --------------------
+    // -------------------- 单解码动态背景配置（默认清晰 ZOOM，可选 ≤5px 轻磨砂，零压暗） --------------------
 
-    private fun applyDynamicBg(enabled: Boolean) {
-        dynamicBgEnabled = enabled
-        if (enabled && isVideoPortrait) {
-            ambientBgView.visibility = View.VISIBLE
-            playerView.setShutterBackgroundColor(Color.TRANSPARENT)
-            startAmbientSampler()
-        } else {
-            stopAmbientSampler()
-            ambientBgView.setImageDrawable(null)
-            ambientBgView.visibility = View.GONE
-        }
+    private fun applyDynamicBackground() {
+        videoStageView.setBackgroundConfig(
+            enabled = dynamicBgEnabled,
+            blur = allowBlur
+        )
     }
 
-    private fun updateAmbientModeForVideoSize(width: Int, height: Int) {
-        isVideoPortrait = height > width
-        applyDynamicBg(dynamicBgEnabled)
-    }
-
-    private fun startAmbientSampler() {
-        if (!dynamicBgEnabled || !isVideoPortrait) return
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O || ambientErrorCount >= 3) return
-        if (isAmbientSampling) return
-        if (ambientThread == null) {
-            ambientThread = HandlerThread("AmbientSampler").apply { start() }
-            ambientHandler = Handler(ambientThread!!.looper)
+    private fun onPlayerBound(exo: ExoPlayer) {
+        player = exo
+        videoStageView.attachPlayer(exo)
+        val vs = exo.videoSize
+        if (vs.width > 0 && vs.height > 0) {
+            val effectiveW = (vs.width * vs.pixelWidthHeightRatio).toInt().coerceAtLeast(1)
+            isVideoPortrait = vs.height > effectiveW
+            videoStageView.setVideoSize(effectiveW, vs.height)
         }
-        isAmbientSampling = true
-        mainHandler.removeCallbacks(ambientTickRunnable)
-        mainHandler.post(ambientTickRunnable)
-    }
-
-    private fun stopAmbientSampler() {
-        isAmbientSampling = false
-        mainHandler.removeCallbacks(ambientTickRunnable)
-    }
-
-    private fun captureAmbientFrame() {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O || ambientErrorCount >= 3) return
-        val p = player ?: return
-        if (!p.isPlaying || !isVideoPortrait || !dynamicBgEnabled) return
-        val surfaceView = playerView.videoSurfaceView as? SurfaceView ?: return
-        val surface = surfaceView.holder?.surface ?: return
-        if (!surface.isValid) return
-        val bgHandler = ambientHandler ?: return
-
-        val sample = ambientSampleBitmap ?: Bitmap.createBitmap(
-            AMBIENT_SAMPLE_W,
-            AMBIENT_SAMPLE_H,
-            Bitmap.Config.ARGB_8888
-        ).also { ambientSampleBitmap = it }
-
-        try {
-            PixelCopy.request(
-                surfaceView,
-                sample,
-                { result ->
-                    if (result == PixelCopy.SUCCESS && isAmbientSampling && dynamicBgEnabled && !isFinishing && !isDestroyed) {
-                        ambientErrorCount = 0
-                        val displayBmp = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                            // Android 12+ 使用硬件 RenderEffect(8f) 轻磨砂，拷贝为独立显示帧
-                            sample.copy(Bitmap.Config.ARGB_8888, false)
-                        } else {
-                            // 低版本系统走轻量单次盒式模糊（约 8px 磨砂感）
-                            fastBoxBlurTiny(sample)
-                        }
-                        mainHandler.post {
-                            if (dynamicBgEnabled && isVideoPortrait && !isFinishing && !isDestroyed) {
-                                ambientBgView.setImageBitmap(displayBmp)
-                            }
-                        }
-                    } else if (result != PixelCopy.SUCCESS) {
-                        ambientErrorCount++
-                        if (ambientErrorCount >= 3) stopAmbientSampler()
-                    }
-                },
-                bgHandler
-            )
-        } catch (_: Throwable) {
-            ambientErrorCount++
-            if (ambientErrorCount >= 3) stopAmbientSampler()
-        }
-    }
-
-    /**
-     * 对 48×85 微型采样帧做轻量盒式模糊（4080 像素耗时 <0.2ms），无需 RenderEffect 着色器即可平滑铺满两侧
-     */
-    private fun fastBoxBlurTiny(src: Bitmap): Bitmap {
-        val w = src.width
-        val h = src.height
-        val pix = IntArray(w * h)
-        src.getPixels(pix, 0, w, 0, 0, w, h)
-        val tmp = IntArray(w * h)
-
-        // 水平 3-tap 均值
-        for (y in 0 until h) {
-            val row = y * w
-            for (x in 0 until w) {
-                val p0 = pix[row + (x - 1).coerceAtLeast(0)]
-                val p1 = pix[row + x]
-                val p2 = pix[row + (x + 1).coerceAtMost(w - 1)]
-                val r = (((p0 shr 16) and 0xFF) + ((p1 shr 16) and 0xFF) + ((p2 shr 16) and 0xFF)) / 3
-                val g = (((p0 shr 8) and 0xFF) + ((p1 shr 8) and 0xFF) + ((p2 shr 8) and 0xFF)) / 3
-                val b = ((p0 and 0xFF) + (p1 and 0xFF) + (p2 and 0xFF)) / 3
-                tmp[row + x] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
-            }
-        }
-        // 垂直 3-tap 均值
-        for (y in 0 until h) {
-            val y0 = (y - 1).coerceAtLeast(0) * w
-            val y1 = y * w
-            val y2 = (y + 1).coerceAtMost(h - 1) * w
-            for (x in 0 until w) {
-                val p0 = tmp[y0 + x]
-                val p1 = tmp[y1 + x]
-                val p2 = tmp[y2 + x]
-                val r = (((p0 shr 16) and 0xFF) + ((p1 shr 16) and 0xFF) + ((p2 shr 16) and 0xFF)) / 3
-                val g = (((p0 shr 8) and 0xFF) + ((p1 shr 8) and 0xFF) + ((p2 shr 8) and 0xFF)) / 3
-                val b = ((p0 and 0xFF) + (p1 and 0xFF) + (p2 and 0xFF)) / 3
-                pix[y1 + x] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
-            }
-        }
-
-        return Bitmap.createBitmap(pix, w, h, Bitmap.Config.ARGB_8888)
+        applyDynamicBackground()
     }
 
     // -------------------- 取流与超时 --------------------
@@ -815,12 +680,12 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
                 }
             }
         }.also {
-            playerView.postDelayed(it, BUFFERING_TIMEOUT_MS)
+            mainHandler.postDelayed(it, BUFFERING_TIMEOUT_MS)
         }
     }
 
     private fun cancelBufferingTimeout() {
-        bufferingTimeoutRunnable?.let { playerView.removeCallbacks(it) }
+        bufferingTimeoutRunnable?.let { mainHandler.removeCallbacks(it) }
         bufferingTimeoutRunnable = null
     }
 
@@ -924,6 +789,12 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
             else -> "已离线"
         }
 
+        val bgStatusText = when {
+            !dynamicBgEnabled -> "关闭（纯黑底）"
+            allowBlur -> "开启（≤5px 轻磨砂 · 零压暗）"
+            else -> "开启（清晰 ZOOM 铺满 · 零压暗）"
+        }
+
         infoOverlay.text = buildString {
             append("频道：${ch.name}\n")
             append("房间：${ch.rid}\n")
@@ -936,7 +807,7 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
             append("码率：${if (kbps > 0) "约 $kbps kbps" else "自适应"}\n")
             append("缓冲：${p?.totalBufferedDuration ?: 0} ms\n")
             append("线路：$lineLabel\n")
-            append("动态背景：${if (dynamicBgEnabled) "开启（轻磨砂 · 零压暗）" else "关闭（纯黑底）"}\n")
+            append("动态背景：$bgStatusText\n")
             append("播放状态：$playStateText\n")
             append("────────────────\n（再次按 OK 或返回键关闭）")
         }
@@ -1095,12 +966,12 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
 
     private fun releasePlayerOnly() {
         cancelBufferingTimeout()
-        stopAmbientSampler()
-        playerView.player = null
+        val old = player
+        videoStageView.detachPlayer(old)
         try {
-            player?.stop()
-            player?.clearMediaItems()
-            player?.release()
+            old?.stop()
+            old?.clearMediaItems()
+            old?.release()
         } catch (_: Exception) {}
         player = null
     }
@@ -1112,26 +983,32 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         tipView.removeCallbacks(hideTipRunnable)
         releasePreparing()
         releasePlayerOnly()
-        ambientThread?.quitSafely()
-        ambientThread = null
-        ambientHandler = null
-        ambientSampleBitmap?.recycle()
-        ambientSampleBitmap = null
     }
 
     override fun onStop() {
         super.onStop()
-        stopAmbientSampler()
         mainHandler.removeCallbacks(infoRefreshRunnable)
         player?.playWhenReady = false
         releasePreparing()
         cancelBufferingTimeout()
     }
 
+    override fun onResume() {
+        super.onResume()
+        videoStageView.onResume()
+    }
+
+    override fun onPause() {
+        videoStageView.onPause()
+        super.onPause()
+    }
+
     override fun onStart() {
         super.onStart()
+        dynamicBgEnabled = preferences.dynamicBgEnabled
+        allowBlur = preferences.dynamicBgBlurEnabled
+        applyDynamicBackground()
         player?.playWhenReady = true
-        applyDynamicBg(preferences.dynamicBgEnabled)
         if (isInfoShowing) {
             mainHandler.removeCallbacks(infoRefreshRunnable)
             mainHandler.postDelayed(infoRefreshRunnable, 1000L)

@@ -99,12 +99,17 @@ class ExampleRobolectricTest {
     val context = ApplicationProvider.getApplicationContext<Context>()
     val prefs = LivePreferences(context)
     assertTrue(prefs.dynamicBgEnabled)
+    assertEquals(false, prefs.dynamicBgBlurEnabled)
 
     prefs.dynamicBgEnabled = false
+    prefs.dynamicBgBlurEnabled = true
     assertEquals(false, LivePreferences(context).dynamicBgEnabled)
+    assertTrue(LivePreferences(context).dynamicBgBlurEnabled)
 
     prefs.dynamicBgEnabled = true
+    prefs.dynamicBgBlurEnabled = false
     assertTrue(LivePreferences(context).dynamicBgEnabled)
+    assertEquals(false, LivePreferences(context).dynamicBgBlurEnabled)
   }
 }
 

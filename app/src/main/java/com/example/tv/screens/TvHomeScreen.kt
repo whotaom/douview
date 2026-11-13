@@ -51,6 +51,8 @@ fun TvHomeScreen(
     var showUpdateDialog by remember { mutableStateOf(false) }
     var showChannelDialog by remember { mutableStateOf(false) }
     var dynamicBgEnabled by remember { mutableStateOf(preferences.dynamicBgEnabled) }
+    var dynamicBgBlurEnabled by remember { mutableStateOf(preferences.dynamicBgBlurEnabled) }
+    var keepScreenOn by remember { mutableStateOf(preferences.keepScreenOn) }
     var channels by remember { mutableStateOf(channelManager.loadChannels()) }
     var probeStatusTip by remember { mutableStateOf("正在检测在线状态...") }
 
@@ -99,11 +101,12 @@ fun TvHomeScreen(
                     val next = !dynamicBgEnabled
                     dynamicBgEnabled = next
                     preferences.dynamicBgEnabled = next
-                    Toast.makeText(
-                        context,
-                        if (next) "动态背景已开启（轻磨砂 · 零压暗）" else "动态背景已关闭（纯黑底）",
-                        Toast.LENGTH_SHORT
-                    ).show()
+                    val toastMsg = when {
+                        !next -> "动态背景已关闭（纯黑底）"
+                        dynamicBgBlurEnabled -> "动态背景已开启（≤5px 轻磨砂 · 零压暗）"
+                        else -> "动态背景已开启（清晰 ZOOM 铺满 · 人眼可辨）"
+                    }
+                    Toast.makeText(context, toastMsg, Toast.LENGTH_SHORT).show()
                 }
             )
 
@@ -355,7 +358,7 @@ fun TvHomeScreen(
                         onClick = { onEnterPlayer("") },
                         focusedBorderColor = DouyinRed,
                         modifier = Modifier
-                            .weight(1.8f)
+                            .weight(1.5f)
                             .height(115.dp)
                     ) { isFocused ->
                         Row(
@@ -397,12 +400,13 @@ fun TvHomeScreen(
                     // 辅助功能卡片：屏幕常亮守护
                     TvFocusableCard(
                         onClick = {
-                            val next = !preferences.keepScreenOn
+                            val next = !keepScreenOn
+                            keepScreenOn = next
                             preferences.keepScreenOn = next
                             Toast.makeText(context, if (next) "大屏屏幕常亮已开启" else "大屏屏幕常亮已关闭", Toast.LENGTH_SHORT).show()
                         },
                         modifier = Modifier
-                            .weight(1.2f)
+                            .weight(1.0f)
                             .height(115.dp)
                     ) { isFocused ->
                         Column(
@@ -426,7 +430,56 @@ fun TvHomeScreen(
                             }
                             Spacer(modifier = Modifier.height(6.dp))
                             Text(
-                                text = if (preferences.keepScreenOn) "常亮守护运行中（无黑屏休眠）" else "系统默认休眠策略",
+                                text = if (keepScreenOn) "常亮守护运行中（无黑屏休眠）" else "系统默认休眠策略",
+                                color = TextSecondary,
+                                fontSize = 12.sp
+                            )
+                        }
+                    }
+
+                    // 辅助功能卡片：背景磨砂开关（默认关闭 -> 清晰 ZOOM 铺满最稳；可手动开启 ≤5px 轻磨砂）
+                    TvFocusableCard(
+                        onClick = {
+                            val next = !dynamicBgBlurEnabled
+                            dynamicBgBlurEnabled = next
+                            preferences.dynamicBgBlurEnabled = next
+                            Toast.makeText(
+                                context,
+                                if (next) "背景轻磨砂已开启（≤5px，动态仍可辨）" else "背景磨砂已关闭（清晰 ZOOM 铺满，最稳）",
+                                Toast.LENGTH_SHORT
+                            ).show()
+                        },
+                        isHighlighted = dynamicBgBlurEnabled,
+                        modifier = Modifier
+                            .weight(1.0f)
+                            .height(115.dp)
+                    ) { isFocused ->
+                        Column(
+                            modifier = Modifier.fillMaxSize(),
+                            verticalArrangement = Arrangement.Center
+                        ) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Icon(
+                                    imageVector = if (dynamicBgBlurEnabled) Icons.Default.BlurOn else Icons.Default.BlurOff,
+                                    contentDescription = null,
+                                    tint = when {
+                                        isFocused -> DouyinCyan
+                                        dynamicBgBlurEnabled -> DouyinCyan
+                                        else -> DouyinGreen
+                                    },
+                                    modifier = Modifier.size(24.dp)
+                                )
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text(
+                                    text = if (dynamicBgBlurEnabled) "背景磨砂：开" else "背景磨砂：关",
+                                    color = TextPrimary,
+                                    fontSize = 16.sp,
+                                    fontWeight = FontWeight.Bold
+                                )
+                            }
+                            Spacer(modifier = Modifier.height(6.dp))
+                            Text(
+                                text = if (dynamicBgBlurEnabled) "当前：5px 轻磨砂增强" else "当前：清晰 ZOOM 铺满（最稳）",
                                 color = TextSecondary,
                                 fontSize = 12.sp
                             )

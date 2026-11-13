@@ -6,29 +6,11 @@
     android:layout_height="match_parent"
     android:background="#000000">
 
-    <!-- 1. 竖屏两侧动态磨砂氛围背景（单解码轻采样放大 + 1.06x 防露边 + 零压暗） -->
-    <ImageView
-        android:id="@+id/ambientBgView"
+    <!-- 1. 单解码双层直出动态舞台：1 个 ExoPlayer 同步绘制底层动态背景（默认清晰 ZOOM，可选 ≤5px 轻磨砂，零压暗）+ 顶层居中清晰主画面 -->
+    <com.example.tv.player.AmbientVideoStageView
+        android:id="@+id/videoStageView"
         android:layout_width="match_parent"
-        android:layout_height="match_parent"
-        android:alpha="1.0"
-        android:contentDescription="@null"
-        android:scaleType="centerCrop"
-        android:scaleX="1.06"
-        android:scaleY="1.06"
-        android:visibility="gone" />
-
-    <!-- 2. 全屏主播放器：横屏源自动铺满全屏，竖屏源居中清晰呈现并透出两侧动态磨砂背景 -->
-    <androidx.media3.ui.PlayerView
-        android:id="@+id/playerView"
-        android:layout_width="match_parent"
-        android:layout_height="match_parent"
-        android:background="@android:color/transparent"
-        app:surface_type="surface_view"
-        app:use_controller="false"
-        app:resize_mode="fit"
-        app:shutter_background_color="#000000"
-        app:keep_content_on_player_reset="true" />
+        android:layout_height="match_parent" />
 
     <!-- 3. 顶部居中换台与状态提示，高 elevation 防止被视频底层遮挡 -->
     <TextView
