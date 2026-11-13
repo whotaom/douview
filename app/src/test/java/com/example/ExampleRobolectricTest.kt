@@ -95,21 +95,16 @@ class ExampleRobolectricTest {
   }
 
   @Test
-  fun `dynamic background preference defaults true and persists`() {
+  fun `dynamic background preference defaults false and persists`() {
     val context = ApplicationProvider.getApplicationContext<Context>()
     val prefs = LivePreferences(context)
-    assertTrue(prefs.dynamicBgEnabled)
-    assertEquals(false, prefs.dynamicBgBlurEnabled)
-
-    prefs.dynamicBgEnabled = false
-    prefs.dynamicBgBlurEnabled = true
-    assertEquals(false, LivePreferences(context).dynamicBgEnabled)
-    assertTrue(LivePreferences(context).dynamicBgBlurEnabled)
+    assertEquals(false, prefs.dynamicBgEnabled)
 
     prefs.dynamicBgEnabled = true
-    prefs.dynamicBgBlurEnabled = false
     assertTrue(LivePreferences(context).dynamicBgEnabled)
-    assertEquals(false, LivePreferences(context).dynamicBgBlurEnabled)
+
+    prefs.dynamicBgEnabled = false
+    assertEquals(false, LivePreferences(context).dynamicBgEnabled)
   }
 }
 

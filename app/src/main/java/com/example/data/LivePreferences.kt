@@ -21,7 +21,6 @@ class LivePreferences(context: Context) {
         private const val KEY_AUTO_CLEAR_CACHE = "auto_clear_cache"
         private const val KEY_LAST_CLEAR_CACHE_TIME = "last_clear_cache_time"
         private const val KEY_TV_DYNAMIC_BG = "tv_dynamic_bg"
-        private const val KEY_TV_DYNAMIC_BG_BLUR = "tv_dynamic_bg_blur"
         const val MAX_HISTORY_URLS = 5
         const val AUTO_CLEAR_CACHE_INTERVAL_MS = 24 * 60 * 60 * 1000L // 24小时自动清理周期
     }
@@ -104,12 +103,8 @@ class LivePreferences(context: Context) {
         set(value) = prefs.edit().putBoolean(KEY_AUTO_CLEAR_CACHE, value).apply()
 
     var dynamicBgEnabled: Boolean
-        get() = prefs.getBoolean(KEY_TV_DYNAMIC_BG, true)
+        get() = prefs.getBoolean(KEY_TV_DYNAMIC_BG, false)
         set(value) = prefs.edit().putBoolean(KEY_TV_DYNAMIC_BG, value).apply()
-
-    var dynamicBgBlurEnabled: Boolean
-        get() = prefs.getBoolean(KEY_TV_DYNAMIC_BG_BLUR, false)
-        set(value) = prefs.edit().putBoolean(KEY_TV_DYNAMIC_BG_BLUR, value).apply()
 
     var lastClearCacheTime: Long
         get() = prefs.getLong(KEY_LAST_CLEAR_CACHE_TIME, 0L)

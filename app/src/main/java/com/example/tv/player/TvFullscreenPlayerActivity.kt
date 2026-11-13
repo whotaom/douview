@@ -2,6 +2,7 @@ package com.example.tv.player
 
 import android.graphics.Color
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -17,6 +18,7 @@ import android.widget.ScrollView
 import android.widget.TextView
 import androidx.activity.ComponentActivity
 import androidx.activity.OnBackPressedCallback
+import androidx.annotation.OptIn
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
@@ -25,6 +27,7 @@ import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.common.VideoSize
+import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.DefaultRenderersFactory
@@ -32,6 +35,8 @@ import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.exoplayer.trackselection.DefaultTrackSelector
 import androidx.media3.exoplayer.upstream.DefaultBandwidthMeter
+import androidx.media3.ui.AspectRatioFrameLayout
+import androidx.media3.ui.PlayerView
 import com.example.R
 import com.example.data.LivePreferences
 import com.example.data.StreamLines
@@ -84,24 +89,23 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
     private lateinit var channelManager: ChannelManager
     private lateinit var preferences: LivePreferences
     private var currentLine: Int = 1
-    private var dynamicBgEnabled: Boolean = true
-    private var allowBlur: Boolean = false
+    private var dynamicBgEnabled: Boolean = false
 
     // UI 组件
     private lateinit var root: FrameLayout
-    private lateinit var videoStageView: AmbientVideoStageView // 单解码双层直出舞台（默认清晰 ZOOM，可选 ≤5px 轻磨砂，零压暗）
+    private lateinit var playerView: PlayerView            // 唯一全屏主播放器（SurfaceView + FIT/ZOOM）
     private lateinit var tipView: TextView                 // 顶部高层级换台与状态提示
     private lateinit var channelMenu: FrameLayout          // 左侧在线选台悬浮面板
     private lateinit var menuTitleView: TextView           // 选台菜单标题：「在线频道（N）」
     private lateinit var channelMenuList: LinearLayout
     private lateinit var infoOverlay: TextView             // OK 键技术参数浮层（1s 实时刷新）
 
-    // 主播放器与后台备播播放器（先备后切）
+    // 主播放器与后台备播播放器（先备后切，禁止中间 player = null 空窗）
     private var player: ExoPlayer? = null
     private var preparingPlayer: ExoPlayer? = null
     private var isMenuShowing = false
     private var isInfoShowing = false
-    private var isVideoPortrait = false
+    private var hasRenderedFirstFrameForCurrent = false
 
     // 播放列表与当前索引
     private var playList: List<Channel> = emptyList()
@@ -116,9 +120,11 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
     private val SWITCH_MIN_INTERVAL = 250L
     private val failedRidsThisRound = mutableSetOf<String>()
 
-    // 缓冲超时监测 (12秒未就绪自动降清晰度)
+    // 缓冲超时监测 (12秒未就绪自动降清晰度) & 首帧看门狗 (开启 ZOOM 无首帧自动降级回 FIT)
     private var bufferingTimeoutRunnable: Runnable? = null
     private val BUFFERING_TIMEOUT_MS = 12_000L
+    private var firstFrameWatchdogRunnable: Runnable? = null
+    private val FIRST_FRAME_WATCHDOG_MS = 4_000L
 
     // OK 信息面板 1 秒实时刷新
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -146,8 +152,7 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         channelManager = ChannelManager(this)
         currentLine = resolveInitialLine()
         dynamicBgEnabled = preferences.dynamicBgEnabled
-        allowBlur = preferences.dynamicBgBlurEnabled
-        applyDynamicBackground()
+        applyDynamicBackground(dynamicBgEnabled)
 
         setupPlayListAndStart()
 
@@ -176,18 +181,15 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
 
     // -------------------- UI 结构构建 --------------------
 
+    @OptIn(UnstableApi::class)
     private fun buildUi() {
         setContentView(R.layout.activity_tv_fullscreen_player)
         root = findViewById(R.id.rootContainer)
-        videoStageView = findViewById(R.id.videoStageView)
+        playerView = findViewById(R.id.playerView)
         tipView = findViewById(R.id.tipView)
 
-        videoStageView.onFirstFrameRendered = {
-            if (!isFinishing && !isDestroyed && tipView.visibility == View.VISIBLE) {
-                tipView.removeCallbacks(hideTipRunnable)
-                tipView.postDelayed(hideTipRunnable, 600)
-            }
-        }
+        playerView.useController = false
+        playerView.resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
 
         // 1. 左侧在线选台悬浮面板（仅占 400dp，无全屏遮罩）
         channelMenu = FrameLayout(this).apply {
@@ -437,7 +439,7 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
             setExtensionRendererMode(DefaultRenderersFactory.EXTENSION_RENDERER_MODE_PREFER)
         }
         val loadControl = DefaultLoadControl.Builder()
-            .setBufferDurationsMs(8_000, 24_000, 1_500, 4_000)
+            .setBufferDurationsMs(10_000, 28_000, 2_000, 5_000)
             .build()
         val trackSelector = DefaultTrackSelector(this).apply {
             parameters = buildUponParameters()
@@ -477,12 +479,18 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
                         cancelBufferingTimeout()
                         if (preparingPlayer === next) {
                             swapTo(next, gen, name)
-                        } else if (player === next && tipView.visibility == View.VISIBLE) {
-                            tipView.postDelayed(hideTipRunnable, 600)
+                        } else if (player === next) {
+                            if (dynamicBgEnabled && !hasRenderedFirstFrameForCurrent) {
+                                scheduleFirstFrameWatchdog(gen, next)
+                            }
+                            if (tipView.visibility == View.VISIBLE) {
+                                tipView.postDelayed(hideTipRunnable, 600)
+                            }
                         }
                     }
                     Player.STATE_ENDED -> {
                         cancelBufferingTimeout()
+                        cancelFirstFrameWatchdog()
                         if (player === next) {
                             onChannelUnplayable("直播已结束")
                         }
@@ -493,11 +501,21 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
             override fun onRenderedFirstFrame() {
                 if (gen != switchGen) return
                 cancelBufferingTimeout()
+                Log.i(
+                    TAG,
+                    "onRenderedFirstFrame model=${Build.MODEL} channel=$name size=${next.videoSize.width}x${next.videoSize.height} dynamicBg=$dynamicBgEnabled"
+                )
                 if (preparingPlayer === next) {
                     swapTo(next, gen, name)
-                } else if (player === next && tipView.visibility == View.VISIBLE) {
-                    tipView.removeCallbacks(hideTipRunnable)
-                    tipView.postDelayed(hideTipRunnable, 600)
+                    hasRenderedFirstFrameForCurrent = true
+                    cancelFirstFrameWatchdog()
+                } else if (player === next) {
+                    hasRenderedFirstFrameForCurrent = true
+                    cancelFirstFrameWatchdog()
+                    if (tipView.visibility == View.VISIBLE) {
+                        tipView.removeCallbacks(hideTipRunnable)
+                        tipView.postDelayed(hideTipRunnable, 600)
+                    }
                 }
             }
 
@@ -505,9 +523,15 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
                 if (gen != switchGen) return
                 Log.e(TAG, "播放异常: ${error.errorCodeName} | ${error.message}")
                 cancelBufferingTimeout()
+                cancelFirstFrameWatchdog()
 
                 if (preparingPlayer === next) {
                     releasePreparing()
+                }
+
+                // 若开启动态背景后发生异常，立即降级回最稳的 FIT 单层
+                if (dynamicBgEnabled) {
+                    fallbackDynamicBgToFit("播放异常自动降级 FIT")
                 }
 
                 // 自动降级尝试下一清晰度；若全部失败则触发自动切台
@@ -525,12 +549,7 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
             }
 
             override fun onVideoSizeChanged(videoSize: VideoSize) {
-                if (player === next && videoSize.width > 0 && videoSize.height > 0) {
-                    val effectiveW = (videoSize.width * videoSize.pixelWidthHeightRatio).toInt().coerceAtLeast(1)
-                    isVideoPortrait = videoSize.height > effectiveW
-                    videoStageView.setVideoSize(effectiveW, videoSize.height)
-                }
-                Log.d(TAG, "视频尺寸已更新: ${videoSize.width}x${videoSize.height}")
+                Log.d(TAG, "视频尺寸已更新: ${videoSize.width}x${videoSize.height} ratio=${videoSize.pixelWidthHeightRatio}")
             }
         })
 
@@ -547,7 +566,10 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
     }
 
     /**
-     * 瞬间切换：先解绑并释放旧播放器，再把新流绑定到单一 SurfaceTexture 舞台
+     * 瞬间切换（零黑屏空窗）：
+     * 1. 旧播放器一直保留在 playerView 上直到新流 READY
+     * 2. 一次赋值 playerView.player = next（禁止中间置 null）
+     * 3. 最后再停止并释放旧播放器
      */
     private fun swapTo(next: ExoPlayer, gen: Long, name: String) {
         if (gen != switchGen || isFinishing || isDestroyed) {
@@ -558,18 +580,24 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
 
         failedRidsThisRound.clear()
         val old = player
+        player = next
+        hasRenderedFirstFrameForCurrent = false
         if (preparingPlayer === next) {
             preparingPlayer = null
         }
 
-        videoStageView.detachPlayer(old)
+        applyDynamicBackground(dynamicBgEnabled)
+        playerView.player = next
+
         try {
             old?.stop()
             old?.clearMediaItems()
             old?.release()
         } catch (_: Exception) {}
 
-        onPlayerBound(next)
+        if (dynamicBgEnabled) {
+            scheduleFirstFrameWatchdog(gen, next)
+        }
         showTip("已切换到：$name", autoHide = true)
     }
 
@@ -582,25 +610,41 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         preparingPlayer = null
     }
 
-    // -------------------- 单解码动态背景配置（默认清晰 ZOOM，可选 ≤5px 轻磨砂，零压暗） --------------------
+    // -------------------- 单 View 安全动态背景（FIT / ZOOM 切换 + 无首帧自动降级） --------------------
 
-    private fun applyDynamicBackground() {
-        videoStageView.setBackgroundConfig(
-            enabled = dynamicBgEnabled,
-            blur = allowBlur
-        )
+    @OptIn(UnstableApi::class)
+    private fun applyDynamicBackground(enabled: Boolean) {
+        dynamicBgEnabled = enabled
+        playerView.resizeMode = if (enabled) {
+            AspectRatioFrameLayout.RESIZE_MODE_ZOOM
+        } else {
+            AspectRatioFrameLayout.RESIZE_MODE_FIT
+        }
     }
 
-    private fun onPlayerBound(exo: ExoPlayer) {
-        player = exo
-        videoStageView.attachPlayer(exo)
-        val vs = exo.videoSize
-        if (vs.width > 0 && vs.height > 0) {
-            val effectiveW = (vs.width * vs.pixelWidthHeightRatio).toInt().coerceAtLeast(1)
-            isVideoPortrait = vs.height > effectiveW
-            videoStageView.setVideoSize(effectiveW, vs.height)
+    private fun scheduleFirstFrameWatchdog(gen: Long, targetPlayer: ExoPlayer) {
+        cancelFirstFrameWatchdog()
+        if (!dynamicBgEnabled || hasRenderedFirstFrameForCurrent) return
+        firstFrameWatchdogRunnable = Runnable {
+            if (gen != switchGen || isFinishing || isDestroyed) return@Runnable
+            if (player === targetPlayer && dynamicBgEnabled && !hasRenderedFirstFrameForCurrent) {
+                fallbackDynamicBgToFit("未收到 onRenderedFirstFrame，已自动关闭动态背景恢复主画面")
+            }
+        }.also {
+            mainHandler.postDelayed(it, FIRST_FRAME_WATCHDOG_MS)
         }
-        applyDynamicBackground()
+    }
+
+    private fun cancelFirstFrameWatchdog() {
+        firstFrameWatchdogRunnable?.let { mainHandler.removeCallbacks(it) }
+        firstFrameWatchdogRunnable = null
+    }
+
+    private fun fallbackDynamicBgToFit(reason: String) {
+        Log.w(TAG, "fallbackDynamicBgToFit: $reason model=${Build.MODEL}")
+        preferences.dynamicBgEnabled = false
+        applyDynamicBackground(false)
+        showTip("检测到渲染异常，已自动关闭动态背景恢复主画面", autoHide = true)
     }
 
     // -------------------- 取流与超时 --------------------
@@ -789,10 +833,10 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
             else -> "已离线"
         }
 
-        val bgStatusText = when {
-            !dynamicBgEnabled -> "关闭（纯黑底）"
-            allowBlur -> "开启（≤5px 轻磨砂 · 零压暗）"
-            else -> "开启（清晰 ZOOM 铺满 · 零压暗）"
+        val bgStatusText = if (dynamicBgEnabled) {
+            "开启（单层 ZOOM 铺满 · 无双 Surface）"
+        } else {
+            "关闭（单层 FIT · 稳定主画面）"
         }
 
         infoOverlay.text = buildString {
@@ -966,12 +1010,12 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
 
     private fun releasePlayerOnly() {
         cancelBufferingTimeout()
-        val old = player
-        videoStageView.detachPlayer(old)
+        cancelFirstFrameWatchdog()
+        playerView.player = null
         try {
-            old?.stop()
-            old?.clearMediaItems()
-            old?.release()
+            player?.stop()
+            player?.clearMediaItems()
+            player?.release()
         } catch (_: Exception) {}
         player = null
     }
@@ -991,23 +1035,13 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         player?.playWhenReady = false
         releasePreparing()
         cancelBufferingTimeout()
-    }
-
-    override fun onResume() {
-        super.onResume()
-        videoStageView.onResume()
-    }
-
-    override fun onPause() {
-        videoStageView.onPause()
-        super.onPause()
+        cancelFirstFrameWatchdog()
     }
 
     override fun onStart() {
         super.onStart()
         dynamicBgEnabled = preferences.dynamicBgEnabled
-        allowBlur = preferences.dynamicBgBlurEnabled
-        applyDynamicBackground()
+        applyDynamicBackground(dynamicBgEnabled)
         player?.playWhenReady = true
         if (isInfoShowing) {
             mainHandler.removeCallbacks(infoRefreshRunnable)

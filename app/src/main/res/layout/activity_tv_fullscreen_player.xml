@@ -6,11 +6,17 @@
     android:layout_height="match_parent"
     android:background="#000000">
 
-    <!-- 1. 单解码双层直出动态舞台：1 个 ExoPlayer 同步绘制底层动态背景（默认清晰 ZOOM，可选 ≤5px 轻磨砂，零压暗）+ 顶层居中清晰主画面 -->
-    <com.example.tv.player.AmbientVideoStageView
-        android:id="@+id/videoStageView"
+    <!-- 1. 唯一全屏主播放器：SurfaceView 直出，默认 RESIZE_MODE_FIT 稳定出画；开启动态背景时切为 RESIZE_MODE_ZOOM 铺满（无双 Surface / 无 RenderEffect） -->
+    <androidx.media3.ui.PlayerView
+        android:id="@+id/playerView"
         android:layout_width="match_parent"
-        android:layout_height="match_parent" />
+        android:layout_height="match_parent"
+        android:background="#000000"
+        app:surface_type="surface_view"
+        app:use_controller="false"
+        app:resize_mode="fit"
+        app:shutter_background_color="#000000"
+        app:keep_content_on_player_reset="true" />
 
     <!-- 3. 顶部居中换台与状态提示，高 elevation 防止被视频底层遮挡 -->
     <TextView
