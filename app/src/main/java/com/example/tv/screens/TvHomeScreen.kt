@@ -50,6 +50,7 @@ fun TvHomeScreen(
     var showClearCacheDialog by remember { mutableStateOf(false) }
     var showUpdateDialog by remember { mutableStateOf(false) }
     var showChannelDialog by remember { mutableStateOf(false) }
+    var dynamicBgEnabled by remember { mutableStateOf(preferences.dynamicBgEnabled) }
     var channels by remember { mutableStateOf(channelManager.loadChannels()) }
     var probeStatusTip by remember { mutableStateOf("正在检测在线状态...") }
 
@@ -89,6 +90,21 @@ fun TvHomeScreen(
                 icon = Icons.Default.LiveTv,
                 isPrimary = true,
                 onClick = { showChannelDialog = true }
+            )
+
+            TvActionButton(
+                text = if (dynamicBgEnabled) "动态背景：开" else "动态背景：关",
+                icon = if (dynamicBgEnabled) Icons.Default.BlurOn else Icons.Default.BlurOff,
+                onClick = {
+                    val next = !dynamicBgEnabled
+                    dynamicBgEnabled = next
+                    preferences.dynamicBgEnabled = next
+                    Toast.makeText(
+                        context,
+                        if (next) "动态背景已开启（轻磨砂 · 零压暗）" else "动态背景已关闭（纯黑底）",
+                        Toast.LENGTH_SHORT
+                    ).show()
+                }
             )
 
             TvActionButton(

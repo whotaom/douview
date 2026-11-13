@@ -6,24 +6,19 @@
     android:layout_height="match_parent"
     android:background="#000000">
 
-    <!-- 1. 竖屏视频两侧动态磨砂氛围背景（单 ExoPlayer 轻采样子帧放大，零额外解码开销） -->
+    <!-- 1. 竖屏两侧动态磨砂氛围背景（单解码轻采样放大 + 1.06x 防露边 + 零压暗） -->
     <ImageView
         android:id="@+id/ambientBgView"
         android:layout_width="match_parent"
         android:layout_height="match_parent"
+        android:alpha="1.0"
         android:contentDescription="@null"
         android:scaleType="centerCrop"
+        android:scaleX="1.06"
+        android:scaleY="1.06"
         android:visibility="gone" />
 
-    <!-- 2. 约 35% 暗色遮罩，保证两侧动态背景人眼可辨且不抢前景主画面 -->
-    <View
-        android:id="@+id/dimOverlay"
-        android:layout_width="match_parent"
-        android:layout_height="match_parent"
-        android:background="#59000000"
-        android:visibility="gone" />
-
-    <!-- 3. 全屏主播放器：横屏源自动铺满全屏，竖屏源居中完整呈现并透出两侧动态背景 -->
+    <!-- 2. 全屏主播放器：横屏源自动铺满全屏，竖屏源居中清晰呈现并透出两侧动态磨砂背景 -->
     <androidx.media3.ui.PlayerView
         android:id="@+id/playerView"
         android:layout_width="match_parent"
@@ -35,7 +30,7 @@
         app:shutter_background_color="#000000"
         app:keep_content_on_player_reset="true" />
 
-    <!-- 4. 顶部居中换台与状态提示，高 elevation 防止被视频底层遮挡 -->
+    <!-- 3. 顶部居中换台与状态提示，高 elevation 防止被视频底层遮挡 -->
     <TextView
         android:id="@+id/tipView"
         android:layout_width="wrap_content"

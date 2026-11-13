@@ -2,6 +2,8 @@ package com.example.tv.player
 
 import android.graphics.Bitmap
 import android.graphics.Color
+import android.graphics.RenderEffect
+import android.graphics.Shader
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -82,9 +84,9 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         val streamCacheTime = mutableMapOf<String, Long>()
         const val CACHE_TTL = 5 * 60 * 1000L
 
-        private const val AMBIENT_SAMPLE_W = 48
-        private const val AMBIENT_SAMPLE_H = 85
-        private const val AMBIENT_INTERVAL_MS = 450L
+        private const val AMBIENT_SAMPLE_W = 144
+        private const val AMBIENT_SAMPLE_H = 256
+        private const val AMBIENT_INTERVAL_MS = 220L
 
         fun clearStreamCache() {
             streamCache.clear()
@@ -95,11 +97,11 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
     private lateinit var channelManager: ChannelManager
     private lateinit var preferences: LivePreferences
     private var currentLine: Int = 1
+    private var dynamicBgEnabled: Boolean = true
 
     // UI 组件
     private lateinit var root: FrameLayout
-    private lateinit var ambientBgView: ImageView          // 竖屏两侧动态氛围背景（低耗轻采样放大）
-    private lateinit var dimOverlay: View                  // 约 35% 压暗遮罩 (#59000000)
+    private lateinit var ambientBgView: ImageView          // 竖屏两侧动态轻磨砂背景（零压暗，1.06x 防露边）
     private lateinit var playerView: PlayerView            // 单一全屏主播放器
     private lateinit var tipView: TextView                 // 顶部高层级换台与状态提示
     private lateinit var channelMenu: FrameLayout          // 左侧在线选台悬浮面板
@@ -171,6 +173,8 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         preferences = LivePreferences(this)
         channelManager = ChannelManager(this)
         currentLine = resolveInitialLine()
+        dynamicBgEnabled = preferences.dynamicBgEnabled
+        applyDynamicBg(dynamicBgEnabled)
 
         setupPlayListAndStart()
 
@@ -203,9 +207,14 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         setContentView(R.layout.activity_tv_fullscreen_player)
         root = findViewById(R.id.rootContainer)
         ambientBgView = findViewById(R.id.ambientBgView)
-        dimOverlay = findViewById(R.id.dimOverlay)
         playerView = findViewById(R.id.playerView)
         tipView = findViewById(R.id.tipView)
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            ambientBgView.setRenderEffect(
+                RenderEffect.createBlurEffect(8f, 8f, Shader.TileMode.CLAMP)
+            )
+        }
 
         // 1. 左侧在线选台悬浮面板（仅占 400dp，无全屏遮罩）
         channelMenu = FrameLayout(this).apply {
@@ -602,24 +611,28 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         preparingPlayer = null
     }
 
-    // -------------------- 单解码动态氛围背景（仅竖屏直播启用） --------------------
+    // -------------------- 单解码动态轻磨砂背景（仅竖屏且开关开启时启用，零压暗） --------------------
 
-    private fun updateAmbientModeForVideoSize(width: Int, height: Int) {
-        val portrait = height > width
-        isVideoPortrait = portrait
-        if (portrait) {
+    private fun applyDynamicBg(enabled: Boolean) {
+        dynamicBgEnabled = enabled
+        if (enabled && isVideoPortrait) {
             ambientBgView.visibility = View.VISIBLE
-            dimOverlay.visibility = View.VISIBLE
             playerView.setShutterBackgroundColor(Color.TRANSPARENT)
             startAmbientSampler()
         } else {
             stopAmbientSampler()
+            ambientBgView.setImageDrawable(null)
             ambientBgView.visibility = View.GONE
-            dimOverlay.visibility = View.GONE
         }
     }
 
+    private fun updateAmbientModeForVideoSize(width: Int, height: Int) {
+        isVideoPortrait = height > width
+        applyDynamicBg(dynamicBgEnabled)
+    }
+
     private fun startAmbientSampler() {
+        if (!dynamicBgEnabled || !isVideoPortrait) return
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O || ambientErrorCount >= 3) return
         if (isAmbientSampling) return
         if (ambientThread == null) {
@@ -639,7 +652,7 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
     private fun captureAmbientFrame() {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O || ambientErrorCount >= 3) return
         val p = player ?: return
-        if (!p.isPlaying || !isVideoPortrait) return
+        if (!p.isPlaying || !isVideoPortrait || !dynamicBgEnabled) return
         val surfaceView = playerView.videoSurfaceView as? SurfaceView ?: return
         val surface = surfaceView.holder?.surface ?: return
         if (!surface.isValid) return
@@ -656,12 +669,18 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
                 surfaceView,
                 sample,
                 { result ->
-                    if (result == PixelCopy.SUCCESS && isAmbientSampling && !isFinishing && !isDestroyed) {
+                    if (result == PixelCopy.SUCCESS && isAmbientSampling && dynamicBgEnabled && !isFinishing && !isDestroyed) {
                         ambientErrorCount = 0
-                        val blurred = fastBoxBlurTiny(sample)
+                        val displayBmp = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                            // Android 12+ 使用硬件 RenderEffect(8f) 轻磨砂，拷贝为独立显示帧
+                            sample.copy(Bitmap.Config.ARGB_8888, false)
+                        } else {
+                            // 低版本系统走轻量单次盒式模糊（约 8px 磨砂感）
+                            fastBoxBlurTiny(sample)
+                        }
                         mainHandler.post {
-                            if (isVideoPortrait && !isFinishing && !isDestroyed) {
-                                ambientBgView.setImageBitmap(blurred)
+                            if (dynamicBgEnabled && isVideoPortrait && !isFinishing && !isDestroyed) {
+                                ambientBgView.setImageBitmap(displayBmp)
                             }
                         }
                     } else if (result != PixelCopy.SUCCESS) {
@@ -917,6 +936,7 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
             append("码率：${if (kbps > 0) "约 $kbps kbps" else "自适应"}\n")
             append("缓冲：${p?.totalBufferedDuration ?: 0} ms\n")
             append("线路：$lineLabel\n")
+            append("动态背景：${if (dynamicBgEnabled) "开启（轻磨砂 · 零压暗）" else "关闭（纯黑底）"}\n")
             append("播放状态：$playStateText\n")
             append("────────────────\n（再次按 OK 或返回键关闭）")
         }
@@ -1111,7 +1131,7 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
     override fun onStart() {
         super.onStart()
         player?.playWhenReady = true
-        if (isVideoPortrait) startAmbientSampler()
+        applyDynamicBg(preferences.dynamicBgEnabled)
         if (isInfoShowing) {
             mainHandler.removeCallbacks(infoRefreshRunnable)
             mainHandler.postDelayed(infoRefreshRunnable, 1000L)

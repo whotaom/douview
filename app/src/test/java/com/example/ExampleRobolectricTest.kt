@@ -93,5 +93,18 @@ class ExampleRobolectricTest {
     val current = com.example.util.UpdateManager.getCurrentVersion(context)
     assertNotNull(current)
   }
+
+  @Test
+  fun `dynamic background preference defaults true and persists`() {
+    val context = ApplicationProvider.getApplicationContext<Context>()
+    val prefs = LivePreferences(context)
+    assertTrue(prefs.dynamicBgEnabled)
+
+    prefs.dynamicBgEnabled = false
+    assertEquals(false, LivePreferences(context).dynamicBgEnabled)
+
+    prefs.dynamicBgEnabled = true
+    assertTrue(LivePreferences(context).dynamicBgEnabled)
+  }
 }
 
