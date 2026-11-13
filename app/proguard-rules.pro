@@ -1,21 +1,22 @@
-# Add project specific ProGuard rules here.
-# You can control the set of applied configuration files using the
-# proguardFiles setting in build.gradle.
-#
-# For more details, see
-#   http://developer.android.com/guide/developing/tools/proguard.html
+# Project-specific ProGuard / R8 keep rules
 
-# If your project uses WebView with JS, uncomment the following
-# and specify the fully qualified class name to the JavaScript interface
-# class:
-#-keepclassmembers class fqcn.of.javascript.interface.for.webview {
-#   public *;
-#}
+# Keep WebView JavascriptInterface methods intact
+-keepclassmembers class com.example.MainActivity$* {
+    @android.webkit.JavascriptInterface <methods>;
+}
 
-# Uncomment this to preserve the line number information for
-# debugging stack traces.
-#-keepattributes SourceFile,LineNumberTable
+# Keep TV channel models & release data models
+-keep class com.example.tv.channel.** { *; }
+-keep class com.example.util.AppReleaseInfo { *; }
 
-# If you keep the line number information, uncomment this to
-# hide the original source file name.
-#-renamesourcefileattribute SourceFile
+# Keep Media3 / ExoPlayer classes referenced by reflection
+-keep class androidx.media3.exoplayer.** { *; }
+-keep class androidx.media3.ui.** { *; }
+-keep class androidx.media3.datasource.** { *; }
+
+# Moshi & OkHttp compatibility
+-keepclassmembers class * {
+    @com.squareup.moshi.Json <fields>;
+}
+-dontwarn okio.**
+-dontwarn javax.annotation.**

@@ -3,9 +3,10 @@ package com.example.tv.screens
 import android.content.Intent
 import android.widget.Toast
 import androidx.compose.foundation.background
+import androidx.compose.foundation.focusGroup
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyRow
-import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -14,6 +15,7 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
@@ -22,22 +24,32 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.data.LivePreferences
 import com.example.data.StreamLines
+import com.example.tv.channel.Channel
 import com.example.tv.channel.ChannelManager
 import com.example.tv.components.TvActionButton
 import com.example.tv.components.TvFocusableCard
+import com.example.tv.components.TvSafeAreaDefaults
 import com.example.tv.components.TvTopBar
+import com.example.tv.components.safeRequestFocus
 import com.example.tv.player.TvFullscreenPlayerActivity
 import com.example.ui.ChannelManageDialog
 import com.example.ui.ClearCacheConfirmDialog
 import com.example.ui.UpdateDialog
 import com.example.ui.theme.*
 import com.example.util.UpdateManager
-import kotlinx.coroutines.launch
+
+private enum class TvDialogReturnTarget {
+    CHANNEL_MANAGE,
+    CLEAR_CACHE,
+    UPDATE,
+    CUSTOM_URL
+}
 
 @Composable
 fun TvHomeScreen(
     onEnterPlayer: (url: String) -> Unit,
-    onOpenUrlDialog: () -> Unit
+    onOpenUrlDialog: () -> Unit,
+    urlDialogReturnSignal: Int = 0
 ) {
     val context = LocalContext.current
     val preferences = remember { LivePreferences(context) }
@@ -53,6 +65,64 @@ fun TvHomeScreen(
     var keepScreenOn by remember { mutableStateOf(preferences.keepScreenOn) }
     var channels by remember { mutableStateOf(channelManager.loadChannels()) }
     var probeStatusTip by remember { mutableStateOf("正在检测在线状态...") }
+
+    val sortedChannels = remember(channels) {
+        channels.sortedWith(
+            compareBy { if (it.isLive) 0 else if (!it.statusKnown) 1 else 2 }
+        )
+    }
+
+    // D-pad 焦点管理与弹窗关闭后焦点安全归位
+    val firstChannelFocusRequester = remember { FocusRequester() }
+    val heroPlayFocusRequester = remember { FocusRequester() }
+    val channelManageFocusRequester = remember { FocusRequester() }
+    val clearCacheFocusRequester = remember { FocusRequester() }
+    val updateBtnFocusRequester = remember { FocusRequester() }
+    val customUrlFocusRequester = remember { FocusRequester() }
+    var pendingReturnTarget by remember { mutableStateOf<TvDialogReturnTarget?>(null) }
+
+    // 首次进入界面：等首帧组合挂载完成后安全赋予默认焦点（优先首位频道，其次一键畅播）
+    LaunchedEffect(Unit) {
+        withFrameNanos { }
+        if (sortedChannels.isNotEmpty()) {
+            if (!firstChannelFocusRequester.safeRequestFocus()) {
+                heroPlayFocusRequester.safeRequestFocus()
+            }
+        } else {
+            heroPlayFocusRequester.safeRequestFocus()
+        }
+    }
+
+    // 外部 URL 弹窗关闭后同步地址并恢复「输入自定义地址」卡片焦点
+    LaunchedEffect(urlDialogReturnSignal) {
+        if (urlDialogReturnSignal > 0) {
+            currentTargetUrl = preferences.targetUrl
+            withFrameNanos { }
+            if (!customUrlFocusRequester.safeRequestFocus()) {
+                heroPlayFocusRequester.safeRequestFocus()
+            }
+        }
+    }
+
+    // 内部弹窗关闭后精确还原焦点的安全守护
+    val anyInternalDialogOpen = showChannelDialog || showClearCacheDialog || showUpdateDialog
+    LaunchedEffect(anyInternalDialogOpen) {
+        if (!anyInternalDialogOpen && pendingReturnTarget != null) {
+            val target = pendingReturnTarget
+            pendingReturnTarget = null
+            withFrameNanos { }
+            val restored = when (target) {
+                TvDialogReturnTarget.CHANNEL_MANAGE -> channelManageFocusRequester.safeRequestFocus()
+                TvDialogReturnTarget.CLEAR_CACHE -> clearCacheFocusRequester.safeRequestFocus()
+                TvDialogReturnTarget.UPDATE -> updateBtnFocusRequester.safeRequestFocus()
+                TvDialogReturnTarget.CUSTOM_URL -> customUrlFocusRequester.safeRequestFocus()
+                null -> false
+            }
+            if (!restored) {
+                heroPlayFocusRequester.safeRequestFocus()
+            }
+        }
+    }
 
     // 进页及切换主备线路时：先展示本地列表，再自动调用当前线路的 live.php?batch= 探测真实在线状态
     LaunchedEffect(activeBaseUrl) {
@@ -80,7 +150,7 @@ fun TvHomeScreen(
             .fillMaxSize()
             .background(DarkBg)
     ) {
-        // 顶部大屏标题栏
+        // 顶部大屏标题栏（含 TV 过扫描安全区）
         TvTopBar(
             title = "抖眸流控 · 电视大屏监控中控台",
             subtitle = "当前中控服务: $activeBaseUrl · $probeStatusTip"
@@ -89,30 +159,50 @@ fun TvHomeScreen(
                 text = "频道管理",
                 icon = Icons.Default.LiveTv,
                 isPrimary = true,
-                onClick = { showChannelDialog = true }
+                focusRequester = channelManageFocusRequester,
+                testTagValue = "tv_btn_channel_manage",
+                onClick = {
+                    pendingReturnTarget = TvDialogReturnTarget.CHANNEL_MANAGE
+                    showChannelDialog = true
+                }
             )
 
             TvActionButton(
                 text = "清理缓存",
                 icon = Icons.Default.DeleteSweep,
-                onClick = { showClearCacheDialog = true }
+                focusRequester = clearCacheFocusRequester,
+                testTagValue = "tv_btn_clear_cache",
+                onClick = {
+                    pendingReturnTarget = TvDialogReturnTarget.CLEAR_CACHE
+                    showClearCacheDialog = true
+                }
             )
 
             TvActionButton(
                 text = "版本更新",
                 icon = Icons.Default.SystemUpdate,
-                onClick = { showUpdateDialog = true }
+                focusRequester = updateBtnFocusRequester,
+                testTagValue = "tv_btn_check_update",
+                onClick = {
+                    pendingReturnTarget = TvDialogReturnTarget.UPDATE
+                    showUpdateDialog = true
+                }
             )
         }
 
-        // 主体操作内容区
+        // 主体操作内容区（遵循 48.dp 水平、27.dp 底部过扫描安全区）
         Column(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(horizontal = 40.dp, vertical = 8.dp),
+                .padding(
+                    start = TvSafeAreaDefaults.HorizontalPadding,
+                    end = TvSafeAreaDefaults.HorizontalPadding,
+                    top = 6.dp,
+                    bottom = TvSafeAreaDefaults.VerticalPadding
+                ),
             verticalArrangement = Arrangement.SpaceBetween
         ) {
-            Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
+            Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
                 // 1. 精选电视频道通道 (横向 D-pad 左右快速切台浏览)
                 Row(
                     modifier = Modifier.fillMaxWidth(),
@@ -135,10 +225,18 @@ fun TvHomeScreen(
 
                 LazyRow(
                     horizontalArrangement = Arrangement.spacedBy(14.dp),
-                    modifier = Modifier.fillMaxWidth()
+                    contentPadding = PaddingValues(horizontal = 4.dp, vertical = 6.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .focusGroup()
                 ) {
-                    items(channels.sortedWith(compareBy<com.example.tv.channel.Channel>({ if (it.isLive) 0 else if (!it.statusKnown) 1 else 2 }))) { channel ->
+                    itemsIndexed(
+                        items = sortedChannels,
+                        key = { _, ch -> ch.rid }
+                    ) { index, channel ->
                         TvFocusableCard(
+                            focusRequester = if (index == 0) firstChannelFocusRequester else null,
+                            testTagValue = "tv_channel_card_${channel.rid}",
                             onClick = {
                                 val intent = Intent(context, TvFullscreenPlayerActivity::class.java).apply {
                                     putExtra(TvFullscreenPlayerActivity.EXTRA_RID, channel.rid)
@@ -188,7 +286,11 @@ fun TvHomeScreen(
 
                     item {
                         TvFocusableCard(
-                            onClick = { showChannelDialog = true },
+                            testTagValue = "tv_channel_card_manage",
+                            onClick = {
+                                pendingReturnTarget = TvDialogReturnTarget.CHANNEL_MANAGE
+                                showChannelDialog = true
+                            },
                             modifier = Modifier.width(180.dp)
                         ) { isFocused ->
                             Row(
@@ -224,10 +326,14 @@ fun TvHomeScreen(
 
                 LazyRow(
                     horizontalArrangement = Arrangement.spacedBy(14.dp),
-                    modifier = Modifier.fillMaxWidth()
+                    contentPadding = PaddingValues(horizontal = 4.dp, vertical = 6.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .focusGroup()
                 ) {
                     item {
                         TvFocusableCard(
+                            testTagValue = "tv_line_card_1",
                             onClick = {
                                 preferences.targetUrl = LivePreferences.DEFAULT_URL
                                 currentTargetUrl = LivePreferences.DEFAULT_URL
@@ -266,6 +372,7 @@ fun TvHomeScreen(
 
                     item {
                         TvFocusableCard(
+                            testTagValue = "tv_line_card_2",
                             onClick = {
                                 preferences.targetUrl = StreamLines.LINE_2
                                 currentTargetUrl = StreamLines.LINE_2
@@ -304,6 +411,8 @@ fun TvHomeScreen(
 
                     item {
                         TvFocusableCard(
+                            focusRequester = customUrlFocusRequester,
+                            testTagValue = "tv_line_card_custom",
                             onClick = onOpenUrlDialog,
                             modifier = Modifier.width(180.dp)
                         ) { isFocused ->
@@ -332,16 +441,20 @@ fun TvHomeScreen(
 
                 // 3. 核心大屏功能卡片区
                 Row(
-                    modifier = Modifier.fillMaxWidth(),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .focusGroup(),
                     horizontalArrangement = Arrangement.spacedBy(18.dp)
                 ) {
                     // 主功能卡片：一键全屏畅播
                     TvFocusableCard(
+                        focusRequester = heroPlayFocusRequester,
+                        testTagValue = "tv_hero_play_card",
                         onClick = { onEnterPlayer("") },
                         focusedBorderColor = DouyinRed,
                         modifier = Modifier
                             .weight(1.8f)
-                            .height(115.dp)
+                            .height(112.dp)
                     ) { isFocused ->
                         Row(
                             modifier = Modifier.fillMaxSize(),
@@ -381,15 +494,20 @@ fun TvHomeScreen(
 
                     // 辅助功能卡片：屏幕常亮守护
                     TvFocusableCard(
+                        testTagValue = "tv_keep_screen_on_card",
                         onClick = {
                             val next = !keepScreenOn
                             keepScreenOn = next
                             preferences.keepScreenOn = next
-                            Toast.makeText(context, if (next) "大屏屏幕常亮已开启" else "大屏屏幕常亮已关闭", Toast.LENGTH_SHORT).show()
+                            Toast.makeText(
+                                context,
+                                if (next) "大屏屏幕常亮已开启" else "大屏屏幕常亮已关闭",
+                                Toast.LENGTH_SHORT
+                            ).show()
                         },
                         modifier = Modifier
                             .weight(1.2f)
-                            .height(115.dp)
+                            .height(112.dp)
                     ) { isFocused ->
                         Column(
                             modifier = Modifier.fillMaxSize(),
@@ -424,10 +542,8 @@ fun TvHomeScreen(
             // 4. 底部遥控器快捷指南
             Surface(
                 shape = RoundedCornerShape(10.dp),
-                color = DarkSurfaceElevated.copy(alpha = 0.7f),
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(bottom = 6.dp)
+                color = DarkSurfaceElevated.copy(alpha = 0.72f),
+                modifier = Modifier.fillMaxWidth()
             ) {
                 Row(
                     modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
@@ -436,11 +552,11 @@ fun TvHomeScreen(
                 ) {
                     Text("【方向键】选择频道与功能", color = TextSecondary, fontSize = 12.sp)
                     Text("•", color = TextTertiary)
-                    Text("【OK 键】直接开播 / 暂停", color = DouyinCyan, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                    Text("【OK 键】直接开播 / 信息面板", color = DouyinCyan, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
                     Text("•", color = TextTertiary)
-                    Text("【全屏中 ↑ / ↓ 键】秒级换台", color = DouyinGreen, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                    Text("【↑ / ↓ 或 CH+/CH-】秒级换台", color = DouyinGreen, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
                     Text("•", color = TextTertiary)
-                    Text("【返回键】退出全屏", color = TextSecondary, fontSize = 12.sp)
+                    Text("【菜单/返回键】选台/退出", color = TextSecondary, fontSize = 12.sp)
                 }
             }
         }
@@ -453,7 +569,7 @@ fun TvHomeScreen(
                 showChannelDialog = false
                 channels = channelManager.loadChannels()
             },
-            onSelectChannelToPlay = { channel ->
+            onSelectChannelToPlay = { channel: Channel ->
                 showChannelDialog = false
                 val intent = Intent(context, TvFullscreenPlayerActivity::class.java).apply {
                     putExtra(TvFullscreenPlayerActivity.EXTRA_RID, channel.rid)
@@ -481,8 +597,8 @@ fun TvHomeScreen(
     if (showUpdateDialog) {
         UpdateDialog(
             onDismiss = { showUpdateDialog = false },
-            onDownloadApk = { url ->
-                UpdateManager.startDownloadApk(context, url)
+            onOpenReleasePage = { url ->
+                UpdateManager.openReleasePage(context, url)
                 showUpdateDialog = false
             }
         )

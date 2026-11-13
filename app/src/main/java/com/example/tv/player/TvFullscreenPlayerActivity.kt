@@ -13,6 +13,7 @@ import android.view.Gravity
 import android.view.KeyEvent
 import android.view.View
 import android.view.WindowManager
+import android.widget.Button
 import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
@@ -21,6 +22,7 @@ import android.widget.TextView
 import androidx.activity.ComponentActivity
 import androidx.activity.OnBackPressedCallback
 import androidx.annotation.OptIn
+import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
@@ -33,6 +35,7 @@ import androidx.media3.common.Player
 import androidx.media3.common.VideoSize
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.DefaultHttpDataSource
+import androidx.media3.exoplayer.DefaultLivePlaybackSpeedControl
 import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
@@ -101,17 +104,102 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
             val trimmed = raw?.trim().orEmpty()
             return if (trimmed.startsWith("//")) "https:$trimmed" else trimmed
         }
+
+        fun buildLiveMediaItem(streamUrl: String): MediaItem {
+            return MediaItem.Builder()
+                .setUri(streamUrl)
+                .setLiveConfiguration(
+                    MediaItem.LiveConfiguration.Builder()
+                        .setTargetOffsetMs(4_000L)
+                        .setMinOffsetMs(1_500L)
+                        .setMaxOffsetMs(12_000L)
+                        .setMinPlaybackSpeed(0.97f)
+                        .setMaxPlaybackSpeed(1.03f)
+                        .build()
+                )
+                .build()
+        }
+
+        enum class RemoteAction {
+            STEP_PREV_CHANNEL,
+            STEP_NEXT_CHANNEL,
+            OPEN_MENU,
+            CLOSE_MENU,
+            MENU_CONFIRM,
+            TOGGLE_INFO,
+            CLOSE_INFO,
+            MEDIA_PLAY,
+            MEDIA_PAUSE,
+            MEDIA_PLAY_PAUSE,
+            BACK_EXIT,
+            NONE
+        }
+
+        fun resolveRemoteAction(
+            keyCode: Int,
+            isMenuShowing: Boolean,
+            isInfoShowing: Boolean
+        ): RemoteAction {
+            if (isMenuShowing) {
+                return when (keyCode) {
+                    KeyEvent.KEYCODE_MENU,
+                    KeyEvent.KEYCODE_INFO,
+                    KeyEvent.KEYCODE_BACK -> RemoteAction.CLOSE_MENU
+                    KeyEvent.KEYCODE_DPAD_CENTER,
+                    KeyEvent.KEYCODE_ENTER,
+                    KeyEvent.KEYCODE_NUMPAD_ENTER -> RemoteAction.MENU_CONFIRM
+                    else -> RemoteAction.NONE
+                }
+            }
+            if (isInfoShowing) {
+                return when (keyCode) {
+                    KeyEvent.KEYCODE_DPAD_CENTER,
+                    KeyEvent.KEYCODE_ENTER,
+                    KeyEvent.KEYCODE_NUMPAD_ENTER,
+                    KeyEvent.KEYCODE_BACK,
+                    KeyEvent.KEYCODE_INFO,
+                    KeyEvent.KEYCODE_MENU -> RemoteAction.CLOSE_INFO
+                    else -> RemoteAction.NONE
+                }
+            }
+            return when (keyCode) {
+                KeyEvent.KEYCODE_BACK -> RemoteAction.BACK_EXIT
+                KeyEvent.KEYCODE_MENU,
+                KeyEvent.KEYCODE_INFO -> RemoteAction.OPEN_MENU
+                KeyEvent.KEYCODE_DPAD_UP,
+                KeyEvent.KEYCODE_CHANNEL_DOWN,
+                KeyEvent.KEYCODE_MEDIA_PREVIOUS -> RemoteAction.STEP_PREV_CHANNEL
+                KeyEvent.KEYCODE_DPAD_DOWN,
+                KeyEvent.KEYCODE_CHANNEL_UP,
+                KeyEvent.KEYCODE_MEDIA_NEXT -> RemoteAction.STEP_NEXT_CHANNEL
+                KeyEvent.KEYCODE_DPAD_CENTER,
+                KeyEvent.KEYCODE_ENTER,
+                KeyEvent.KEYCODE_NUMPAD_ENTER -> RemoteAction.TOGGLE_INFO
+                KeyEvent.KEYCODE_MEDIA_PLAY -> RemoteAction.MEDIA_PLAY
+                KeyEvent.KEYCODE_MEDIA_PAUSE -> RemoteAction.MEDIA_PAUSE
+                KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE -> RemoteAction.MEDIA_PLAY_PAUSE
+                else -> RemoteAction.NONE
+            }
+        }
     }
 
     private lateinit var channelManager: ChannelManager
     private lateinit var preferences: LivePreferences
     private var currentLine: Int = 1
 
-    // UI 组件（单个 PlayerView + 固定竖屏背景图）
+    // UI 组件（单个 PlayerView + 固定竖屏背景图 + TV 安全区交互浮层）
     private lateinit var root: FrameLayout
     private lateinit var portraitBackdrop: ImageView       // 固定系统风格竖屏背景图
     private lateinit var playerView: PlayerView            // 唯一全屏主播放器（SurfaceView + RESIZE_MODE_FIT）
     private lateinit var tipView: TextView                 // 顶部高层级换台与状态提示
+    private lateinit var bufferingPill: LinearLayout       // 右上角 TV 安全区缓冲指示胶囊
+    private lateinit var bufferingText: TextView
+    private lateinit var errorOverlay: LinearLayout        // 可遥控操作的高对比度失败兜底面板
+    private lateinit var errorTitleView: TextView
+    private lateinit var errorDetailView: TextView
+    private lateinit var btnRetryChannel: Button
+    private lateinit var btnNextChannel: Button
+    private lateinit var btnExitPlayer: Button
     private lateinit var channelMenu: FrameLayout          // 左侧在线选台悬浮面板
     private lateinit var menuTitleView: TextView           // 选台菜单标题：「在线频道（N）」
     private lateinit var channelMenuList: LinearLayout
@@ -218,6 +306,14 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         portraitBackdrop = findViewById(R.id.portraitBackdrop)
         playerView = findViewById(R.id.playerView)
         tipView = findViewById(R.id.tipView)
+        bufferingPill = findViewById(R.id.bufferingPill)
+        bufferingText = findViewById(R.id.bufferingText)
+        errorOverlay = findViewById(R.id.errorOverlay)
+        errorTitleView = findViewById(R.id.errorTitleView)
+        errorDetailView = findViewById(R.id.errorDetailView)
+        btnRetryChannel = findViewById(R.id.btnRetryChannel)
+        btnNextChannel = findViewById(R.id.btnNextChannel)
+        btnExitPlayer = findViewById(R.id.btnExitPlayer)
 
         root.setBackgroundColor(Color.parseColor("#09090C"))
         portraitBackdrop.visibility = if (isPortraitStream) View.VISIBLE else View.GONE
@@ -226,14 +322,31 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         playerView.resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
         playerView.setBackgroundColor(Color.TRANSPARENT)
         playerView.setShutterBackgroundColor(Color.TRANSPARENT)
-        playerView.keepScreenOn = true
+        playerView.keepScreenOn = preferences.keepScreenOn
 
-        // 1. 左侧在线选台悬浮面板（仅占 400dp，无全屏遮罩）
+        btnRetryChannel.setOnClickListener {
+            hideErrorOverlay()
+            failedRidsThisRound.clear()
+            switchToChannel(currentIndex, force = true)
+        }
+        btnNextChannel.setOnClickListener {
+            hideErrorOverlay()
+            failedRidsThisRound.clear()
+            val nextIdx = if (playList.isNotEmpty()) (currentIndex + 1) % playList.size else 0
+            switchToChannel(nextIdx, force = true)
+        }
+        btnExitPlayer.setOnClickListener {
+            releaseAll()
+            finish()
+        }
+
+        // 1. 左侧在线选台悬浮面板（遵循 TV 48dp 左侧与 27dp 上下过扫描安全区）
         channelMenu = FrameLayout(this).apply {
-            layoutParams = FrameLayout.LayoutParams(400.dp(), FrameLayout.LayoutParams.MATCH_PARENT).also {
+            layoutParams = FrameLayout.LayoutParams(430.dp(), FrameLayout.LayoutParams.MATCH_PARENT).also {
                 it.gravity = Gravity.START
             }
-            setBackgroundColor(Color.parseColor("#E6121212"))
+            setBackgroundColor(Color.parseColor("#EB101218"))
+            setPadding(48.dp(), 27.dp(), 16.dp(), 27.dp())
             visibility = View.GONE
             elevation = 24f
             isClickable = true
@@ -244,32 +357,36 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
             text = "在线频道（0）"
             setTextColor(Color.WHITE)
             textSize = 18f
-            setPadding(24, 24, 24, 8)
+            setPadding(16, 12, 16, 8)
         }
         channelMenuList = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(8, 0, 8, 16)
+            setPadding(4, 0, 4, 16)
         }
         val scroll = ScrollView(this).apply {
             layoutParams = FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT,
                 FrameLayout.LayoutParams.MATCH_PARENT
-            ).also { it.topMargin = 64.dp() }
+            ).also { it.topMargin = 54.dp() }
             addView(channelMenuList)
         }
         channelMenu.addView(menuTitleView)
         channelMenu.addView(scroll)
         root.addView(channelMenu)
 
-        // 2. OK 键技术参数信息面板
+        // 2. OK 键技术参数信息面板（TV 安全区内居中玻璃面板）
         infoOverlay = TextView(this).apply {
-            layoutParams = FrameLayout.LayoutParams(500.dp(), FrameLayout.LayoutParams.WRAP_CONTENT).also {
+            layoutParams = FrameLayout.LayoutParams(520.dp(), FrameLayout.LayoutParams.WRAP_CONTENT).also {
                 it.gravity = Gravity.CENTER
+                it.leftMargin = 48.dp()
+                it.rightMargin = 48.dp()
+                it.topMargin = 27.dp()
+                it.bottomMargin = 27.dp()
             }
-            setBackgroundColor(Color.parseColor("#E6101010"))
+            background = ContextCompat.getDrawable(this@TvFullscreenPlayerActivity, R.drawable.bg_tv_overlay_panel)
             setTextColor(Color.WHITE)
             textSize = 15f
-            setPadding(26, 20, 26, 20)
+            setPadding(28.dp(), 20.dp(), 28.dp(), 20.dp())
             elevation = 48f
             visibility = View.GONE
             setLineSpacing(5f, 1.2f)
@@ -394,6 +511,7 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         val channel = playList[index]
 
         hideLiveInfo()
+        hideErrorOverlay()
 
         // 明确已知离线的频道直接跳过到下一在线台（防死循环）
         if (channel.statusKnown && !channel.isLive && !fromAutoSkip && playList.any { it.isLive }) {
@@ -401,6 +519,7 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
             return
         }
 
+        showBuffering("准备切换到 ${channel.name}...")
         if (!fromAutoSkip) {
             showTip("正在切换到：${channel.name}", autoHide = false)
         }
@@ -469,7 +588,11 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
             }
 
         if (next == null) {
-            showTip("没有更多可播放频道", autoHide = true)
+            hideBuffering()
+            showErrorOverlay(
+                title = "暂无可播放信号",
+                detail = "$name $reason，本轮全部候选频道均暂时不可用。\n可使用遥控器重试当前频道、尝试下一台或返回主页。"
+            )
             return
         }
 
@@ -523,10 +646,16 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
             .setContentType(C.AUDIO_CONTENT_TYPE_MOVIE)
             .build()
 
+        val liveSpeedControl = DefaultLivePlaybackSpeedControl.Builder()
+            .setFallbackMinPlaybackSpeed(0.97f)
+            .setFallbackMaxPlaybackSpeed(1.03f)
+            .build()
+
         val next = ExoPlayer.Builder(this, renderersFactory)
             .setTrackSelector(trackSelector)
             .setLoadControl(loadControl)
             .setMediaSourceFactory(mediaSourceFactory)
+            .setLivePlaybackSpeedControl(liveSpeedControl)
             .setAudioAttributes(audioAttributes, true)
             .setWakeMode(C.WAKE_MODE_NETWORK)
             .build()
@@ -548,15 +677,19 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
                 when (state) {
                     Player.STATE_BUFFERING -> {
                         scheduleBufferingTimeout(gen, next, name)
+                        val qLabel = qualityList.getOrNull(qualityIndex)?.first ?: "默认"
                         if (preparingPlayer === next) {
+                            showBuffering("预加载：$name [$qLabel]")
                             showTip("正在切换到：$name（缓冲中）", autoHide = false)
                         } else if (player === next) {
-                            val qLabel = qualityList.getOrNull(qualityIndex)?.first ?: "默认"
+                            showBuffering("缓冲中 [$qLabel]")
                             showTip("正在缓冲 [$qLabel]...", autoHide = false)
                         }
                     }
                     Player.STATE_READY -> {
                         cancelBufferingTimeout()
+                        hideBuffering()
+                        hideErrorOverlay()
                         if (preparingPlayer === next) {
                             swapTo(next, gen, name)
                         } else if (player === next) {
@@ -573,6 +706,7 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
                     }
                     Player.STATE_ENDED -> {
                         cancelBufferingTimeout()
+                        hideBuffering()
                         if (player === next) {
                             onChannelUnplayable("直播已结束")
                         }
@@ -583,6 +717,8 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
             override fun onRenderedFirstFrame() {
                 if (gen != switchGen) return
                 cancelBufferingTimeout()
+                hideBuffering()
+                hideErrorOverlay()
                 Log.i(
                     TAG,
                     "onRenderedFirstFrame model=${Build.MODEL} sw=$preferSoftwareDecoderForCurrent channel=$name size=${next.videoSize.width}x${next.videoSize.height}"
@@ -659,7 +795,7 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         }
 
         next.playWhenReady = isColdStart
-        next.setMediaItem(MediaItem.fromUri(hls))
+        next.setMediaItem(buildLiveMediaItem(hls))
         next.prepare()
         scheduleBufferingTimeout(gen, next, name)
     }
@@ -1034,6 +1170,10 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         when {
             isMenuShowing -> hideMenu()
             isInfoShowing -> hideLiveInfo()
+            errorOverlay.visibility == View.VISIBLE -> {
+                releaseAll()
+                finish()
+            }
             else -> {
                 releaseAll()
                 finish()
@@ -1042,74 +1182,84 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
     }
 
     override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
-        if (isMenuShowing) {
-            when (keyCode) {
-                KeyEvent.KEYCODE_MENU,
-                KeyEvent.KEYCODE_INFO,
-                KeyEvent.KEYCODE_BACK -> {
-                    hideMenu()
-                    return true
-                }
-                KeyEvent.KEYCODE_DPAD_CENTER,
-                KeyEvent.KEYCODE_ENTER -> {
-                    val focusedView = currentFocus ?: channelMenuList.focusedChild
-                    val target = (focusedView?.tag as? Int)
-                    if (target != null) {
-                        hideMenu()
-                        switchToChannel(target, force = true)
-                        return true
-                    }
-                    return false
-                }
-            }
-            return super.onKeyDown(keyCode, event)
-        }
-
-        if (isInfoShowing) {
-            when (keyCode) {
-                KeyEvent.KEYCODE_DPAD_CENTER,
-                KeyEvent.KEYCODE_ENTER,
-                KeyEvent.KEYCODE_BACK,
-                KeyEvent.KEYCODE_INFO,
-                KeyEvent.KEYCODE_MENU -> {
-                    hideLiveInfo()
-                    return true
-                }
-            }
-            return super.onKeyDown(keyCode, event)
-        }
-
-        when (keyCode) {
-            KeyEvent.KEYCODE_BACK -> {
+        if (errorOverlay.visibility == View.VISIBLE) {
+            if (keyCode == KeyEvent.KEYCODE_BACK) {
                 handleBack()
                 return true
             }
-            KeyEvent.KEYCODE_MENU,
-            KeyEvent.KEYCODE_INFO -> {
+            return super.onKeyDown(keyCode, event)
+        }
+
+        val action = resolveRemoteAction(keyCode, isMenuShowing, isInfoShowing)
+        when (action) {
+            RemoteAction.CLOSE_MENU -> {
+                hideMenu()
+                return true
+            }
+            RemoteAction.MENU_CONFIRM -> {
+                val focusedView = currentFocus ?: channelMenuList.focusedChild
+                val target = focusedView?.tag as? Int
+                if (target != null) {
+                    hideMenu()
+                    switchToChannel(target, force = true)
+                    return true
+                }
+                return false
+            }
+            RemoteAction.CLOSE_INFO -> {
+                hideLiveInfo()
+                return true
+            }
+            RemoteAction.BACK_EXIT -> {
+                handleBack()
+                return true
+            }
+            RemoteAction.OPEN_MENU -> {
                 showMenu()
                 return true
             }
-            KeyEvent.KEYCODE_DPAD_UP -> {
+            RemoteAction.STEP_PREV_CHANNEL -> {
                 stepChannel(forward = false)
                 return true
             }
-            KeyEvent.KEYCODE_DPAD_DOWN -> {
+            RemoteAction.STEP_NEXT_CHANNEL -> {
                 stepChannel(forward = true)
                 return true
             }
-            KeyEvent.KEYCODE_DPAD_CENTER,
-            KeyEvent.KEYCODE_ENTER -> {
+            RemoteAction.TOGGLE_INFO -> {
                 toggleInfo()
                 return true
             }
-            KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE -> {
+            RemoteAction.MEDIA_PLAY -> {
                 player?.let {
-                    if (it.isPlaying) it.pause() else it.play()
+                    it.play()
+                    showTip("继续播放", autoHide = true)
                 }
                 return true
             }
+            RemoteAction.MEDIA_PAUSE -> {
+                player?.let {
+                    it.pause()
+                    showTip("已暂停", autoHide = true)
+                }
+                return true
+            }
+            RemoteAction.MEDIA_PLAY_PAUSE -> {
+                player?.let {
+                    if (it.isPlaying) {
+                        it.pause()
+                        showTip("已暂停", autoHide = true)
+                    } else {
+                        it.play()
+                        showTip("继续播放", autoHide = true)
+                    }
+                }
+                return true
+            }
+            RemoteAction.NONE -> {
+                return super.onKeyDown(keyCode, event)
+            }
         }
-        return super.onKeyDown(keyCode, event)
     }
 
     private fun stepChannel(forward: Boolean) {
@@ -1139,6 +1289,30 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
                 )
             }
         }
+    }
+
+    private fun showBuffering(message: String) {
+        bufferingText.text = message
+        if (bufferingPill.visibility != View.VISIBLE) {
+            bufferingPill.visibility = View.VISIBLE
+            bufferingPill.bringToFront()
+        }
+    }
+
+    private fun hideBuffering() {
+        bufferingPill.visibility = View.GONE
+    }
+
+    private fun showErrorOverlay(title: String, detail: String) {
+        errorTitleView.text = title
+        errorDetailView.text = detail
+        errorOverlay.visibility = View.VISIBLE
+        errorOverlay.bringToFront()
+        btnRetryChannel.post { btnRetryChannel.requestFocus() }
+    }
+
+    private fun hideErrorOverlay() {
+        errorOverlay.visibility = View.GONE
     }
 
     private fun showTip(msg: String, autoHide: Boolean) {

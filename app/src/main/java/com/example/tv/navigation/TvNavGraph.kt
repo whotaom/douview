@@ -24,6 +24,7 @@ fun TvNavGraph(
     val context = LocalContext.current
     val preferences = remember { LivePreferences(context) }
     var showUrlDialog by remember { mutableStateOf(false) }
+    var urlDialogReturnSignal by remember { mutableIntStateOf(0) }
 
     NavHost(
         navController = navController,
@@ -42,7 +43,8 @@ fun TvNavGraph(
                     }
                     context.startActivity(intent)
                 },
-                onOpenUrlDialog = { showUrlDialog = true }
+                onOpenUrlDialog = { showUrlDialog = true },
+                urlDialogReturnSignal = urlDialogReturnSignal
             )
         }
     }
@@ -50,9 +52,13 @@ fun TvNavGraph(
     if (showUrlDialog) {
         ChangeUrlDialog(
             currentUrl = preferences.targetUrl,
-            onDismiss = { showUrlDialog = false },
+            onDismiss = {
+                showUrlDialog = false
+                urlDialogReturnSignal++
+            },
             onConfirmUrl = { confirmedUrl ->
                 showUrlDialog = false
+                urlDialogReturnSignal++
                 preferences.targetUrl = confirmedUrl
                 val line = StreamLines.detectLine(confirmedUrl)
                 val base = StreamLines.baseUrl(line)

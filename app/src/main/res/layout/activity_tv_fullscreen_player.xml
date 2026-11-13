@@ -28,22 +28,141 @@
         app:surface_type="surface_view"
         app:use_controller="false" />
 
-    <!-- 3. 顶部居中换台与状态提示 -->
+    <!-- 3. 顶部安全区居中换台与状态提示（遵守 TV 5% Overscan 安全区） -->
     <TextView
         android:id="@+id/tipView"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
         android:layout_gravity="top|center_horizontal"
-        android:layout_marginTop="40dp"
-        android:background="#CC111111"
+        android:layout_marginLeft="48dp"
+        android:layout_marginTop="28dp"
+        android:layout_marginRight="48dp"
+        android:background="@drawable/bg_tv_overlay_panel"
         android:elevation="40dp"
-        android:paddingLeft="28dp"
-        android:paddingTop="12dp"
-        android:paddingRight="28dp"
-        android:paddingBottom="12dp"
+        android:paddingLeft="24dp"
+        android:paddingTop="10dp"
+        android:paddingRight="24dp"
+        android:paddingBottom="10dp"
         android:text="正在连接直播服务..."
         android:textColor="#FFFFFF"
-        android:textSize="18sp"
+        android:textSize="17sp"
         android:visibility="gone" />
+
+    <!-- 4. 右上角 TV 安全区轻量缓冲加载指示胶囊 -->
+    <LinearLayout
+        android:id="@+id/bufferingPill"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="top|end"
+        android:layout_marginTop="28dp"
+        android:layout_marginEnd="48dp"
+        android:background="@drawable/bg_tv_overlay_panel"
+        android:elevation="36dp"
+        android:gravity="center_vertical"
+        android:orientation="horizontal"
+        android:paddingLeft="16dp"
+        android:paddingTop="8dp"
+        android:paddingRight="18dp"
+        android:paddingBottom="8dp"
+        android:visibility="gone">
+
+        <ProgressBar
+            android:layout_width="20dp"
+            android:layout_height="20dp"
+            android:indeterminate="true"
+            android:indeterminateTint="#25F4EE" />
+
+        <TextView
+            android:id="@+id/bufferingText"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="10dp"
+            android:text="缓冲中..."
+            android:textColor="#F2F4F8"
+            android:textSize="15sp"
+            android:textStyle="bold" />
+    </LinearLayout>
+
+    <!-- 5. 高对比度可遥控操作的直播加载失败 / 无可用频道兜底面板 -->
+    <LinearLayout
+        android:id="@+id/errorOverlay"
+        android:layout_width="520dp"
+        android:layout_height="wrap_content"
+        android:layout_gravity="center"
+        android:layout_marginLeft="48dp"
+        android:layout_marginRight="48dp"
+        android:background="@drawable/bg_tv_overlay_panel"
+        android:elevation="52dp"
+        android:gravity="center_horizontal"
+        android:orientation="vertical"
+        android:padding="28dp"
+        android:visibility="gone">
+
+        <TextView
+            android:id="@+id/errorTitleView"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="直播连接暂时中断"
+            android:textColor="#FFFFFF"
+            android:textSize="22sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:id="@+id/errorDetailView"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="10dp"
+            android:gravity="center"
+            android:lineSpacingExtra="4dp"
+            android:text="当前暂无可播放信号，请使用遥控器选择重试或切换下一台"
+            android:textColor="#B8C0CC"
+            android:textSize="15sp" />
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="22dp"
+            android:gravity="center"
+            android:orientation="horizontal">
+
+            <Button
+                android:id="@+id/btnRetryChannel"
+                android:layout_width="0dp"
+                android:layout_height="48dp"
+                android:layout_marginEnd="10dp"
+                android:layout_weight="1"
+                android:backgroundTint="#25F4EE"
+                android:focusable="true"
+                android:text="重试当前台"
+                android:textColor="#09090C"
+                android:textSize="15sp"
+                android:textStyle="bold" />
+
+            <Button
+                android:id="@+id/btnNextChannel"
+                android:layout_width="0dp"
+                android:layout_height="48dp"
+                android:layout_marginEnd="10dp"
+                android:layout_weight="1"
+                android:backgroundTint="#2A2D3A"
+                android:focusable="true"
+                android:text="下一频道"
+                android:textColor="#FFFFFF"
+                android:textSize="15sp"
+                android:textStyle="bold" />
+
+            <Button
+                android:id="@+id/btnExitPlayer"
+                android:layout_width="0dp"
+                android:layout_height="48dp"
+                android:layout_weight="1"
+                android:backgroundTint="#FE2C55"
+                android:focusable="true"
+                android:text="返回主页"
+                android:textColor="#FFFFFF"
+                android:textSize="15sp"
+                android:textStyle="bold" />
+        </LinearLayout>
+    </LinearLayout>
 
 </FrameLayout>

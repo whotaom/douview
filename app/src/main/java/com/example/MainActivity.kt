@@ -577,11 +577,11 @@ class MainActivity : ComponentActivity() {
                                 handler: SslErrorHandler?,
                                 error: SslError?
                             ) {
-                                val host = Uri.parse(error?.url ?: "").host ?: ""
-                                if (host.contains("fuxiaoya.com") || host.contains("whomao.com") || host.contains("douyin.com") || host.contains("bytevod.com")) {
-                                    handler?.proceed()
-                                } else {
-                                    handler?.proceed()
+                                handler?.cancel()
+                                if (error?.primaryError != null) {
+                                    isLoading = false
+                                    isPageError = true
+                                    errorMessage = "HTTPS 证书校验未通过，已拦截不安全连接"
                                 }
                             }
                         }
@@ -1083,9 +1083,9 @@ class MainActivity : ComponentActivity() {
         if (showUpdateDialog) {
             UpdateDialog(
                 onDismiss = { showUpdateDialog = false },
-                onDownloadApk = { downloadUrl ->
+                onOpenReleasePage = { releaseUrl ->
                     showUpdateDialog = false
-                    UpdateManager.startDownloadApk(this@MainActivity, downloadUrl)
+                    UpdateManager.openReleasePage(this@MainActivity, releaseUrl)
                 }
             )
         }
@@ -1772,7 +1772,7 @@ class MainActivity : ComponentActivity() {
         settings.displayZoomControls = false
         settings.textZoom = 100
         settings.cacheMode = WebSettings.LOAD_DEFAULT
-        settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+        settings.mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
         settings.allowFileAccess = false
         settings.allowContentAccess = false
         settings.setSupportMultipleWindows(false)

@@ -7,8 +7,6 @@
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <!-- Keep screen awake while streaming -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
-    <!-- APK download & in-app update installation -->
-    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
 
     <!-- 声明支持 Android TV 大屏，且不强制触摸屏支持 -->
     <uses-feature
@@ -31,7 +29,7 @@
         android:banner="@drawable/tv_banner"
         android:supportsRtl="true"
         android:theme="@style/Theme.MyApplication"
-        android:usesCleartextTraffic="true"
+        android:networkSecurityConfig="@xml/network_security_config"
         android:hardwareAccelerated="true">
         <!-- 现有手机/平板启动入口 Activity -->
         <activity
