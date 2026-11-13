@@ -1,10 +1,13 @@
 package com.example
 
 import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.Color
 import androidx.test.core.app.ApplicationProvider
 import com.example.data.LivePreferences
 import com.example.tv.player.LiveDynamicBackgroundConfig
 import com.example.tv.player.LiveDynamicBackgroundState
+import com.example.tv.player.LiveFrameAnalyzer
 import com.example.tv.player.PlayerSurfaceMode
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -19,7 +22,7 @@ import org.robolectric.annotation.Config
 class LiveDynamicBackgroundTest {
 
     @Test
-    fun `shouldSample is true only when all seven runtime guards pass`() {
+    fun `shouldSample is true only when all eight runtime guards pass`() {
         val ready = LiveDynamicBackgroundState(
             enabled = true,
             isPlaying = true,
@@ -27,7 +30,8 @@ class LiveDynamicBackgroundTest {
             hasRenderedFirstFrame = true,
             isScreenOffAudioMode = false,
             isLifecycleBackground = false,
-            surfaceIsTextureView = true,
+            surfaceIsSupported = true,
+            samplerBackedOff = false,
             resetKey = "1001"
         )
         assertTrue(ready.shouldSample)
@@ -38,13 +42,14 @@ class LiveDynamicBackgroundTest {
         assertFalse(ready.copy(hasRenderedFirstFrame = false).shouldSample)
         assertFalse(ready.copy(isScreenOffAudioMode = true).shouldSample)
         assertFalse(ready.copy(isLifecycleBackground = true).shouldSample)
-        assertFalse(ready.copy(surfaceIsTextureView = false).shouldSample)
+        assertFalse(ready.copy(surfaceIsSupported = false).shouldSample)
+        assertFalse(ready.copy(samplerBackedOff = true).shouldSample)
     }
 
     @Test
-    fun `resolveSurfaceType respects dynamic bg preference and hardware blacklist`() {
+    fun `resolveSurfaceType always prioritizes SurfaceView for hardware stability`() {
         assertEquals(
-            PlayerSurfaceMode.TEXTURE_VIEW,
+            PlayerSurfaceMode.SURFACE_VIEW,
             LiveDynamicBackgroundConfig.resolveSurfaceType(
                 preferDynamicBg = true,
                 textureViewBlacklisted = false
@@ -64,6 +69,24 @@ class LiveDynamicBackgroundTest {
                 textureViewBlacklisted = false
             )
         )
+    }
+
+    @Test
+    fun `frame analyzer rejects pitch black and transparent frames but accepts visible content`() {
+        val black = Bitmap.createBitmap(32, 64, Bitmap.Config.ARGB_8888)
+        black.eraseColor(Color.BLACK)
+        assertFalse(LiveFrameAnalyzer.hasVisibleContent(black))
+        black.recycle()
+
+        val transparent = Bitmap.createBitmap(32, 64, Bitmap.Config.ARGB_8888)
+        transparent.eraseColor(Color.TRANSPARENT)
+        assertFalse(LiveFrameAnalyzer.hasVisibleContent(transparent))
+        transparent.recycle()
+
+        val visible = Bitmap.createBitmap(32, 64, Bitmap.Config.ARGB_8888)
+        visible.eraseColor(Color.rgb(42, 88, 120))
+        assertTrue(LiveFrameAnalyzer.hasVisibleContent(visible))
+        visible.recycle()
     }
 
     @Test

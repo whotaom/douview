@@ -34,9 +34,11 @@ import androidx.media3.common.Player
 import androidx.media3.common.VideoSize
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.DefaultHttpDataSource
+import android.content.Intent
 import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.mediacodec.MediaCodecSelector
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.exoplayer.trackselection.DefaultTrackSelector
 import androidx.media3.exoplayer.upstream.DefaultBandwidthMeter
@@ -60,10 +62,10 @@ import java.util.concurrent.TimeUnit
 
 /**
  * 电视大屏全屏直播播放器（顶级 TV 直播客户端方案）
- * 1. 唯一全屏 PlayerView（优先 TextureView 采样，异常自动降级 SurfaceView，始终 RESIZE_MODE_FIT 不拉伸）
- * 2. 竖屏动态背景：未出首帧使用主播头像轻虚化占位；出首帧后由 TextureView 双缓冲采样实况帧轻磨砂铺满左右
- * 3. 「先备后切」(prepare-then-swap)：换台期间旧流不中断，新流 READY/首帧切换并立刻清空旧台实况背景帧
- * 4. 离线/无法播放自动切换下一在线台，记录本轮失败集合彻底防死循环
+ * 1. 主画面永远优先 SurfaceView 硬件直出（RESIZE_MODE_FIT 不拉伸），彻底规避 RK3528 / H96 等盒子 TextureView 黑屏
+ * 2. 竖屏动态背景：未出首帧使用主播头像轻虚化占位；出首帧后通过 PixelCopy 异步采集 SurfaceView 实况帧 + 黑帧过滤 + 轻磨砂铺满左右
+ * 3. 「先备后切」(prepare-then-swap)：冷启动直绑 Surface 避免丢首帧 IDR；切台后台静默缓冲至 READY 再瞬切并释放旧解码器，避免双路 VPU 抢占
+ * 4. 硬件解码首帧超时（4.5s）或解码异常时自动降级软件兼容解码重试，彻底防止单台卡黑屏
  * 5. 菜单仅展示在线频道，标题带实时在线台数「在线频道（N）」；OK 键技术面板 1 秒实时刷新
  */
 class TvFullscreenPlayerActivity : ComponentActivity() {
@@ -72,7 +74,7 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         const val DEFAULT_BASE_URL = StreamLines.LINE_1
         private const val TAG = "TVPlayer"
         private const val TV_UA = ChannelManager.TV_UA
-        private const val FIRST_FRAME_WATCHDOG_MS = 4_000L
+        private const val FIRST_FRAME_WATCHDOG_MS = 4_500L
 
         const val EXTRA_URL = "extra_url"
         const val EXTRA_RID = "extra_rid"
@@ -87,7 +89,7 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         val streamCacheTime = mutableMapOf<String, Long>()
         const val CACHE_TTL = 5 * 60 * 1000L
 
-        // 轻微模糊头像内存缓存（未出首帧占位用）
+        // 轻微模糊头像内存缓存（未出首帧或采样退避时占位用）
         private val blurredAvatarCache = LruCache<String, Bitmap>(16)
 
         fun clearStreamCache() {
@@ -103,29 +105,32 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
 
     // UI 组件
     private lateinit var root: FrameLayout
-    private lateinit var posterBg: ImageView               // 未出首帧（及兼容降级时）主播头像虚化占位
-    private lateinit var liveBg: ImageView                 // 出首帧后 TextureView 实况采样双缓冲背景
-    private lateinit var playerHost: FrameLayout           // 动态承载 TextureView / SurfaceView 版 PlayerView
-    private lateinit var playerView: PlayerView            // 唯一全屏主播放器（严格 RESIZE_MODE_FIT）
+    private lateinit var posterBg: ImageView               // 未出首帧（及采样退避时）主播头像虚化占位
+    private lateinit var liveBg: ImageView                 // 出首帧后 PixelCopy 实况采样双缓冲背景
+    private lateinit var playerHost: FrameLayout           // 唯一全屏主播放器宿主容器
+    private lateinit var playerView: PlayerView            // 唯一全屏主播放器（SurfaceView + RESIZE_MODE_FIT）
     private lateinit var tipView: TextView                 // 顶部高层级换台与状态提示
     private lateinit var channelMenu: FrameLayout          // 左侧在线选台悬浮面板
     private lateinit var menuTitleView: TextView           // 选台菜单标题：「在线频道（N）」
     private lateinit var channelMenuList: LinearLayout
     private lateinit var infoOverlay: TextView             // OK 键技术参数浮层（1s 实时刷新）
 
-    // 主播放器与后台备播播放器（先备后切，禁止中间 player = null 空窗）
+    // 主播放器与后台备播播放器
     private var player: ExoPlayer? = null
     private var preparingPlayer: ExoPlayer? = null
     private var isMenuShowing = false
     private var isInfoShowing = false
 
-    // 竖屏动态背景与 Surface 黑屏降级状态
-    private var currentSurfaceMode: PlayerSurfaceMode = PlayerSurfaceMode.TEXTURE_VIEW
+    // 竖屏动态背景与黑屏自愈状态
+    private var currentSurfaceMode: PlayerSurfaceMode = PlayerSurfaceMode.SURFACE_VIEW
     private lateinit var dynamicBgController: LiveDynamicBackgroundController
     private var avatarLoadJob: Job? = null
     private var currentAvatarUrl: String? = null
     private var isPortraitStream: Boolean = true
     private var hasRenderedFirstFrameForCurrent: Boolean = false
+    private var preferSoftwareDecoderForCurrent: Boolean = false
+    private var activeStreamUrl: String = ""
+    private var activeChannelName: String = ""
     private var firstFrameWatchdogRunnable: Runnable? = null
 
     // 播放列表与当前索引
@@ -177,6 +182,15 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
                 handleBack()
             }
         })
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        failedRidsThisRound.clear()
+        preferSoftwareDecoderForCurrent = false
+        currentLine = resolveInitialLine()
+        setupPlayListAndStart()
     }
 
     private fun resolveInitialLine(): Int {
@@ -238,7 +252,6 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
             }
         }
         dynamicBgController.attachPlayerView(playerView)
-        dynamicBgController.setSurfaceIsTextureView(currentSurfaceMode == PlayerSurfaceMode.TEXTURE_VIEW)
 
         // 1. 左侧在线选台悬浮面板（仅占 400dp，无全屏遮罩）
         channelMenu = FrameLayout(this).apply {
@@ -446,6 +459,7 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         if (!fromAutoSkip) {
             showTip("正在切换到：${channel.name}", autoHide = false)
         }
+        preferSoftwareDecoderForCurrent = false
         // 切台时立即清空上一频道的实况背景帧，并以未出首帧海报占位
         dynamicBgController.onChannelChanged(channel.rid)
         bindPosterPlaceholder(channel.avatar)
@@ -532,18 +546,32 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
     }
 
     /**
-     * 后台准备新流，STATE_READY 后瞬间替换当前播放器
+     * 准备新流并切换：
+     * - 冷启动（player == null）：直接绑定 playerView 再 prepare，保证首帧 IDR 直接落到 SurfaceView，杜绝无 Surface 丢帧黑屏
+     * - 换台（player != null）：新播放器以 playWhenReady = false 后台静默缓冲至 STATE_READY，保持旧流不中断；
+     *   就绪瞬间切流并立即释放旧播放器，防止低端 TV 盒子双路硬件 VPU 内存抢占导致的黑屏
      */
-    private fun prepareThenSwap(gen: Long, hls: String, name: String) {
+    @OptIn(UnstableApi::class)
+    private fun prepareThenSwap(
+        gen: Long,
+        hls: String,
+        name: String,
+        preferSoftwareDecoder: Boolean = preferSoftwareDecoderForCurrent
+    ) {
         if (gen != switchGen || isFinishing || isDestroyed) return
         releasePreparing()
+        cancelFirstFrameWatchdog()
+
+        preferSoftwareDecoderForCurrent = preferSoftwareDecoder
+        activeStreamUrl = hls
+        activeChannelName = name
 
         val renderersFactory = DefaultRenderersFactory(this).apply {
             setEnableDecoderFallback(true)
-            setExtensionRendererMode(DefaultRenderersFactory.EXTENSION_RENDERER_MODE_PREFER)
+            setMediaCodecSelector(buildMediaCodecSelector(preferSoftwareDecoder))
         }
         val loadControl = DefaultLoadControl.Builder()
-            .setBufferDurationsMs(10_000, 28_000, 2_000, 5_000)
+            .setBufferDurationsMs(10_000, 25_000, 1_500, 4_000)
             .build()
         val trackSelector = DefaultTrackSelector(this).apply {
             parameters = buildUponParameters()
@@ -564,7 +592,21 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
             .setMediaSourceFactory(mediaSourceFactory)
             .build()
 
-        preparingPlayer = next
+        val isColdStart = (player == null)
+        if (isColdStart) {
+            player = next
+            preparingPlayer = null
+            hasRenderedFirstFrameForCurrent = false
+            val currentRid = playList.getOrNull(currentIndex)?.rid ?: name
+            dynamicBgController.onChannelChanged(currentRid)
+            dynamicBgController.setHasRenderedFirstFrame(false)
+            playerView.resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
+            playerView.player = next
+            dynamicBgController.attachPlayerView(playerView)
+            dynamicBgController.setPlaying(true)
+        } else {
+            preparingPlayer = next
+        }
 
         next.addListener(object : Player.Listener {
             override fun onIsPlayingChanged(isPlaying: Boolean) {
@@ -594,12 +636,11 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
                             swapTo(next, gen, name)
                         } else if (player === next) {
                             dynamicBgController.setPlaying(next.isPlaying || next.playWhenReady)
-                            if (currentSurfaceMode == PlayerSurfaceMode.TEXTURE_VIEW &&
-                                !hasRenderedFirstFrameForCurrent &&
+                            if (!hasRenderedFirstFrameForCurrent &&
                                 next.playWhenReady &&
                                 next.videoFormat != null
                             ) {
-                                scheduleFirstFrameWatchdog(next)
+                                scheduleFirstFrameWatchdog(gen, next)
                             }
                             if (tipView.visibility == View.VISIBLE) {
                                 tipView.postDelayed(hideTipRunnable, 600)
@@ -621,7 +662,7 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
                 cancelBufferingTimeout()
                 Log.i(
                     TAG,
-                    "onRenderedFirstFrame model=${Build.MODEL} surface=$currentSurfaceMode channel=$name size=${next.videoSize.width}x${next.videoSize.height}"
+                    "onRenderedFirstFrame model=${Build.MODEL} surface=$currentSurfaceMode sw=$preferSoftwareDecoderForCurrent channel=$name size=${next.videoSize.width}x${next.videoSize.height}"
                 )
                 if (preparingPlayer === next) {
                     swapTo(next, gen, name)
@@ -632,6 +673,7 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
                     if (next.videoSize.width > 0 && next.videoSize.height > 0) {
                         updateBackgroundForVideoSize(next.videoSize)
                     }
+                    dynamicBgController.attachPlayerView(playerView)
                     dynamicBgController.setPlaying(next.isPlaying || next.playWhenReady)
                     dynamicBgController.setHasRenderedFirstFrame(true)
                     if (tipView.visibility == View.VISIBLE) {
@@ -645,25 +687,25 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
                 if (gen != switchGen) return
                 Log.e(TAG, "播放异常: ${error.errorCodeName} | ${error.message}")
                 cancelBufferingTimeout()
+                cancelFirstFrameWatchdog()
 
-                if (player === next &&
-                    currentSurfaceMode == PlayerSurfaceMode.TEXTURE_VIEW &&
-                    !hasRenderedFirstFrameForCurrent &&
-                    isLikelySurfaceOrRenderError(error)
-                ) {
-                    fallbackToSurfaceView("TextureView 渲染异常降级")
+                if (!preferSoftwareDecoderForCurrent && isLikelyDecoderOrRenderError(error)) {
+                    retryWithSoftwareDecoder(gen, "解码器异常自动切软件兼容解码")
                     return
                 }
 
                 if (preparingPlayer === next) {
                     releasePreparing()
+                } else if (player === next) {
+                    releasePlayerOnly()
                 }
 
                 // 自动降级尝试下一清晰度；若全部失败则触发自动切台
                 val nextQIdx = qualityIndex + 1
                 if (nextQIdx in qualityList.indices) {
                     qualityIndex = nextQIdx
-                    prepareThenSwap(gen, qualityList[nextQIdx].second, name)
+                    preferSoftwareDecoderForCurrent = false
+                    prepareThenSwap(gen, qualityList[nextQIdx].second, name, preferSoftwareDecoder = false)
                 } else {
                     playList.getOrNull(currentIndex)?.rid?.let { rid ->
                         streamCache.remove(rid)
@@ -684,20 +726,21 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         if (gen != switchGen) {
             next.release()
             if (preparingPlayer === next) preparingPlayer = null
+            if (player === next) player = null
             return
         }
 
+        next.playWhenReady = isColdStart
         next.setMediaItem(MediaItem.fromUri(hls))
         next.prepare()
-        next.playWhenReady = true
         scheduleBufferingTimeout(gen, next, name)
     }
 
     /**
-     * 瞬间切换（零黑屏空窗）：
-     * 1. 旧播放器一直保留在 playerView 上直到新流 READY
-     * 2. 一次赋值 playerView.player = next（禁止中间置 null）
-     * 3. 立即重置首帧与采样状态，绑定新流后再释放旧播放器
+     * 瞬间切换（零黑屏空窗且避免双 VPU 解码抢占）：
+     * 1. 先让 playerView.player = next（内部自动解除旧 Surface，零 player = null 空窗）
+     * 2. 立即释放旧播放器，腾出硬件 VPU 解码通道与 CMA 内存
+     * 3. 置 next.playWhenReady = true，使新流从首关键帧直接解码渲染到 SurfaceView
      */
     @OptIn(UnstableApi::class)
     private fun swapTo(next: ExoPlayer, gen: Long, name: String) {
@@ -723,8 +766,15 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         playerView.resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
         playerView.player = next
         dynamicBgController.attachPlayerView(playerView)
-        dynamicBgController.setSurfaceIsTextureView(currentSurfaceMode == PlayerSurfaceMode.TEXTURE_VIEW)
-        dynamicBgController.setPlaying(next.isPlaying || next.playWhenReady)
+
+        try {
+            old?.stop()
+            old?.clearMediaItems()
+            old?.release()
+        } catch (_: Exception) {}
+
+        next.playWhenReady = true
+        dynamicBgController.setPlaying(true)
 
         val vs = next.videoSize
         if (vs.width > 0 && vs.height > 0) {
@@ -735,19 +785,12 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
             refreshPosterVisibility()
         }
 
-        if (currentSurfaceMode == PlayerSurfaceMode.TEXTURE_VIEW &&
-            next.playbackState == Player.STATE_READY &&
+        if (next.playbackState == Player.STATE_READY &&
             next.playWhenReady &&
             next.videoFormat != null
         ) {
-            scheduleFirstFrameWatchdog(next)
+            scheduleFirstFrameWatchdog(gen, next)
         }
-
-        try {
-            old?.stop()
-            old?.clearMediaItems()
-            old?.release()
-        } catch (_: Exception) {}
 
         showTip("已切换到：$name", autoHide = true)
     }
@@ -761,7 +804,25 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         preparingPlayer = null
     }
 
-    private fun isLikelySurfaceOrRenderError(error: PlaybackException): Boolean {
+    @OptIn(UnstableApi::class)
+    private fun buildMediaCodecSelector(preferSoftware: Boolean): MediaCodecSelector {
+        if (!preferSoftware) return MediaCodecSelector.DEFAULT
+        return MediaCodecSelector { mimeType, requiresSecureDecoder, requiresTunnelingDecoder ->
+            val all = MediaCodecSelector.DEFAULT.getDecoderInfos(
+                mimeType,
+                requiresSecureDecoder,
+                requiresTunnelingDecoder
+            )
+            all.sortedBy { info ->
+                val isSw = info.softwareOnly ||
+                    info.name.startsWith("c2.android.", ignoreCase = true) ||
+                    info.name.startsWith("OMX.google.", ignoreCase = true)
+                if (isSw) 0 else 1
+            }
+        }
+    }
+
+    private fun isLikelyDecoderOrRenderError(error: PlaybackException): Boolean {
         return when (error.errorCode) {
             PlaybackException.ERROR_CODE_DECODER_INIT_FAILED,
             PlaybackException.ERROR_CODE_DECODING_FAILED,
@@ -771,19 +832,19 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         }
     }
 
-    private fun scheduleFirstFrameWatchdog(targetPlayer: ExoPlayer) {
+    private fun scheduleFirstFrameWatchdog(gen: Long, targetPlayer: ExoPlayer) {
         cancelFirstFrameWatchdog()
-        if (currentSurfaceMode != PlayerSurfaceMode.TEXTURE_VIEW || hasRenderedFirstFrameForCurrent) return
+        if (hasRenderedFirstFrameForCurrent || preferSoftwareDecoderForCurrent) return
         firstFrameWatchdogRunnable = Runnable {
-            if (isFinishing || isDestroyed) return@Runnable
+            if (isFinishing || isDestroyed || gen != switchGen) return@Runnable
             if (player === targetPlayer &&
-                currentSurfaceMode == PlayerSurfaceMode.TEXTURE_VIEW &&
                 !hasRenderedFirstFrameForCurrent &&
+                !preferSoftwareDecoderForCurrent &&
                 targetPlayer.playbackState == Player.STATE_READY &&
                 targetPlayer.playWhenReady &&
                 targetPlayer.videoFormat != null
             ) {
-                fallbackToSurfaceView("TextureView 首帧超时(${FIRST_FRAME_WATCHDOG_MS}ms)")
+                retryWithSoftwareDecoder(gen, "硬件解码首帧超时(${FIRST_FRAME_WATCHDOG_MS}ms)")
             }
         }.also {
             mainHandler.postDelayed(it, FIRST_FRAME_WATCHDOG_MS)
@@ -795,29 +856,16 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         firstFrameWatchdogRunnable = null
     }
 
-    /**
-     * H96 / RK3528 等硬件平台 TextureView 首帧异常时，持久化降级标记并热切至 SurfaceView
-     */
-    @OptIn(UnstableApi::class)
-    private fun fallbackToSurfaceView(reason: String) {
-        if (currentSurfaceMode == PlayerSurfaceMode.SURFACE_VIEW || isFinishing || isDestroyed) return
-        Log.w(TAG, "自动降级至 SurfaceView: reason=$reason model=${Build.MODEL}")
-        cancelFirstFrameWatchdog()
-        preferences.textureViewBlacklisted = true
-        currentSurfaceMode = PlayerSurfaceMode.SURFACE_VIEW
-
-        dynamicBgController.setSurfaceIsTextureView(false)
-        liveBg.setImageDrawable(null)
-        liveBg.visibility = View.GONE
-        refreshPosterVisibility()
-
-        val activePlayer = player
-        activePlayer?.clearVideoSurface()
-        inflatePlayerView(PlayerSurfaceMode.SURFACE_VIEW)
-        playerView.player = activePlayer
-        dynamicBgController.attachPlayerView(playerView)
-        dynamicBgController.setSurfaceIsTextureView(false)
-        showTip("已切换至兼容播放模式（SurfaceView）", autoHide = true)
+    private fun retryWithSoftwareDecoder(gen: Long, reason: String) {
+        if (gen != switchGen || preferSoftwareDecoderForCurrent || isFinishing || isDestroyed) return
+        val url = activeStreamUrl
+        if (url.isBlank()) return
+        val name = activeChannelName.ifBlank { playList.getOrNull(currentIndex)?.name ?: "当前频道" }
+        Log.w(TAG, "硬件解码未出画，切软件兼容解码重试: reason=$reason model=${Build.MODEL}")
+        showTip("正切换兼容解码模式…", autoHide = true)
+        releasePreparing()
+        releasePlayerOnly()
+        prepareThenSwap(gen, url, name, preferSoftwareDecoder = true)
     }
 
     // -------------------- 竖屏动态背景：未出首帧头像占位 + 出首帧后实况采样 --------------------
@@ -1142,13 +1190,17 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
             append("音频编码：${af?.sampleMimeType ?: "-"}\n")
             append("码率：${if (kbps > 0) "约 $kbps kbps" else "自适应"}\n")
             append("缓冲：${p?.totalBufferedDuration ?: 0} ms\n")
-            val bgDesc = if (currentSurfaceMode == PlayerSurfaceMode.TEXTURE_VIEW) {
-                "TextureView 实况采样（FIT 不拉伸）"
-            } else {
-                "SurfaceView 兼容模式（FIT 不拉伸）"
+            val bgState = dynamicBgController.currentState
+            val bgDesc = when {
+                !isPortraitStream -> "SurfaceView 横屏直出（纯黑底 · FIT）"
+                bgState.samplerBackedOff -> "SurfaceView 直出 + 头像占位（采样已退避）"
+                bgState.shouldSample -> "SurfaceView 直出 + PixelCopy 实况背景"
+                else -> "SurfaceView 直出 + 头像占位（待首帧）"
             }
+            val decodeDesc = if (preferSoftwareDecoderForCurrent) "软件兼容解码" else "硬件直出解码"
             append("线路：$lineLabel\n")
             append("背景模式：$bgDesc\n")
+            append("解码引擎：$decodeDesc（首帧：${if (hasRenderedFirstFrameForCurrent) "已出画" else "等待中"}）\n")
             append("播放状态：$playStateText\n")
             append("────────────────\n（再次按 OK 或返回键关闭）")
         }
