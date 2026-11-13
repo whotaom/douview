@@ -805,9 +805,15 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
                     val json = JSONObject(body)
                     if (json.optInt("code", 0) != 200) return@withContext emptyList<Pair<String, String>>() to null
 
-                    val avatarUrl = ChannelManager.extractAvatarUrl(json)
-                        .ifBlank { ChannelManager.extractAvatarUrl(json.optJSONObject("room")) }
-                        .takeIf { it.isNotBlank() }
+                    val avatarUrl = listOf(
+                        json,
+                        json.optJSONObject("room"),
+                        json.optJSONObject("anchor"),
+                        json.optJSONObject("data"),
+                        json.optJSONObject("info")
+                    ).firstNotNullOfOrNull { obj ->
+                        ChannelManager.extractAvatarUrl(obj).takeIf { it.isNotBlank() }
+                    }
 
                     val streamsObj = json.optJSONObject("streams") ?: return@withContext emptyList<Pair<String, String>>() to avatarUrl
 
