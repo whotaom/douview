@@ -5,8 +5,10 @@ import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.Looper
+import android.util.Log
 import android.view.PixelCopy
 import android.view.SurfaceView
+import android.view.TextureView
 import android.view.View
 import android.widget.ImageView
 import androidx.media3.ui.PlayerView
@@ -16,14 +18,16 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
- * TV 端纯原生动态背景助手（PixelCopy + 48×84 极小缩略图 + 轻量模糊）
- * - 保持 PlayerView 使用 SurfaceView 硬件直出，不改 TextureView、不引入 WebView/Base64
- * - 严格门控：仅竖屏流 + 正在播放 + 已出首帧 + 页面在前台时以 ≈5fps 采样
- * - 横屏 / 暂停 / 切台 / 退后台 / 错误态立即停止并清空，彻底避免串台残影与后台空转
+ * TV 端纯原生动态背景助手（TextureView 优先采样 + SurfaceView PixelCopy 兜底）
+ * - 针对 RK3528 等 TV SoC：PlayerView 使用 TextureView，与底层 dynBgView 处于同一窗口渲染树，
+ *   彻底解决 SurfaceView 硬件 VOP 覆盖层在 RK3528 上分层失效及 PixelCopy 黑帧/拒读问题。
+ * - 采样尺寸仅 48×84（≈5fps），模糊与压暗全在后台线程完成，不阻塞主线程与解码器。
+ * - 严格门控：仅竖屏流 + 正在播放 + 已出首帧 + 页面在前台时运行；横屏/暂停/切台/退后台/报错立即清空。
  */
 class DynBgHelper(
     private val playerView: PlayerView,
@@ -31,6 +35,7 @@ class DynBgHelper(
     private val scope: CoroutineScope
 ) {
     companion object {
+        private const val TAG = "DynBgHelper"
         const val SAMPLE_WIDTH = 48
         const val SAMPLE_HEIGHT = 84
         const val SAMPLE_INTERVAL_MS = 200L
@@ -41,12 +46,15 @@ class DynBgHelper(
         fun isPortraitVideo(
             width: Int,
             height: Int,
-            pixelWidthHeightRatio: Float = 1f
+            pixelWidthHeightRatio: Float = 1f,
+            unappliedRotationDegrees: Int = 0
         ): Boolean {
             if (width <= 0 || height <= 0) return false
             val sar = if (pixelWidthHeightRatio > 0f) pixelWidthHeightRatio else 1f
-            val displayWidth = width * sar
-            return height > displayWidth * 1.02f
+            val rotated = ((unappliedRotationDegrees % 180) + 180) % 180 == 90
+            val visualWidth = if (rotated) height.toFloat() else width * sar
+            val visualHeight = if (rotated) width * sar else height.toFloat()
+            return visualHeight > visualWidth * 1.02f
         }
 
         fun shouldRunDynamicBg(
@@ -55,6 +63,33 @@ class DynBgHelper(
             hasFirstFrame: Boolean,
             isForeground: Boolean
         ): Boolean = isPortrait && isPlaying && hasFirstFrame && isForeground
+
+        fun hasVisibleFrameContent(bitmap: Bitmap): Boolean {
+            val w = bitmap.width
+            val h = bitmap.height
+            if (w <= 0 || h <= 0) return false
+            val stepX = (w / 6).coerceAtLeast(1)
+            val stepY = (h / 8).coerceAtLeast(1)
+            var nonBlackCount = 0
+            var y = 0
+            while (y < h) {
+                var x = 0
+                while (x < w) {
+                    val p = bitmap.getPixel(x, y)
+                    val a = p ushr 24
+                    val r = (p shr 16) and 0xFF
+                    val g = (p shr 8) and 0xFF
+                    val b = p and 0xFF
+                    if (a > 16 && (r > 6 || g > 6 || b > 6)) {
+                        nonBlackCount++
+                        if (nonBlackCount >= 3) return true
+                    }
+                    x += stepX
+                }
+                y += stepY
+            }
+            return false
+        }
 
         /**
          * 对 48×84 缩略图做 2-pass BoxBlur + 轻微压暗与降饱和（直接像素运算，零 Canvas/ColorMatrix 分配）。
@@ -149,6 +184,7 @@ class DynBgHelper(
     private val copyInFlight = AtomicBoolean(false)
     @Volatile
     private var released = false
+    private var loggedSurfaceWarning = false
 
     private var isPortraitStream: Boolean = false
     private var hasFirstFrame: Boolean = false
@@ -183,6 +219,7 @@ class DynBgHelper(
         isPortraitStream = false
         hasFirstFrame = false
         isPlaying = false
+        loggedSurfaceWarning = false
         stopAndClear()
     }
 
@@ -230,7 +267,7 @@ class DynBgHelper(
                 if (!shouldRunDynamicBg(isPortraitStream, isPlaying, hasFirstFrame, isForeground)) {
                     break
                 }
-                requestSample(myGen)
+                sampleOnce(myGen)
                 delay(SAMPLE_INTERVAL_MS)
             }
         }
@@ -247,11 +284,71 @@ class DynBgHelper(
         return handler
     }
 
-    private fun requestSample(expectedGen: Int) {
-        if (released || Build.VERSION.SDK_INT < Build.VERSION_CODES.N) return
-        if (generation.get() != expectedGen) return
+    private suspend fun sampleOnce(expectedGen: Int) {
+        if (released || generation.get() != expectedGen) return
+        when (val videoView = playerView.videoSurfaceView) {
+            is TextureView -> sampleFromTextureView(videoView, expectedGen)
+            is SurfaceView -> sampleFromSurfaceView(videoView, expectedGen)
+            else -> {
+                if (!loggedSurfaceWarning) {
+                    loggedSurfaceWarning = true
+                    Log.w(TAG, "Unsupported videoSurfaceView type: ${videoView?.javaClass?.simpleName}")
+                }
+            }
+        }
+    }
 
-        val surfaceView = playerView.videoSurfaceView as? SurfaceView ?: return
+    private suspend fun sampleFromTextureView(textureView: TextureView, expectedGen: Int) {
+        if (!textureView.isAvailable || !textureView.isAttachedToWindow ||
+            textureView.width <= 0 || textureView.height <= 0
+        ) {
+            return
+        }
+        if (!copyInFlight.compareAndSet(false, true)) return
+
+        val tiny = Bitmap.createBitmap(SAMPLE_WIDTH, SAMPLE_HEIGHT, Bitmap.Config.ARGB_8888)
+        var captured = false
+        try {
+            captured = textureView.getBitmap(tiny) != null
+        } catch (t: Throwable) {
+            Log.w(TAG, "TextureView.getBitmap failed", t)
+        }
+
+        if (!captured ||
+            released ||
+            generation.get() != expectedGen ||
+            !shouldRunDynamicBg(isPortraitStream, isPlaying, hasFirstFrame, isForeground)
+        ) {
+            tiny.recycle()
+            copyInFlight.set(false)
+            return
+        }
+
+        val processed = try {
+            withContext(Dispatchers.Default) {
+                try {
+                    if (hasVisibleFrameContent(tiny)) processSampleBitmap(tiny) else null
+                } finally {
+                    tiny.recycle()
+                }
+            }
+        } catch (_: Throwable) {
+            null
+        } finally {
+            copyInFlight.set(false)
+        }
+
+        if (processed != null &&
+            !released &&
+            generation.get() == expectedGen &&
+            shouldRunDynamicBg(isPortraitStream, isPlaying, hasFirstFrame, isForeground)
+        ) {
+            applyBackgroundBitmap(processed)
+        }
+    }
+
+    private fun sampleFromSurfaceView(surfaceView: SurfaceView, expectedGen: Int) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N) return
         if (!surfaceView.isAttachedToWindow || surfaceView.width <= 0 || surfaceView.height <= 0) return
         val surface = surfaceView.holder?.surface ?: return
         if (!surface.isValid) return
@@ -272,7 +369,7 @@ class DynBgHelper(
                         shouldRunDynamicBg(isPortraitStream, isPlaying, hasFirstFrame, isForeground)
                     ) {
                         val processed = try {
-                            processSampleBitmap(tiny)
+                            if (hasVisibleFrameContent(tiny)) processSampleBitmap(tiny) else null
                         } catch (_: Throwable) {
                             null
                         } finally {
@@ -284,24 +381,33 @@ class DynBgHelper(
                                     generation.get() == expectedGen &&
                                     shouldRunDynamicBg(isPortraitStream, isPlaying, hasFirstFrame, isForeground)
                                 ) {
-                                    dynBgView.setImageBitmap(processed)
-                                    if (dynBgView.visibility != View.VISIBLE) {
-                                        dynBgView.alpha = 0f
-                                        dynBgView.visibility = View.VISIBLE
-                                        dynBgView.animate().alpha(1f).setDuration(220L).start()
-                                    }
+                                    applyBackgroundBitmap(processed)
                                 }
                             }
                         }
                     } else {
+                        if (result != PixelCopy.SUCCESS && !loggedSurfaceWarning) {
+                            loggedSurfaceWarning = true
+                            Log.w(TAG, "PixelCopy(SurfaceView) failed with code=$result")
+                        }
                         tiny.recycle()
                     }
                 },
                 handler
             )
-        } catch (_: Throwable) {
+        } catch (t: Throwable) {
             copyInFlight.set(false)
             tiny.recycle()
+            Log.w(TAG, "PixelCopy request threw exception", t)
+        }
+    }
+
+    private fun applyBackgroundBitmap(processed: Bitmap) {
+        dynBgView.setImageBitmap(processed)
+        if (dynBgView.visibility != View.VISIBLE) {
+            dynBgView.alpha = 0f
+            dynBgView.visibility = View.VISIBLE
+            dynBgView.animate().alpha(1f).setDuration(220L).start()
         }
     }
 }

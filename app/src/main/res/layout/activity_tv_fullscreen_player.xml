@@ -18,7 +18,7 @@
         android:scaleType="centerCrop"
         android:visibility="gone" />
 
-    <!-- 2. 唯一全屏主播放器（SurfaceView 原生硬件直出 + RESIZE_MODE_FIT + 透明底以透出两侧动态背景） -->
+    <!-- 2. 唯一全屏主播放器（TextureView 同窗口真分层 + RESIZE_MODE_FIT + 透明底，确保 RK3528 等 TV 盒子稳出动态背景） -->
     <androidx.media3.ui.PlayerView
         android:id="@+id/playerView"
         android:layout_width="match_parent"
@@ -30,7 +30,7 @@
         app:keep_content_on_player_reset="true"
         app:resize_mode="fit"
         app:shutter_background_color="#09090C"
-        app:surface_type="surface_view"
+        app:surface_type="texture_view"
         app:use_controller="false" />
 
     <!-- 2. 顶部安全区居中状态提示（与缓冲胶囊互斥显示，避免重叠） -->

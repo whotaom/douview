@@ -152,6 +152,8 @@ class TvPlayerLogicTest {
     @Test
     fun `dynBgHelper detects portrait streams and enforces strict run gates`() {
         assertTrue(com.example.tv.player.DynBgHelper.isPortraitVideo(720, 1280, 1f))
+        assertTrue(com.example.tv.player.DynBgHelper.isPortraitVideo(1280, 720, 1f, unappliedRotationDegrees = 90))
+        assertTrue(com.example.tv.player.DynBgHelper.isPortraitVideo(1280, 720, 1f, unappliedRotationDegrees = 270))
         assertFalse(com.example.tv.player.DynBgHelper.isPortraitVideo(1920, 1080, 1f))
         assertFalse(com.example.tv.player.DynBgHelper.isPortraitVideo(1080, 1080, 1f))
         assertFalse(com.example.tv.player.DynBgHelper.isPortraitVideo(0, 0, 1f))
@@ -161,6 +163,21 @@ class TvPlayerLogicTest {
         assertFalse(com.example.tv.player.DynBgHelper.shouldRunDynamicBg(true, false, true, true))
         assertFalse(com.example.tv.player.DynBgHelper.shouldRunDynamicBg(true, true, false, true))
         assertFalse(com.example.tv.player.DynBgHelper.shouldRunDynamicBg(true, true, true, false))
+    }
+
+    @Test
+    fun `dynBgHelper filters empty black frames and accepts visible frames`() {
+        val empty = android.graphics.Bitmap.createBitmap(
+            com.example.tv.player.DynBgHelper.SAMPLE_WIDTH,
+            com.example.tv.player.DynBgHelper.SAMPLE_HEIGHT,
+            android.graphics.Bitmap.Config.ARGB_8888
+        )
+        empty.eraseColor(android.graphics.Color.BLACK)
+        assertFalse(com.example.tv.player.DynBgHelper.hasVisibleFrameContent(empty))
+
+        empty.eraseColor(android.graphics.Color.rgb(40, 120, 200))
+        assertTrue(com.example.tv.player.DynBgHelper.hasVisibleFrameContent(empty))
+        empty.recycle()
     }
 
     @Test

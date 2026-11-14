@@ -63,8 +63,8 @@ import org.json.JSONObject
 import java.util.concurrent.TimeUnit
 
 /**
- * 电视大屏全屏直播播放器（极简高稳单个 PlayerView + 纯原生低开销竖屏动态背景）
- * 1. 仅使用单个原生 SurfaceView PlayerView（RESIZE_MODE_FIT + 透明底），竖屏直播时由 DynBgHelper 以 PixelCopy 48×84 极小图渲染底层动态光影
+ * 电视大屏全屏直播播放器（极简高稳单个 PlayerView + RK3528 兼容 TextureView 动态背景分层）
+ * 1. 使用单个 TextureView PlayerView（RESIZE_MODE_FIT + 透明底），与底层 dynBgView 同窗口渲染，彻底解决 RK3528 上 SurfaceView VOP 覆盖层导致动态背景分层失效与 PixelCopy 拒读问题
  * 2. 「先备后切」(prepare-then-swap)：冷启动直绑 Surface；切台后台静默缓冲至 READY 再瞬切并立即释放旧解码器
  * 3. 硬件解码首帧超时（4.5s）或解码异常自动切软件兼容解码；支持直播窗口落后（BEHIND_LIVE_WINDOW）无缝回拉直播前沿
  * 4. 菜单仅展示在线频道并带实时在线台数「在线频道（N）」；OK 键技术参数面板 1 秒实时刷新
@@ -204,9 +204,9 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
 
     // UI 组件（单个 PlayerView + 纯原生动态背景层 + TV 安全区交互浮层）
     private lateinit var root: FrameLayout
-    private lateinit var dynBgView: ImageView              // 竖屏直播纯原生模糊动态背景（48×84 PixelCopy）
+    private lateinit var dynBgView: ImageView              // 竖屏直播纯原生模糊动态背景（48×84 TextureView 采样）
     private lateinit var dynBgHelper: DynBgHelper
-    private lateinit var playerView: PlayerView            // 唯一全屏主播放器（SurfaceView + RESIZE_MODE_FIT + 透明底）
+    private lateinit var playerView: PlayerView            // 唯一全屏主播放器（TextureView + RESIZE_MODE_FIT + 透明底）
     private lateinit var tipView: TextView                 // 顶部高层级换台与状态提示（与缓冲胶囊互斥）
     private lateinit var bufferingPill: LinearLayout       // 顶部安全区居中缓冲指示胶囊
     private lateinit var bufferingText: TextView
@@ -784,8 +784,14 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
                     hasRenderedFirstFrameForCurrent = true
                     val vs = next.videoSize
                     if (vs.width > 0 && vs.height > 0) {
+                        @Suppress("DEPRECATION")
                         dynBgHelper.setPortraitStream(
-                            DynBgHelper.isPortraitVideo(vs.width, vs.height, vs.pixelWidthHeightRatio)
+                            DynBgHelper.isPortraitVideo(
+                                vs.width,
+                                vs.height,
+                                vs.pixelWidthHeightRatio,
+                                vs.unappliedRotationDegrees
+                            )
                         )
                     }
                     dynBgHelper.setFirstFrameRendered(true)
@@ -840,11 +846,13 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
             override fun onVideoSizeChanged(videoSize: VideoSize) {
                 Log.d(TAG, "视频尺寸已更新: ${videoSize.width}x${videoSize.height} ratio=${videoSize.pixelWidthHeightRatio}")
                 if (gen == switchGen && player === next) {
+                    @Suppress("DEPRECATION")
                     dynBgHelper.setPortraitStream(
                         DynBgHelper.isPortraitVideo(
                             videoSize.width,
                             videoSize.height,
-                            videoSize.pixelWidthHeightRatio
+                            videoSize.pixelWidthHeightRatio,
+                            videoSize.unappliedRotationDegrees
                         )
                     )
                 }
@@ -901,8 +909,14 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
 
         val vs = next.videoSize
         if (vs.width > 0 && vs.height > 0) {
+            @Suppress("DEPRECATION")
             dynBgHelper.setPortraitStream(
-                DynBgHelper.isPortraitVideo(vs.width, vs.height, vs.pixelWidthHeightRatio)
+                DynBgHelper.isPortraitVideo(
+                    vs.width,
+                    vs.height,
+                    vs.pixelWidthHeightRatio,
+                    vs.unappliedRotationDegrees
+                )
             )
         }
 

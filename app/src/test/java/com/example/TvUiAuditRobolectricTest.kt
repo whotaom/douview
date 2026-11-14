@@ -130,9 +130,10 @@ class TvUiAuditRobolectricTest {
         assertEquals(android.widget.ImageView.ScaleType.CENTER_CROP, dynBgView.scaleType)
         org.junit.Assert.assertFalse(dynBgView.isFocusable)
 
-        // playerView background must be transparent so portrait pillar areas reveal dynBgView
+        // playerView background must be transparent and surface must be TextureView for RK3528 true View layering
         val playerBg = (playerView.background as? android.graphics.drawable.ColorDrawable)?.color
         assertEquals(android.graphics.Color.TRANSPARENT, playerBg)
+        assertTrue(playerView.videoSurfaceView is android.view.TextureView)
 
         val tipLp = tipView.layoutParams as FrameLayout.LayoutParams
         val bufLp = bufferingPill.layoutParams as FrameLayout.LayoutParams
