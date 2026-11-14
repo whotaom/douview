@@ -45,9 +45,9 @@ object UpdateManager {
                 .get()
                 .build()
 
-            val response = NetworkClient.okHttpClient.newCall(request).execute()
-            val responseBody = response.body?.string() ?: ""
-            val isSuccess = response.isSuccessful
+            val (isSuccess, responseBody) = NetworkClient.okHttpClient.newCall(request).execute().use { response ->
+                response.isSuccessful to (response.body?.string() ?: "")
+            }
 
             if (isSuccess && responseBody.isNotBlank()) {
                 val json = JSONObject(responseBody)

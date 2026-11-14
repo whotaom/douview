@@ -83,4 +83,21 @@ class ExampleRobolectricTest {
     val current = com.example.util.UpdateManager.getCurrentVersion(context)
     assertNotNull(current)
   }
+
+  @Test
+  fun `preferences enforces https only target and history urls`() {
+    val context = ApplicationProvider.getApplicationContext<Context>()
+    val prefs = LivePreferences(context)
+    prefs.getHistoryUrls().forEach { prefs.removeHistoryUrl(it) }
+
+    prefs.targetUrl = "http://insecure.example.com"
+    assertEquals(LivePreferences.DEFAULT_URL, prefs.targetUrl)
+
+    prefs.targetUrl = "javascript:alert(1)"
+    assertEquals(LivePreferences.DEFAULT_URL, prefs.targetUrl)
+
+    prefs.recordHistoryUrl("http://bad.example.com")
+    prefs.recordHistoryUrl("file:///etc/passwd")
+    assertTrue(prefs.getHistoryUrls().none { !it.startsWith("https://") })
+  }
 }

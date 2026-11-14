@@ -2,16 +2,15 @@ package com.example.tv.channel
 
 import android.content.Context
 import android.util.Log
+import com.example.util.NetworkClient
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.net.URI
 import java.net.URLEncoder
-import java.util.concurrent.TimeUnit
 
 /**
  * 电视端频道管理器（与 tv_fuxiaoya_com 网页版完全一致）
@@ -27,6 +26,7 @@ class ChannelManager(private val context: Context) {
         private const val PREFS_NAME = "tv_channels_v1"
         private const val KEY_CHANNELS = "channels_json"
         private const val EXPORT_DIR_NAME = "DouyinLiveChannels"
+        private const val MAX_IMPORT_BYTES = 2 * 1024 * 1024L
         const val DEFAULT_BASE_URL = "https://tv.fuxiaoya.com"
         const val TV_UA =
             "Mozilla/5.0 (Linux; Android 13; TV) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -133,12 +133,7 @@ class ChannelManager(private val context: Context) {
     }
 
     private val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-
-    private val okHttp = OkHttpClient.Builder()
-        .connectTimeout(8, TimeUnit.SECONDS)
-        .readTimeout(12, TimeUnit.SECONDS)
-        .followRedirects(true)
-        .build()
+    private val okHttp get() = NetworkClient.fastOkHttpClient
 
     // 与网页版完全一致的默认频道（不预设写死 isLive，由服务端 live.php?batch= 探测）
     fun getDefaultChannels(): List<Channel> = listOf(
@@ -234,9 +229,13 @@ class ChannelManager(private val context: Context) {
      * 远程导入：直接拉取 URL 内容并解析
      */
     suspend fun remoteImport(url: String): Result<List<Channel>> = withContext(Dispatchers.IO) {
+        val cleanUrl = url.trim()
+        if (!cleanUrl.startsWith("https://", ignoreCase = true)) {
+            return@withContext Result.failure(Exception("仅支持 HTTPS 安全地址进行远程导入"))
+        }
         try {
             val request = Request.Builder()
-                .url(url.trim())
+                .url(cleanUrl)
                 .header("User-Agent", TV_UA)
                 .get()
                 .build()
@@ -245,7 +244,14 @@ class ChannelManager(private val context: Context) {
                 if (!response.isSuccessful) {
                     return@withContext Result.failure(Exception("HTTP ${response.code}"))
                 }
+                val contentLength = response.body?.contentLength() ?: -1L
+                if (contentLength > MAX_IMPORT_BYTES) {
+                    return@withContext Result.failure(Exception("远程频道文件过大，已拒绝加载"))
+                }
                 val body = response.body?.string() ?: return@withContext Result.failure(Exception("响应内容为空"))
+                if (body.length > MAX_IMPORT_BYTES) {
+                    return@withContext Result.failure(Exception("远程频道内容超过体积限制"))
+                }
                 val list = parseImportContent(body)
                 if (list.isEmpty()) {
                     Result.failure(Exception("未解析出任何有效频道"))
@@ -265,9 +271,13 @@ class ChannelManager(private val context: Context) {
      */
     suspend fun remoteImportViaProxy(baseUrl: String, remoteUrl: String): Result<List<Channel>> =
         withContext(Dispatchers.IO) {
+            val cleanRemote = remoteUrl.trim()
+            if (!cleanRemote.startsWith("https://", ignoreCase = true)) {
+                return@withContext Result.failure(Exception("仅支持 HTTPS 安全地址进行远程导入"))
+            }
             try {
                 val base = normalizeBaseUrl(baseUrl)
-                val encodedUrl = URLEncoder.encode(remoteUrl.trim(), "UTF-8")
+                val encodedUrl = URLEncoder.encode(cleanRemote, "UTF-8")
                 val proxyUrl = "$base/live.php?action=remote_import&remote_url=$encodedUrl"
                 val request = Request.Builder()
                     .url(proxyUrl)
@@ -281,6 +291,9 @@ class ChannelManager(private val context: Context) {
                         return@withContext Result.failure(Exception("代理请求失败 HTTP ${response.code}"))
                     }
                     val body = response.body?.string() ?: return@withContext Result.failure(Exception("代理响应为空"))
+                    if (body.length > MAX_IMPORT_BYTES) {
+                        return@withContext Result.failure(Exception("代理响应内容超过体积限制"))
+                    }
 
                     val json = JSONObject(body)
                     val code = json.optInt("code", -1)

@@ -20,20 +20,20 @@ class LivePreferences(context: Context) {
         private const val KEY_LAST_CLEAR_CACHE_TIME = "last_clear_cache_time"
         const val MAX_HISTORY_URLS = 5
         const val AUTO_CLEAR_CACHE_INTERVAL_MS = 24 * 60 * 60 * 1000L // 24小时自动清理周期
+
+        fun sanitizeWebUrl(raw: String?): String {
+            val trimmed = raw?.trim().orEmpty()
+            if (trimmed.isBlank()) return DEFAULT_URL
+            if (trimmed == API_ENDPOINT_URL) return DEFAULT_URL
+            if (trimmed.contains("whomao.com", ignoreCase = true)) return DEFAULT_URL
+            return if (trimmed.startsWith("https://", ignoreCase = true)) trimmed else DEFAULT_URL
+        }
     }
 
     var targetUrl: String
-        get() {
-            val url = prefs.getString(KEY_TARGET_URL, DEFAULT_URL) ?: DEFAULT_URL
-            // 向下兼容与平滑迁移：旧版 live.php 或已下线的线路二域名自动迁移回默认主线
-            return when {
-                url == API_ENDPOINT_URL -> DEFAULT_URL
-                url.contains("whomao.com", ignoreCase = true) -> DEFAULT_URL
-                else -> url
-            }
-        }
+        get() = sanitizeWebUrl(prefs.getString(KEY_TARGET_URL, DEFAULT_URL))
         set(value) {
-            val sanitized = if (value.contains("whomao.com", ignoreCase = true)) DEFAULT_URL else value
+            val sanitized = sanitizeWebUrl(value)
             prefs.edit().putString(KEY_TARGET_URL, sanitized).apply()
             recordHistoryUrl(sanitized)
         }
@@ -48,16 +48,16 @@ class LivePreferences(context: Context) {
         val raw = prefs.getString(KEY_HISTORY_URLS, null) ?: return emptyList()
         return raw.split("\n")
             .map { it.trim() }
-            .filter { it.isNotBlank() }
+            .filter { it.startsWith("https://", ignoreCase = true) && !it.contains("whomao.com", ignoreCase = true) }
             .take(MAX_HISTORY_URLS)
     }
 
     /**
-     * 自动记忆新地址并限定最多五个（自动去重并置顶）
+     * 自动记忆新地址并限定最多五个（自动去重并置顶，仅保存安全 HTTPS 地址）
      */
     fun recordHistoryUrl(newUrl: String) {
         val clean = newUrl.trim()
-        if (clean.isBlank()) return
+        if (!clean.startsWith("https://", ignoreCase = true) || clean.contains("whomao.com", ignoreCase = true)) return
         val current = getHistoryUrls().toMutableList()
         current.remove(clean)
         current.add(0, clean)

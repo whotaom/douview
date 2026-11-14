@@ -232,7 +232,7 @@ class MainActivity : ComponentActivity() {
 
         preferences = LivePreferences(this)
         defaultMobileUserAgent = WebSettings.getDefaultUserAgent(this)
-        audioManager = getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+        audioManager = applicationContext.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
 
         requestAppAudioFocus()
         updateKeepScreenOn(preferences.keepScreenOn)
@@ -541,6 +541,25 @@ class MainActivity : ComponentActivity() {
                         }, "AndroidLiveBridge")
 
                         webViewClient = object : WebViewClient() {
+                            override fun shouldOverrideUrlLoading(
+                                view: WebView?,
+                                request: WebResourceRequest?
+                            ): Boolean {
+                                val uri = request?.url ?: return true
+                                val scheme = uri.scheme?.lowercase() ?: return true
+                                if (scheme == "https") return false
+                                if (request.isForMainFrame) {
+                                    runOnUiThread {
+                                        Toast.makeText(
+                                            this@MainActivity,
+                                            "已拦截非 HTTPS 安全协议跳转 ($scheme)",
+                                            Toast.LENGTH_SHORT
+                                        ).show()
+                                    }
+                                }
+                                return true
+                            }
+
                             override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
                                 super.onPageStarted(view, url, favicon)
                                 isLoading = true
@@ -1708,6 +1727,7 @@ class MainActivity : ComponentActivity() {
 
     private fun injectRoomToWeb(roomInput: String) {
         val sanitized = roomInput.replace("\\", "\\\\").replace("'", "\\'").replace("\"", "\\\"").replace("\n", " ")
+        val safeTargetUrl = preferences.targetUrl.replace("\\", "\\\\").replace("'", "\\'")
         val js = """
             (function() {
                 try {
@@ -1718,7 +1738,7 @@ class MainActivity : ComponentActivity() {
                         input.dispatchEvent(new Event('input', { bubbles: true }));
                         form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
                     } else {
-                        window.location.href = '${preferences.targetUrl}?room=' + encodeURIComponent('$sanitized');
+                        window.location.href = '$safeTargetUrl?room=' + encodeURIComponent('$sanitized');
                     }
                 } catch(e) {
                     console.error(e);
@@ -1775,6 +1795,15 @@ class MainActivity : ComponentActivity() {
         settings.mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
         settings.allowFileAccess = false
         settings.allowContentAccess = false
+        @Suppress("DEPRECATION")
+        settings.allowFileAccessFromFileURLs = false
+        @Suppress("DEPRECATION")
+        settings.allowUniversalAccessFromFileURLs = false
+        @Suppress("DEPRECATION")
+        settings.setGeolocationEnabled(false)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            settings.safeBrowsingEnabled = true
+        }
         settings.setSupportMultipleWindows(false)
         settings.userAgentString = if (isDesktop) desktopUserAgent else defaultMobileUserAgent
 
@@ -1820,6 +1849,8 @@ class MainActivity : ComponentActivity() {
             audioManager?.abandonAudioFocus(null)
         }
         webView?.let { wv ->
+            wv.stopLoading()
+            wv.removeJavascriptInterface("AndroidLiveBridge")
             wv.loadDataWithBaseURL(null, "", "text/html", "utf-8", null)
             wv.clearHistory()
             (wv.parent as? ViewGroup)?.removeView(wv)

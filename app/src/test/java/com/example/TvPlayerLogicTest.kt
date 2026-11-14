@@ -150,58 +150,16 @@ class TvPlayerLogicTest {
     }
 
     @Test
-    fun `dynBgHelper detects portrait streams and enforces strict run gates`() {
-        assertTrue(com.example.tv.player.DynBgHelper.isPortraitVideo(720, 1280, 1f))
-        assertTrue(com.example.tv.player.DynBgHelper.isPortraitVideo(1280, 720, 1f, unappliedRotationDegrees = 90))
-        assertTrue(com.example.tv.player.DynBgHelper.isPortraitVideo(1280, 720, 1f, unappliedRotationDegrees = 270))
-        assertFalse(com.example.tv.player.DynBgHelper.isPortraitVideo(1920, 1080, 1f))
-        assertFalse(com.example.tv.player.DynBgHelper.isPortraitVideo(1080, 1080, 1f))
-        assertFalse(com.example.tv.player.DynBgHelper.isPortraitVideo(0, 0, 1f))
-
-        assertTrue(com.example.tv.player.DynBgHelper.shouldRunDynamicBg(true, true, true, true))
-        assertFalse(com.example.tv.player.DynBgHelper.shouldRunDynamicBg(false, true, true, true))
-        assertFalse(com.example.tv.player.DynBgHelper.shouldRunDynamicBg(true, false, true, true))
-        assertFalse(com.example.tv.player.DynBgHelper.shouldRunDynamicBg(true, true, false, true))
-        assertFalse(com.example.tv.player.DynBgHelper.shouldRunDynamicBg(true, true, true, false))
-    }
-
-    @Test
-    fun `dynBgHelper filters empty black frames and accepts visible frames`() {
-        val empty = android.graphics.Bitmap.createBitmap(
-            com.example.tv.player.DynBgHelper.SAMPLE_WIDTH,
-            com.example.tv.player.DynBgHelper.SAMPLE_HEIGHT,
-            android.graphics.Bitmap.Config.ARGB_8888
-        )
-        empty.eraseColor(android.graphics.Color.BLACK)
-        assertFalse(com.example.tv.player.DynBgHelper.hasVisibleFrameContent(empty))
-
-        empty.eraseColor(android.graphics.Color.rgb(40, 120, 200))
-        assertTrue(com.example.tv.player.DynBgHelper.hasVisibleFrameContent(empty))
-        empty.recycle()
-    }
-
-    @Test
-    fun `dynBgHelper processSampleBitmap preserves dimensions dims white and keeps black deep`() {
-        val src = android.graphics.Bitmap.createBitmap(
-            com.example.tv.player.DynBgHelper.SAMPLE_WIDTH,
-            com.example.tv.player.DynBgHelper.SAMPLE_HEIGHT,
-            android.graphics.Bitmap.Config.ARGB_8888
-        )
-        src.eraseColor(android.graphics.Color.WHITE)
-        val processedWhite = com.example.tv.player.DynBgHelper.processSampleBitmap(src)
-        assertEquals(src.width, processedWhite.width)
-        assertEquals(src.height, processedWhite.height)
-        val centerPixel = processedWhite.getPixel(src.width / 2, src.height / 2)
-        val red = android.graphics.Color.red(centerPixel)
-        assertTrue("Expected dimmed luminance < 180, got $red", red in 120..180)
-
-        src.eraseColor(android.graphics.Color.BLACK)
-        val processedBlack = com.example.tv.player.DynBgHelper.processSampleBitmap(src)
-        val blackPixel = processedBlack.getPixel(src.width / 2, src.height / 2)
-        assertEquals(0, android.graphics.Color.red(blackPixel))
-
-        src.recycle()
-        processedWhite.recycle()
-        processedBlack.recycle()
+    fun `putStreamCache enforces max size and evicts expired entries`() {
+        TvFullscreenPlayerActivity.clearStreamCache()
+        val now = 1_000_000L
+        TvFullscreenPlayerActivity.putStreamCache("expired_rid", listOf("标清" to "https://a.m3u8"), now - TvFullscreenPlayerActivity.CACHE_TTL - 1)
+        for (i in 1..70) {
+            TvFullscreenPlayerActivity.putStreamCache("rid_$i", listOf("原画" to "https://s$i.m3u8"), now + i)
+        }
+        assertFalse(TvFullscreenPlayerActivity.streamCache.containsKey("expired_rid"))
+        assertTrue(TvFullscreenPlayerActivity.streamCache.size <= TvFullscreenPlayerActivity.MAX_STREAM_CACHE_SIZE)
+        assertTrue(TvFullscreenPlayerActivity.streamCache.containsKey("rid_70"))
+        TvFullscreenPlayerActivity.clearStreamCache()
     }
 }

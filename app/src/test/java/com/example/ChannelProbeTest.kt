@@ -149,4 +149,16 @@ class ChannelProbeTest {
         assertEquals("https://img.example.com/a.jpg", map["1001"]!!.avatar)
         assertEquals("https://img.example.com/b.jpg", map["1002"]!!.avatar)
     }
+
+    @Test
+    fun `remoteImport rejects non-https urls upfront`() = kotlinx.coroutines.test.runTest {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val manager = ChannelManager(context)
+
+        val httpResult = manager.remoteImport("http://example.com/channels.json")
+        assertTrue(httpResult.isFailure)
+
+        val fileResult = manager.remoteImport("file:///sdcard/channels.json")
+        assertTrue(fileResult.isFailure)
+    }
 }
