@@ -201,20 +201,22 @@ fun TvTopBar(
                 Surface(
                     shape = RoundedCornerShape(6.dp),
                     color = DouyinRed,
-                    modifier = Modifier.padding(end = 10.dp)
+                    modifier = Modifier.padding(end = 8.dp)
                 ) {
                     Text(
                         text = "TV 大屏版",
                         color = Color.White,
-                        fontSize = 12.sp,
+                        fontSize = 11.sp,
                         fontWeight = FontWeight.Bold,
-                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
+                        maxLines = 1,
+                        softWrap = false,
+                        modifier = Modifier.padding(horizontal = 7.dp, vertical = 3.dp)
                     )
                 }
                 Text(
                     text = title,
                     color = TextPrimary,
-                    fontSize = 22.sp,
+                    fontSize = 20.sp,
                     fontWeight = FontWeight.Bold,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis
@@ -224,7 +226,7 @@ fun TvTopBar(
             Text(
                 text = subtitle,
                 color = TextSecondary,
-                fontSize = 13.sp,
+                fontSize = 12.sp,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis
             )
@@ -233,7 +235,7 @@ fun TvTopBar(
         Row(
             modifier = Modifier.focusGroup(),
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(12.dp)
+            horizontalArrangement = Arrangement.spacedBy(10.dp)
         ) {
             actions()
         }
@@ -289,23 +291,25 @@ fun TvActionButton(
             )
     ) {
         Row(
-            modifier = Modifier.padding(horizontal = 20.dp, vertical = 12.dp),
+            modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
+            horizontalArrangement = Arrangement.spacedBy(6.dp)
         ) {
             if (icon != null) {
                 Icon(
                     imageVector = icon,
                     contentDescription = null,
                     tint = if (isFocused) DouyinCyan else Color.White,
-                    modifier = Modifier.size(20.dp)
+                    modifier = Modifier.size(18.dp)
                 )
             }
             Text(
                 text = text,
                 color = Color.White,
-                fontSize = 15.sp,
-                fontWeight = FontWeight.Bold
+                fontSize = 14.sp,
+                fontWeight = FontWeight.Bold,
+                maxLines = 1,
+                softWrap = false
             )
         }
     }

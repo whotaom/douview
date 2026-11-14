@@ -33,11 +33,9 @@ fun TvNavGraph(
         composable(TvRoutes.HOME) {
             TvHomeScreen(
                 onEnterPlayer = { url ->
-                    val currentLine = preferences.currentLine
-                    val base = StreamLines.baseUrl(currentLine)
+                    val base = preferences.activeBaseUrl
                     val intent = Intent(context, TvFullscreenPlayerActivity::class.java).apply {
                         putExtra(TvFullscreenPlayerActivity.EXTRA_URL, url)
-                        putExtra(TvFullscreenPlayerActivity.EXTRA_LINE, currentLine)
                         putExtra(TvFullscreenPlayerActivity.EXTRA_BASE_URL, base)
                         putExtra(TvFullscreenPlayerActivity.EXTRA_TITLE, "抖眸流控 · 大屏全屏直播监控")
                     }
@@ -60,11 +58,9 @@ fun TvNavGraph(
                 showUrlDialog = false
                 urlDialogReturnSignal++
                 preferences.targetUrl = confirmedUrl
-                val line = StreamLines.detectLine(confirmedUrl)
-                val base = StreamLines.baseUrl(line)
+                val base = StreamLines.resolveBaseUrl(confirmedUrl)
                 val intent = Intent(context, TvFullscreenPlayerActivity::class.java).apply {
                     putExtra(TvFullscreenPlayerActivity.EXTRA_URL, confirmedUrl)
-                    putExtra(TvFullscreenPlayerActivity.EXTRA_LINE, line)
                     putExtra(TvFullscreenPlayerActivity.EXTRA_BASE_URL, base)
                     putExtra(TvFullscreenPlayerActivity.EXTRA_TITLE, "抖眸流控 · 大屏全屏直播监控")
                 }

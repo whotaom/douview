@@ -23,6 +23,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.DialogProperties
 import com.example.data.LivePreferences
 import com.example.tv.components.safeRequestFocus
 import com.example.tv.components.tvInteractive
@@ -52,10 +53,12 @@ fun ChangeUrlDialog(
 
     AlertDialog(
         onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false),
         containerColor = DarkSurface,
         modifier = Modifier
-            .padding(horizontal = 24.dp, vertical = 16.dp)
-            .widthIn(max = 560.dp),
+            .fillMaxWidth(0.82f)
+            .widthIn(max = 560.dp)
+            .padding(horizontal = 24.dp, vertical = 16.dp),
         title = {
             Text(
                 text = "更换中控服务地址",
@@ -185,7 +188,7 @@ fun ChangeUrlDialog(
 
                 // 快捷预设地址
                 Text(
-                    text = "快捷默认预设：",
+                    text = "默认预置地址：",
                     style = MaterialTheme.typography.labelSmall,
                     color = TextSecondary
                 )
@@ -196,7 +199,6 @@ fun ChangeUrlDialog(
                     horizontalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
                     var chip1Focused by remember { mutableStateOf(false) }
-                    var chip2Focused by remember { mutableStateOf(false) }
                     Surface(
                         shape = RoundedCornerShape(8.dp),
                         color = DarkSurfaceElevated,
@@ -212,32 +214,12 @@ fun ChangeUrlDialog(
                             )
                     ) {
                         Text(
-                            text = "线路一 (默认)",
+                            text = "默认主线 (tv.fuxiaoya.com)",
                             color = DouyinCyan,
                             fontSize = 12.sp,
                             fontWeight = FontWeight.Medium,
-                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)
-                        )
-                    }
-                    Surface(
-                        shape = RoundedCornerShape(8.dp),
-                        color = DarkSurfaceElevated,
-                        border = BorderStroke(
-                            if (chip2Focused) 2.dp else 1.dp,
-                            if (chip2Focused) DouyinRed else DarkSurfaceBorder
-                        ),
-                        modifier = Modifier
-                            .minimumInteractiveComponentSize()
-                            .tvInteractive(
-                                onClick = { inputUrl = LivePreferences.LINE_TWO_URL },
-                                onFocusedChange = { chip2Focused = it }
-                            )
-                    ) {
-                        Text(
-                            text = "线路二 (备用)",
-                            color = DouyinRed,
-                            fontSize = 12.sp,
-                            fontWeight = FontWeight.Medium,
+                            maxLines = 1,
+                            softWrap = false,
                             modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)
                         )
                     }
@@ -300,10 +282,12 @@ fun ClearCacheConfirmDialog(
 
     AlertDialog(
         onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false),
         containerColor = DarkSurface,
         modifier = Modifier
-            .padding(horizontal = 24.dp, vertical = 16.dp)
-            .widthIn(max = 520.dp),
+            .fillMaxWidth(0.78f)
+            .widthIn(max = 520.dp)
+            .padding(horizontal = 24.dp, vertical = 16.dp),
         icon = {
             Icon(
                 imageVector = Icons.Default.DeleteSweep,
@@ -389,10 +373,12 @@ fun UpdateDialog(
 
     AlertDialog(
         onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false),
         containerColor = DarkSurface,
         modifier = Modifier
-            .padding(horizontal = 24.dp, vertical = 16.dp)
-            .widthIn(max = 560.dp),
+            .fillMaxWidth(0.82f)
+            .widthIn(max = 560.dp)
+            .padding(horizontal = 24.dp, vertical = 16.dp),
         icon = {
             Icon(
                 imageVector = Icons.Default.SystemUpdate,

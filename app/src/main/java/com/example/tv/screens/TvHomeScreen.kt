@@ -56,8 +56,10 @@ fun TvHomeScreen(
     val channelManager = remember { ChannelManager(context) }
 
     var currentTargetUrl by remember { mutableStateOf(preferences.targetUrl) }
-    val currentLine = remember(currentTargetUrl) { StreamLines.detectLine(currentTargetUrl) }
-    val activeBaseUrl = remember(currentLine) { StreamLines.baseUrl(currentLine) }
+    val activeBaseUrl = remember(currentTargetUrl) { StreamLines.resolveBaseUrl(currentTargetUrl) }
+    val isDefaultLine = remember(currentTargetUrl) {
+        currentTargetUrl.trimEnd('/').equals(StreamLines.LINE_1, ignoreCase = true)
+    }
 
     var showClearCacheDialog by remember { mutableStateOf(false) }
     var showUpdateDialog by remember { mutableStateOf(false) }
@@ -225,7 +227,7 @@ fun TvHomeScreen(
 
                 LazyRow(
                     horizontalArrangement = Arrangement.spacedBy(14.dp),
-                    contentPadding = PaddingValues(horizontal = 4.dp, vertical = 6.dp),
+                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp),
                     modifier = Modifier
                         .fillMaxWidth()
                         .focusGroup()
@@ -240,7 +242,6 @@ fun TvHomeScreen(
                             onClick = {
                                 val intent = Intent(context, TvFullscreenPlayerActivity::class.java).apply {
                                     putExtra(TvFullscreenPlayerActivity.EXTRA_RID, channel.rid)
-                                    putExtra(TvFullscreenPlayerActivity.EXTRA_LINE, currentLine)
                                     putExtra(TvFullscreenPlayerActivity.EXTRA_BASE_URL, activeBaseUrl)
                                     putExtra(TvFullscreenPlayerActivity.EXTRA_TITLE, channel.name)
                                 }
@@ -316,9 +317,9 @@ fun TvHomeScreen(
                     }
                 }
 
-                // 2. 线路与自定义中控区
+                // 2. 默认主线与自定义地址区
                 Text(
-                    text = "快捷服务节点切换：",
+                    text = "服务节点配置：",
                     color = TextSecondary,
                     fontSize = 13.sp,
                     fontWeight = FontWeight.SemiBold
@@ -326,7 +327,7 @@ fun TvHomeScreen(
 
                 LazyRow(
                     horizontalArrangement = Arrangement.spacedBy(14.dp),
-                    contentPadding = PaddingValues(horizontal = 4.dp, vertical = 6.dp),
+                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp),
                     modifier = Modifier
                         .fillMaxWidth()
                         .focusGroup()
@@ -338,24 +339,26 @@ fun TvHomeScreen(
                                 preferences.targetUrl = LivePreferences.DEFAULT_URL
                                 currentTargetUrl = LivePreferences.DEFAULT_URL
                                 TvFullscreenPlayerActivity.clearStreamCache()
-                                Toast.makeText(context, "已切至主线（tv.fuxiaoya.com）", Toast.LENGTH_SHORT).show()
+                                Toast.makeText(context, "已使用默认主线（tv.fuxiaoya.com）", Toast.LENGTH_SHORT).show()
                             },
-                            isHighlighted = currentLine == 1,
-                            modifier = Modifier.width(220.dp)
+                            isHighlighted = isDefaultLine,
+                            modifier = Modifier.width(240.dp)
                         ) { isFocused ->
                             Column {
                                 Row(verticalAlignment = Alignment.CenterVertically) {
                                     Box(
                                         modifier = Modifier
                                             .size(8.dp)
-                                            .background(if (currentLine == 1) DouyinGreen else Color.Gray, CircleShape)
+                                            .background(if (isDefaultLine) DouyinGreen else Color.Gray, CircleShape)
                                     )
                                     Spacer(modifier = Modifier.width(8.dp))
                                     Text(
-                                        text = "官方主线 (线路一)",
+                                        text = "默认主线",
                                         color = if (isFocused) DouyinCyan else TextPrimary,
                                         fontWeight = FontWeight.Bold,
-                                        fontSize = 14.sp
+                                        fontSize = 14.sp,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
                                     )
                                 }
                                 Spacer(modifier = Modifier.height(4.dp))
@@ -372,67 +375,37 @@ fun TvHomeScreen(
 
                     item {
                         TvFocusableCard(
-                            testTagValue = "tv_line_card_2",
-                            onClick = {
-                                preferences.targetUrl = StreamLines.LINE_2
-                                currentTargetUrl = StreamLines.LINE_2
-                                TvFullscreenPlayerActivity.clearStreamCache()
-                                Toast.makeText(context, "已切至线路二（dy.whomao.com）", Toast.LENGTH_SHORT).show()
-                            },
-                            isHighlighted = currentLine == 2,
-                            modifier = Modifier.width(220.dp)
+                            focusRequester = customUrlFocusRequester,
+                            testTagValue = "tv_line_card_custom",
+                            onClick = onOpenUrlDialog,
+                            isHighlighted = !isDefaultLine,
+                            modifier = Modifier.width(240.dp)
                         ) { isFocused ->
                             Column {
                                 Row(verticalAlignment = Alignment.CenterVertically) {
-                                    Box(
-                                        modifier = Modifier
-                                            .size(8.dp)
-                                            .background(if (currentLine == 2) DouyinGreen else Color.Gray, CircleShape)
+                                    Icon(
+                                        imageVector = Icons.Default.Edit,
+                                        contentDescription = null,
+                                        tint = if (isFocused) DouyinCyan else TextSecondary,
+                                        modifier = Modifier.size(16.dp)
                                     )
                                     Spacer(modifier = Modifier.width(8.dp))
                                     Text(
-                                        text = "备用线路 (线路二)",
+                                        text = "输入自定义地址",
                                         color = if (isFocused) DouyinCyan else TextPrimary,
+                                        fontSize = 14.sp,
                                         fontWeight = FontWeight.Bold,
-                                        fontSize = 14.sp
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
                                     )
                                 }
                                 Spacer(modifier = Modifier.height(4.dp))
                                 Text(
-                                    text = StreamLines.LINE_2,
+                                    text = if (!isDefaultLine) currentTargetUrl else "支持自定义部署地址或记忆切换",
                                     color = TextSecondary,
                                     fontSize = 11.sp,
                                     maxLines = 1,
                                     overflow = TextOverflow.Ellipsis
-                                )
-                            }
-                        }
-                    }
-
-                    item {
-                        TvFocusableCard(
-                            focusRequester = customUrlFocusRequester,
-                            testTagValue = "tv_line_card_custom",
-                            onClick = onOpenUrlDialog,
-                            modifier = Modifier.width(180.dp)
-                        ) { isFocused ->
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.Center
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Default.Edit,
-                                    contentDescription = null,
-                                    tint = if (isFocused) DouyinCyan else TextSecondary,
-                                    modifier = Modifier.size(16.dp)
-                                )
-                                Spacer(modifier = Modifier.width(6.dp))
-                                Text(
-                                    text = "输入自定义地址",
-                                    color = if (isFocused) DouyinCyan else TextPrimary,
-                                    fontSize = 13.sp,
-                                    fontWeight = FontWeight.SemiBold
                                 )
                             }
                         }
@@ -454,10 +427,10 @@ fun TvHomeScreen(
                         focusedBorderColor = DouyinRed,
                         modifier = Modifier
                             .weight(1.8f)
-                            .height(112.dp)
+                            .heightIn(min = 96.dp)
                     ) { isFocused ->
                         Row(
-                            modifier = Modifier.fillMaxSize(),
+                            modifier = Modifier.fillMaxWidth(),
                             verticalAlignment = Alignment.CenterVertically
                         ) {
                             Surface(
@@ -479,14 +452,18 @@ fun TvHomeScreen(
                                 Text(
                                     text = "一键全屏畅播（在线优先）",
                                     color = TextPrimary,
-                                    fontSize = 18.sp,
-                                    fontWeight = FontWeight.Bold
+                                    fontSize = 17.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
                                 )
                                 Spacer(modifier = Modifier.height(4.dp))
                                 Text(
                                     text = "无需房间号直接开播，原生 ExoPlayer HLS，遥控器上下键随时切台",
                                     color = TextSecondary,
-                                    fontSize = 12.sp
+                                    fontSize = 12.sp,
+                                    maxLines = 2,
+                                    overflow = TextOverflow.Ellipsis
                                 )
                             }
                         }
@@ -507,10 +484,10 @@ fun TvHomeScreen(
                         },
                         modifier = Modifier
                             .weight(1.2f)
-                            .height(112.dp)
+                            .heightIn(min = 96.dp)
                     ) { isFocused ->
                         Column(
-                            modifier = Modifier.fillMaxSize(),
+                            modifier = Modifier.fillMaxWidth(),
                             verticalArrangement = Arrangement.Center
                         ) {
                             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -518,21 +495,25 @@ fun TvHomeScreen(
                                     imageVector = Icons.Default.Tv,
                                     contentDescription = null,
                                     tint = if (isFocused) DouyinCyan else DouyinGreen,
-                                    modifier = Modifier.size(24.dp)
+                                    modifier = Modifier.size(22.dp)
                                 )
                                 Spacer(modifier = Modifier.width(8.dp))
                                 Text(
                                     text = "大屏常亮守护",
                                     color = TextPrimary,
                                     fontSize = 16.sp,
-                                    fontWeight = FontWeight.Bold
+                                    fontWeight = FontWeight.Bold,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
                                 )
                             }
                             Spacer(modifier = Modifier.height(6.dp))
                             Text(
                                 text = if (keepScreenOn) "常亮守护运行中（无黑屏休眠）" else "系统默认休眠策略",
                                 color = TextSecondary,
-                                fontSize = 12.sp
+                                fontSize = 12.sp,
+                                maxLines = 2,
+                                overflow = TextOverflow.Ellipsis
                             )
                         }
                     }
@@ -546,17 +527,19 @@ fun TvHomeScreen(
                 modifier = Modifier.fillMaxWidth()
             ) {
                 Row(
-                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 14.dp, vertical = 8.dp),
                     verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.SpaceAround
+                    horizontalArrangement = Arrangement.SpaceBetween
                 ) {
-                    Text("【方向键】选择频道与功能", color = TextSecondary, fontSize = 12.sp)
+                    Text("【方向键】选台与功能", color = TextSecondary, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
                     Text("•", color = TextTertiary)
-                    Text("【OK 键】直接开播 / 信息面板", color = DouyinCyan, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                    Text("【OK 键】开播 / 信息", color = DouyinCyan, fontSize = 12.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
                     Text("•", color = TextTertiary)
-                    Text("【↑ / ↓ 或 CH+/CH-】秒级换台", color = DouyinGreen, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                    Text("【↑/↓ / CH±】秒级换台", color = DouyinGreen, fontSize = 12.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
                     Text("•", color = TextTertiary)
-                    Text("【菜单/返回键】选台/退出", color = TextSecondary, fontSize = 12.sp)
+                    Text("【菜单/返回】选台/退出", color = TextSecondary, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
                 }
             }
         }
@@ -571,9 +554,9 @@ fun TvHomeScreen(
             },
             onSelectChannelToPlay = { channel: Channel ->
                 showChannelDialog = false
+                channels = channelManager.loadChannels()
                 val intent = Intent(context, TvFullscreenPlayerActivity::class.java).apply {
                     putExtra(TvFullscreenPlayerActivity.EXTRA_RID, channel.rid)
-                    putExtra(TvFullscreenPlayerActivity.EXTRA_LINE, currentLine)
                     putExtra(TvFullscreenPlayerActivity.EXTRA_BASE_URL, activeBaseUrl)
                     putExtra(TvFullscreenPlayerActivity.EXTRA_TITLE, channel.name)
                 }

@@ -200,13 +200,12 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
 
     private lateinit var channelManager: ChannelManager
     private lateinit var preferences: LivePreferences
-    private var currentLine: Int = 1
 
     // UI 组件（单个 PlayerView + TV 安全区交互浮层）
     private lateinit var root: FrameLayout
     private lateinit var playerView: PlayerView            // 唯一全屏主播放器（SurfaceView + RESIZE_MODE_FIT）
-    private lateinit var tipView: TextView                 // 顶部高层级换台与状态提示
-    private lateinit var bufferingPill: LinearLayout       // 右上角 TV 安全区缓冲指示胶囊
+    private lateinit var tipView: TextView                 // 顶部高层级换台与状态提示（与缓冲胶囊互斥）
+    private lateinit var bufferingPill: LinearLayout       // 顶部安全区居中缓冲指示胶囊
     private lateinit var bufferingText: TextView
     private lateinit var errorOverlay: LinearLayout        // 可遥控操作的高对比度失败兜底面板
     private lateinit var errorTitleView: TextView
@@ -217,6 +216,7 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
     private lateinit var channelMenu: FrameLayout          // 左侧在线选台悬浮面板
     private lateinit var menuTitleView: TextView           // 选台菜单标题：「在线频道（N）」
     private lateinit var channelMenuList: LinearLayout
+    private lateinit var infoScrollView: ScrollView        // OK 键技术参数可滚动外框（防止小屏底部截断）
     private lateinit var infoOverlay: TextView             // OK 键技术参数浮层（1s 实时刷新）
 
     // 主播放器与后台备播播放器
@@ -275,7 +275,6 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         channelManager = ChannelManager(this)
         buildUi()
 
-        currentLine = resolveInitialLine()
         setupPlayListAndStart()
 
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
@@ -290,24 +289,15 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         setIntent(intent)
         failedRidsThisRound.clear()
         preferSoftwareDecoderForCurrent = false
-        currentLine = resolveInitialLine()
         setupPlayListAndStart()
-    }
-
-    private fun resolveInitialLine(): Int {
-        val extraLine = intent.getIntExtra(EXTRA_LINE, 0)
-        if (extraLine == 1 || extraLine == 2) return extraLine
-        val extraBase = intent.getStringExtra(EXTRA_BASE_URL)
-        if (!extraBase.isNullOrBlank()) return StreamLines.detectLine(extraBase)
-        return preferences.currentLine
     }
 
     private fun activeBaseUrl(): String {
         val extraBase = intent.getStringExtra(EXTRA_BASE_URL)?.trim()
         if (!extraBase.isNullOrBlank()) {
-            return ChannelManager.normalizeBaseUrl(extraBase)
+            return StreamLines.resolveBaseUrl(extraBase)
         }
-        return StreamLines.baseUrl(currentLine)
+        return preferences.activeBaseUrl
     }
 
     // -------------------- UI 结构构建 --------------------
@@ -339,6 +329,26 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         playerView.isFocusableInTouchMode = false
         playerView.descendantFocusability = ViewGroup.FOCUS_BLOCK_DESCENDANTS
 
+        val safeScreenWidth = (resources.displayMetrics.widthPixels - 96.dp()).coerceAtLeast(280.dp())
+        errorOverlay.layoutParams = (errorOverlay.layoutParams as FrameLayout.LayoutParams).apply {
+            width = safeScreenWidth.coerceAtMost(540.dp())
+        }
+
+        val bindErrorBtnFocusStyle = { btn: Button ->
+            btn.setOnFocusChangeListener { v, hasFocus ->
+                v.animate().cancel()
+                v.animate()
+                    .scaleX(if (hasFocus) 1.06f else 1.0f)
+                    .scaleY(if (hasFocus) 1.06f else 1.0f)
+                    .setDuration(120)
+                    .start()
+                v.alpha = if (hasFocus) 1.0f else 0.85f
+            }
+        }
+        bindErrorBtnFocusStyle(btnRetryChannel)
+        bindErrorBtnFocusStyle(btnNextChannel)
+        bindErrorBtnFocusStyle(btnExitPlayer)
+
         btnRetryChannel.setOnClickListener {
             hideErrorOverlay()
             failedRidsThisRound.clear()
@@ -357,7 +367,10 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
 
         // 1. 左侧在线选台悬浮面板（遵循 TV 48dp 左侧与 27dp 上下过扫描安全区）
         channelMenu = FrameLayout(this).apply {
-            layoutParams = FrameLayout.LayoutParams(430.dp(), FrameLayout.LayoutParams.MATCH_PARENT).also {
+            layoutParams = FrameLayout.LayoutParams(
+                safeScreenWidth.coerceAtMost(420.dp()),
+                FrameLayout.LayoutParams.MATCH_PARENT
+            ).also {
                 it.gravity = Gravity.START
             }
             setBackgroundColor(Color.parseColor("#EB101218"))
@@ -365,48 +378,61 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
             visibility = View.GONE
             elevation = 24f
             isClickable = true
-            isFocusable = true
+            isFocusable = false
         }
 
         menuTitleView = TextView(this).apply {
             text = "在线频道（0）"
             setTextColor(Color.WHITE)
             textSize = 18f
-            setPadding(16, 12, 16, 8)
+            setPadding(12.dp(), 8.dp(), 12.dp(), 8.dp())
         }
         channelMenuList = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(4, 0, 4, 16)
+            setPadding(4.dp(), 0, 4.dp(), 12.dp())
         }
         val scroll = ScrollView(this).apply {
             layoutParams = FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT,
                 FrameLayout.LayoutParams.MATCH_PARENT
-            ).also { it.topMargin = 54.dp() }
+            ).also { it.topMargin = 48.dp() }
+            isFocusable = false
             addView(channelMenuList)
         }
         channelMenu.addView(menuTitleView)
         channelMenu.addView(scroll)
         root.addView(channelMenu)
 
-        // 2. OK 键技术参数信息面板（TV 安全区内居中玻璃面板）
-        infoOverlay = TextView(this).apply {
-            layoutParams = FrameLayout.LayoutParams(520.dp(), FrameLayout.LayoutParams.WRAP_CONTENT).also {
+        // 2. OK 键技术参数信息面板（可滚动容器 + 顶部留出 HUD 安全距，彻底杜绝截断与重叠）
+        infoScrollView = ScrollView(this).apply {
+            layoutParams = FrameLayout.LayoutParams(
+                safeScreenWidth.coerceAtMost(540.dp()),
+                FrameLayout.LayoutParams.WRAP_CONTENT
+            ).also {
                 it.gravity = Gravity.CENTER
                 it.leftMargin = 48.dp()
                 it.rightMargin = 48.dp()
-                it.topMargin = 27.dp()
+                it.topMargin = 72.dp()
                 it.bottomMargin = 27.dp()
             }
             background = ContextCompat.getDrawable(this@TvFullscreenPlayerActivity, R.drawable.bg_tv_overlay_panel)
-            setTextColor(Color.WHITE)
-            textSize = 15f
-            setPadding(28.dp(), 20.dp(), 28.dp(), 20.dp())
             elevation = 48f
             visibility = View.GONE
-            setLineSpacing(5f, 1.2f)
+            isVerticalScrollBarEnabled = true
+            isFocusable = false
         }
-        root.addView(infoOverlay)
+        infoOverlay = TextView(this).apply {
+            layoutParams = FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.WRAP_CONTENT
+            )
+            setTextColor(Color.WHITE)
+            textSize = 14f
+            setPadding(24.dp(), 16.dp(), 24.dp(), 16.dp())
+            setLineSpacing(2f, 1.12f)
+        }
+        infoScrollView.addView(infoOverlay)
+        root.addView(infoScrollView)
     }
 
     // -------------------- 播放与切台核心逻辑 --------------------
@@ -534,10 +560,7 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
             return
         }
 
-        showBuffering("准备切换到 ${channel.name}...")
-        if (!fromAutoSkip) {
-            showTip("正在切换到：${channel.name}", autoHide = false)
-        }
+        showBuffering("准备切换到：${channel.name}")
         preferSoftwareDecoderForCurrent = false
 
         val base = activeBaseUrl()
@@ -694,11 +717,9 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
                         scheduleBufferingTimeout(gen, next, name)
                         val qLabel = qualityList.getOrNull(qualityIndex)?.first ?: "默认"
                         if (preparingPlayer === next) {
-                            showBuffering("预加载：$name [$qLabel]")
-                            showTip("正在切换到：$name（缓冲中）", autoHide = false)
+                            showBuffering("正在切换：$name [$qLabel]")
                         } else if (player === next) {
-                            showBuffering("缓冲中 [$qLabel]")
-                            showTip("正在缓冲 [$qLabel]...", autoHide = false)
+                            showBuffering("正在缓冲：$name [$qLabel]")
                         }
                     }
                     Player.STATE_READY -> {
@@ -1045,8 +1066,10 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
                 maxLines = 1
                 ellipsize = TextUtils.TruncateAt.END
                 setTextColor(if (isCurrent) Color.parseColor("#4FC3F7") else Color.WHITE)
-                textSize = 17f
-                setPadding(18, 14, 18, 14)
+                textSize = 16f
+                gravity = Gravity.CENTER_VERTICAL
+                minHeight = 48.dp()
+                setPadding(14.dp(), 10.dp(), 14.dp(), 10.dp())
                 isFocusable = true
                 isClickable = true
                 tag = realIdx
@@ -1071,11 +1094,13 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         channelMenu.visibility = View.VISIBLE
         channelMenu.bringToFront()
         val focus = online.indexOfFirst { it.first == currentIndex }.coerceAtLeast(0)
-        channelMenuList.getChildAt(focus)?.requestFocus()
+        val focusTarget = channelMenuList.getChildAt(focus)
+        focusTarget?.post { focusTarget.requestFocus() }
     }
 
     private fun hideMenu() {
         isMenuShowing = false
+        channelMenuList.clearFocus()
         channelMenu.visibility = View.GONE
     }
 
@@ -1087,9 +1112,13 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
             return
         }
         isInfoShowing = true
+        tipView.animate().cancel()
+        tipView.removeCallbacks(hideTipRunnable)
+        tipView.visibility = View.GONE
         renderInfoOverlay()
-        infoOverlay.visibility = View.VISIBLE
-        infoOverlay.bringToFront()
+        infoScrollView.scrollTo(0, 0)
+        infoScrollView.visibility = View.VISIBLE
+        infoScrollView.bringToFront()
         mainHandler.removeCallbacks(infoRefreshRunnable)
         mainHandler.postDelayed(infoRefreshRunnable, 1000L)
     }
@@ -1111,10 +1140,11 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
             p.isPlaying -> "播放中"
             else -> "已暂停"
         }
-        val lineLabel = if (currentLine == 2) {
-            "线路二（${StreamLines.LINE_2.removePrefix("https://")}）"
+        val baseHost = activeBaseUrl().removePrefix("https://").removePrefix("http://")
+        val lineLabel = if (baseHost.equals(StreamLines.LINE_1.removePrefix("https://"), ignoreCase = true)) {
+            "默认主线（$baseHost）"
         } else {
-            "线路一（${StreamLines.LINE_1.removePrefix("https://")}）"
+            baseHost
         }
         val liveStatusText = when {
             ch.isLive -> "在线直播中"
@@ -1122,7 +1152,6 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
             else -> "已离线"
         }
 
-        val screenDesc = "自适应 FIT（纯暗底，完整比例不变形）"
         val decodeDesc = if (preferSoftwareDecoderForCurrent) "软件兼容解码" else "硬件直出解码"
 
         infoOverlay.text = buildString {
@@ -1137,7 +1166,6 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
             append("码率：${if (kbps > 0) "约 $kbps kbps" else "自适应"}\n")
             append("缓冲：${p?.totalBufferedDuration ?: 0} ms\n")
             append("线路：$lineLabel\n")
-            append("画面模式：$screenDesc\n")
             append("解码引擎：$decodeDesc（首帧：${if (hasRenderedFirstFrameForCurrent) "已出画" else "等待中"}）\n")
             append("播放状态：$playStateText\n")
             append("────────────────\n（再次按 OK 或返回键关闭）")
@@ -1146,7 +1174,7 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
 
     private fun hideLiveInfo() {
         mainHandler.removeCallbacks(infoRefreshRunnable)
-        infoOverlay.visibility = View.GONE
+        infoScrollView.visibility = View.GONE
         isInfoShowing = false
     }
 
@@ -1281,10 +1309,16 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
     }
 
     private fun showBuffering(message: String) {
+        tipView.animate().cancel()
+        tipView.removeCallbacks(hideTipRunnable)
+        tipView.visibility = View.GONE
         bufferingText.text = message
         if (bufferingPill.visibility != View.VISIBLE) {
             bufferingPill.visibility = View.VISIBLE
-            bufferingPill.bringToFront()
+        }
+        bufferingPill.bringToFront()
+        if (isInfoShowing) {
+            infoScrollView.bringToFront()
         }
     }
 
@@ -1293,6 +1327,7 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
     }
 
     private fun showErrorOverlay(title: String, detail: String) {
+        hideLiveInfo()
         errorTitleView.text = title
         errorDetailView.text = detail
         errorOverlay.visibility = View.VISIBLE
@@ -1305,7 +1340,11 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
     }
 
     private fun showTip(msg: String, autoHide: Boolean) {
+        hideBuffering()
         tipView.bringToFront()
+        if (isInfoShowing) {
+            infoScrollView.bringToFront()
+        }
         tipView.text = msg
         if (tipView.visibility != View.VISIBLE) {
             tipView.alpha = 0f

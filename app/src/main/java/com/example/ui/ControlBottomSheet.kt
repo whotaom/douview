@@ -175,37 +175,26 @@ fun ControlBottomSheet(
                         fontWeight = FontWeight.Medium
                     )
 
-                    // 线路一与线路二一键直达
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        val isLine1 = currentUrl.startsWith(StreamLines.LINE_1)
-                        val isLine2 = currentUrl.startsWith(StreamLines.LINE_2)
-                        SuggestionChip(
-                            onClick = { onSwitchLine(LivePreferences.DEFAULT_URL) },
-                            label = { Text("线路一 (主线)", fontSize = 11.sp) },
-                            colors = SuggestionChipDefaults.suggestionChipColors(
-                                containerColor = if (isLine1) DouyinCyan.copy(alpha = 0.2f) else DarkSurface,
-                                labelColor = if (isLine1) DouyinCyan else TextSecondary
-                            ),
-                            border = SuggestionChipDefaults.suggestionChipBorder(
-                                enabled = true,
-                                borderColor = if (isLine1) DouyinCyan else DarkSurfaceBorder
+                    // 默认主线快捷复位
+                    val isDefaultLine = currentUrl.startsWith(StreamLines.LINE_1)
+                    if (!isDefaultLine) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            SuggestionChip(
+                                onClick = { onSwitchLine(LivePreferences.DEFAULT_URL) },
+                                label = { Text("恢复默认主线", fontSize = 11.sp) },
+                                colors = SuggestionChipDefaults.suggestionChipColors(
+                                    containerColor = DarkSurface,
+                                    labelColor = DouyinCyan
+                                ),
+                                border = SuggestionChipDefaults.suggestionChipBorder(
+                                    enabled = true,
+                                    borderColor = DouyinCyan
+                                )
                             )
-                        )
-                        SuggestionChip(
-                            onClick = { onSwitchLine(StreamLines.LINE_2) },
-                            label = { Text("线路二 (备用)", fontSize = 11.sp) },
-                            colors = SuggestionChipDefaults.suggestionChipColors(
-                                containerColor = if (isLine2) DouyinRed.copy(alpha = 0.2f) else DarkSurface,
-                                labelColor = if (isLine2) DouyinRed else TextSecondary
-                            ),
-                            border = SuggestionChipDefaults.suggestionChipBorder(
-                                enabled = true,
-                                borderColor = if (isLine2) DouyinRed else DarkSurfaceBorder
-                            )
-                        )
+                        }
                     }
                 }
             }

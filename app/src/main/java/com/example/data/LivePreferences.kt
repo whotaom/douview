@@ -9,9 +9,7 @@ class LivePreferences(context: Context) {
 
     companion object {
         const val DEFAULT_URL = "${StreamLines.LINE_1}/"
-        const val LINE_TWO_URL = StreamLines.LINE_2
         const val API_ENDPOINT_URL = "${StreamLines.LINE_1}/live.php"
-        private const val LEGACY_LINE_TWO_URL = "https://www.whomao.com"
         private const val KEY_TARGET_URL = "target_url"
         private const val KEY_KEEP_SCREEN_ON = "keep_screen_on"
         private const val KEY_DESKTOP_UA = "desktop_ua"
@@ -27,23 +25,21 @@ class LivePreferences(context: Context) {
     var targetUrl: String
         get() {
             val url = prefs.getString(KEY_TARGET_URL, DEFAULT_URL) ?: DEFAULT_URL
-            // 向下兼容与平滑迁移：旧版 live.php 或旧线路二域名自动迁移到新地址
+            // 向下兼容与平滑迁移：旧版 live.php 或已下线的线路二域名自动迁移回默认主线
             return when {
                 url == API_ENDPOINT_URL -> DEFAULT_URL
-                url.trimEnd('/').equals(LEGACY_LINE_TWO_URL, ignoreCase = true) -> LINE_TWO_URL
+                url.contains("whomao.com", ignoreCase = true) -> DEFAULT_URL
                 else -> url
             }
         }
         set(value) {
-            prefs.edit().putString(KEY_TARGET_URL, value).apply()
-            recordHistoryUrl(value)
+            val sanitized = if (value.contains("whomao.com", ignoreCase = true)) DEFAULT_URL else value
+            prefs.edit().putString(KEY_TARGET_URL, sanitized).apply()
+            recordHistoryUrl(sanitized)
         }
 
-    val currentLine: Int
-        get() = StreamLines.detectLine(targetUrl)
-
     val activeBaseUrl: String
-        get() = StreamLines.baseUrl(currentLine)
+        get() = StreamLines.resolveBaseUrl(targetUrl)
 
     /**
      * 获取记忆的切换地址列表（限定最多 5 个，最近使用的排在最前）
