@@ -16,6 +16,7 @@ import android.view.ViewGroup
 import android.view.WindowManager
 import android.widget.Button
 import android.widget.FrameLayout
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
@@ -62,8 +63,8 @@ import org.json.JSONObject
 import java.util.concurrent.TimeUnit
 
 /**
- * 电视大屏全屏直播播放器（极简高稳单个 PlayerView 架构）
- * 1. 仅使用单个原生 SurfaceView PlayerView（RESIZE_MODE_FIT），纯暗底显示，彻底杜绝动态背景与表面冲突导致的黑屏
+ * 电视大屏全屏直播播放器（极简高稳单个 PlayerView + 纯原生低开销竖屏动态背景）
+ * 1. 仅使用单个原生 SurfaceView PlayerView（RESIZE_MODE_FIT + 透明底），竖屏直播时由 DynBgHelper 以 PixelCopy 48×84 极小图渲染底层动态光影
  * 2. 「先备后切」(prepare-then-swap)：冷启动直绑 Surface；切台后台静默缓冲至 READY 再瞬切并立即释放旧解码器
  * 3. 硬件解码首帧超时（4.5s）或解码异常自动切软件兼容解码；支持直播窗口落后（BEHIND_LIVE_WINDOW）无缝回拉直播前沿
  * 4. 菜单仅展示在线频道并带实时在线台数「在线频道（N）」；OK 键技术参数面板 1 秒实时刷新
@@ -201,9 +202,11 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
     private lateinit var channelManager: ChannelManager
     private lateinit var preferences: LivePreferences
 
-    // UI 组件（单个 PlayerView + TV 安全区交互浮层）
+    // UI 组件（单个 PlayerView + 纯原生动态背景层 + TV 安全区交互浮层）
     private lateinit var root: FrameLayout
-    private lateinit var playerView: PlayerView            // 唯一全屏主播放器（SurfaceView + RESIZE_MODE_FIT）
+    private lateinit var dynBgView: ImageView              // 竖屏直播纯原生模糊动态背景（48×84 PixelCopy）
+    private lateinit var dynBgHelper: DynBgHelper
+    private lateinit var playerView: PlayerView            // 唯一全屏主播放器（SurfaceView + RESIZE_MODE_FIT + 透明底）
     private lateinit var tipView: TextView                 // 顶部高层级换台与状态提示（与缓冲胶囊互斥）
     private lateinit var bufferingPill: LinearLayout       // 顶部安全区居中缓冲指示胶囊
     private lateinit var bufferingText: TextView
@@ -306,6 +309,7 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
     private fun buildUi() {
         setContentView(R.layout.activity_tv_fullscreen_player)
         root = findViewById(R.id.rootContainer)
+        dynBgView = findViewById(R.id.dynBgView)
         playerView = findViewById(R.id.playerView)
         tipView = findViewById(R.id.tipView)
         bufferingPill = findViewById(R.id.bufferingPill)
@@ -320,9 +324,11 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         val darkBgColor = Color.parseColor("#09090C")
         root.setBackgroundColor(darkBgColor)
 
+        dynBgHelper = DynBgHelper(playerView, dynBgView, lifecycleScope)
+
         playerView.useController = false
         playerView.resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
-        playerView.setBackgroundColor(darkBgColor)
+        playerView.setBackgroundColor(Color.TRANSPARENT)
         playerView.setShutterBackgroundColor(darkBgColor)
         playerView.keepScreenOn = preferences.keepScreenOn
         playerView.isFocusable = false
@@ -703,6 +709,7 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
             player = next
             preparingPlayer = null
             hasRenderedFirstFrameForCurrent = false
+            dynBgHelper.resetForChannelSwitch()
             playerView.resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
             playerView.player = next
         } else {
@@ -719,6 +726,7 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
                         if (preparingPlayer === next) {
                             showBuffering("正在切换：$name [$qLabel]")
                         } else if (player === next) {
+                            dynBgHelper.setPlaying(false)
                             showBuffering("正在缓冲：$name [$qLabel]")
                         }
                     }
@@ -729,6 +737,7 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
                         if (preparingPlayer === next) {
                             swapTo(next, gen, name)
                         } else if (player === next) {
+                            dynBgHelper.setPlaying(next.isPlaying)
                             if (!hasRenderedFirstFrameForCurrent &&
                                 next.playWhenReady &&
                                 next.videoFormat != null
@@ -744,9 +753,17 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
                         cancelBufferingTimeout()
                         hideBuffering()
                         if (player === next) {
+                            dynBgHelper.stopAndClear()
                             onChannelUnplayable("直播已结束")
                         }
                     }
+                }
+            }
+
+            override fun onIsPlayingChanged(isPlaying: Boolean) {
+                if (gen != switchGen) return
+                if (player === next) {
+                    dynBgHelper.setPlaying(isPlaying && next.playbackState == Player.STATE_READY)
                 }
             }
 
@@ -765,6 +782,14 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
                 if (player === next) {
                     cancelFirstFrameWatchdog()
                     hasRenderedFirstFrameForCurrent = true
+                    val vs = next.videoSize
+                    if (vs.width > 0 && vs.height > 0) {
+                        dynBgHelper.setPortraitStream(
+                            DynBgHelper.isPortraitVideo(vs.width, vs.height, vs.pixelWidthHeightRatio)
+                        )
+                    }
+                    dynBgHelper.setFirstFrameRendered(true)
+                    dynBgHelper.setPlaying(next.playbackState == Player.STATE_READY && next.isPlaying)
                     if (tipView.visibility == View.VISIBLE) {
                         tipView.removeCallbacks(hideTipRunnable)
                         tipView.postDelayed(hideTipRunnable, 600)
@@ -814,6 +839,15 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
 
             override fun onVideoSizeChanged(videoSize: VideoSize) {
                 Log.d(TAG, "视频尺寸已更新: ${videoSize.width}x${videoSize.height} ratio=${videoSize.pixelWidthHeightRatio}")
+                if (gen == switchGen && player === next) {
+                    dynBgHelper.setPortraitStream(
+                        DynBgHelper.isPortraitVideo(
+                            videoSize.width,
+                            videoSize.height,
+                            videoSize.pixelWidthHeightRatio
+                        )
+                    )
+                }
             }
         })
 
@@ -832,7 +866,7 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
 
     /**
      * 瞬间切换（零黑屏空窗且避免双 VPU 解码抢占）：
-     * 1. 先赋值 playerView.player = next（内部自动解除旧 Surface，零 null 空窗）
+     * 1. 先清空旧频道动态背景防止串台残影，再赋值 playerView.player = next（零 null 空窗）
      * 2. 立即释放旧播放器，腾出硬件 VPU 解码通道与 CMA 内存
      * 3. 置 next.playWhenReady = true，使新流从首关键帧直接解码渲染到 SurfaceView
      */
@@ -845,6 +879,7 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         }
 
         cancelFirstFrameWatchdog()
+        dynBgHelper.resetForChannelSwitch()
         failedRidsThisRound.clear()
         val old = player
         player = next
@@ -863,6 +898,13 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         } catch (_: Exception) {}
 
         next.playWhenReady = true
+
+        val vs = next.videoSize
+        if (vs.width > 0 && vs.height > 0) {
+            dynBgHelper.setPortraitStream(
+                DynBgHelper.isPortraitVideo(vs.width, vs.height, vs.pixelWidthHeightRatio)
+            )
+        }
 
         if (next.playbackState == Player.STATE_READY &&
             next.playWhenReady &&
@@ -1327,6 +1369,7 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
     }
 
     private fun showErrorOverlay(title: String, detail: String) {
+        dynBgHelper.resetForChannelSwitch()
         hideLiveInfo()
         errorTitleView.text = title
         errorDetailView.text = detail
@@ -1378,6 +1421,9 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
     private fun releasePlayerOnly() {
         cancelBufferingTimeout()
         cancelFirstFrameWatchdog()
+        if (::dynBgHelper.isInitialized) {
+            dynBgHelper.resetForChannelSwitch()
+        }
         playerView.player = null
         try {
             player?.stop()
@@ -1398,8 +1444,25 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         releasePlayerOnly()
     }
 
+    override fun onResume() {
+        super.onResume()
+        if (::dynBgHelper.isInitialized) {
+            dynBgHelper.setForeground(true)
+        }
+    }
+
+    override fun onPause() {
+        if (::dynBgHelper.isInitialized) {
+            dynBgHelper.setForeground(false)
+        }
+        super.onPause()
+    }
+
     override fun onStop() {
         super.onStop()
+        if (::dynBgHelper.isInitialized) {
+            dynBgHelper.setForeground(false)
+        }
         mainHandler.removeCallbacks(infoRefreshRunnable)
         cancelFirstFrameWatchdog()
         wasStoppedInBackground = true
@@ -1433,6 +1496,9 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
 
     override fun onDestroy() {
         releaseAll()
+        if (::dynBgHelper.isInitialized) {
+            dynBgHelper.release()
+        }
         super.onDestroy()
     }
 

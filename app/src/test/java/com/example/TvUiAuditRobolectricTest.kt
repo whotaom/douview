@@ -119,8 +119,20 @@ class TvUiAuditRobolectricTest {
     fun `player layout aligns tipView and bufferingPill cleanly to shared top-center slot`() {
         val context = ApplicationProvider.getApplicationContext<Context>()
         val root = LayoutInflater.from(context).inflate(R.layout.activity_tv_fullscreen_player, null) as FrameLayout
+        val dynBgView = root.findViewById<android.widget.ImageView>(R.id.dynBgView)
+        val playerView = root.findViewById<androidx.media3.ui.PlayerView>(R.id.playerView)
         val tipView = root.findViewById<android.view.View>(R.id.tipView)
         val bufferingPill = root.findViewById<android.view.View>(R.id.bufferingPill)
+
+        // dynBgView must sit strictly beneath playerView and start GONE + non-focusable
+        assertTrue(root.indexOfChild(dynBgView) < root.indexOfChild(playerView))
+        assertEquals(android.view.View.GONE, dynBgView.visibility)
+        assertEquals(android.widget.ImageView.ScaleType.CENTER_CROP, dynBgView.scaleType)
+        org.junit.Assert.assertFalse(dynBgView.isFocusable)
+
+        // playerView background must be transparent so portrait pillar areas reveal dynBgView
+        val playerBg = (playerView.background as? android.graphics.drawable.ColorDrawable)?.color
+        assertEquals(android.graphics.Color.TRANSPARENT, playerBg)
 
         val tipLp = tipView.layoutParams as FrameLayout.LayoutParams
         val bufLp = bufferingPill.layoutParams as FrameLayout.LayoutParams
