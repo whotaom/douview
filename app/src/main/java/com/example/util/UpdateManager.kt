@@ -1,5 +1,7 @@
 package com.example.util
 
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
@@ -122,8 +124,8 @@ object UpdateManager {
     }
 
     /**
-     * 零权限合规更新入口：通过系统浏览器打开官方 Release 发布页
-     * （不申请 REQUEST_INSTALL_PACKAGES，也不在应用内直接下载或安装 APK）
+     * 零权限合规更新入口：通过系统浏览器打开官方 Release 发布页；
+     * 若电视盒子系统精简了浏览器组件，自动降级复制发布页链接到剪贴板并提示用户。
      */
     fun openReleasePage(context: Context, url: String) {
         val safeUrl = sanitizeHttpsUrl(url)
@@ -131,17 +133,24 @@ object UpdateManager {
             val browserIntent = Intent(Intent.ACTION_VIEW, Uri.parse(safeUrl)).apply {
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             }
-            context.startActivity(browserIntent)
-            Toast.makeText(context, "正在前往官方发布页面...", Toast.LENGTH_SHORT).show()
-        } catch (e: Exception) {
-            try {
-                val fallbackIntent = Intent(Intent.ACTION_VIEW, Uri.parse(GITHUB_REPO_PAGE)).apply {
-                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                }
-                context.startActivity(fallbackIntent)
-            } catch (_: Exception) {
-                Toast.makeText(context, "未检测到可用浏览器，请访问发布页查看更新", Toast.LENGTH_LONG).show()
+            if (browserIntent.resolveActivity(context.packageManager) != null) {
+                context.startActivity(browserIntent)
+                Toast.makeText(context, "正在前往官方发布页面...", Toast.LENGTH_SHORT).show()
+            } else {
+                copyReleaseUrlFallback(context, safeUrl)
             }
+        } catch (_: Exception) {
+            copyReleaseUrlFallback(context, safeUrl)
+        }
+    }
+
+    private fun copyReleaseUrlFallback(context: Context, safeUrl: String) {
+        try {
+            val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+            clipboard?.setPrimaryClip(ClipData.newPlainText("release_url", safeUrl))
+            Toast.makeText(context, "设备未安装浏览器，已复制发布页地址：$safeUrl", Toast.LENGTH_LONG).show()
+        } catch (_: Exception) {
+            Toast.makeText(context, "请使用手机或电脑访问：$safeUrl", Toast.LENGTH_LONG).show()
         }
     }
 }

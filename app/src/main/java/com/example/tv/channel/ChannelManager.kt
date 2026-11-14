@@ -253,6 +253,8 @@ class ChannelManager(private val context: Context) {
                     Result.success(list)
                 }
             }
+        } catch (e: java.net.UnknownServiceException) {
+            Result.failure(Exception("已拦截不安全明文 HTTP 连接，请改用 HTTPS 地址"))
         } catch (e: Exception) {
             Result.failure(e)
         }

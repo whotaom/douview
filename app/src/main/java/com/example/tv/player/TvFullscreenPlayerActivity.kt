@@ -12,6 +12,7 @@ import android.util.Log
 import android.view.Gravity
 import android.view.KeyEvent
 import android.view.View
+import android.view.ViewGroup
 import android.view.WindowManager
 import android.widget.Button
 import android.widget.FrameLayout
@@ -181,6 +182,28 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
                 else -> RemoteAction.NONE
             }
         }
+
+        fun shouldIgnoreRepeatKey(keyCode: Int, repeatCount: Int): Boolean {
+            if (repeatCount <= 0) return false
+            return when (keyCode) {
+                KeyEvent.KEYCODE_DPAD_CENTER,
+                KeyEvent.KEYCODE_ENTER,
+                KeyEvent.KEYCODE_NUMPAD_ENTER,
+                KeyEvent.KEYCODE_BACK,
+                KeyEvent.KEYCODE_MENU,
+                KeyEvent.KEYCODE_INFO,
+                KeyEvent.KEYCODE_MEDIA_PLAY,
+                KeyEvent.KEYCODE_MEDIA_PAUSE,
+                KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE,
+                KeyEvent.KEYCODE_CHANNEL_UP,
+                KeyEvent.KEYCODE_CHANNEL_DOWN,
+                KeyEvent.KEYCODE_MEDIA_NEXT,
+                KeyEvent.KEYCODE_MEDIA_PREVIOUS,
+                KeyEvent.KEYCODE_DPAD_UP,
+                KeyEvent.KEYCODE_DPAD_DOWN -> true
+                else -> false
+            }
+        }
     }
 
     private lateinit var channelManager: ChannelManager
@@ -323,6 +346,9 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         playerView.setBackgroundColor(Color.TRANSPARENT)
         playerView.setShutterBackgroundColor(Color.TRANSPARENT)
         playerView.keepScreenOn = preferences.keepScreenOn
+        playerView.isFocusable = false
+        playerView.isFocusableInTouchMode = false
+        playerView.descendantFocusability = ViewGroup.FOCUS_BLOCK_DESCENDANTS
 
         btnRetryChannel.setOnClickListener {
             hideErrorOverlay()
@@ -1182,6 +1208,9 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
     }
 
     override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
+        if (shouldIgnoreRepeatKey(keyCode, event?.repeatCount ?: 0)) {
+            return true
+        }
         if (errorOverlay.visibility == View.VISIBLE) {
             if (keyCode == KeyEvent.KEYCODE_BACK) {
                 handleBack()

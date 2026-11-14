@@ -125,4 +125,38 @@ class TvPlayerLogicTest {
         assertTrue(UpdateManager.isNewerVersion("1.0.2", "1.0.1"))
         assertFalse(UpdateManager.isNewerVersion("1.0.1", "1.0.1"))
     }
+
+    @Test
+    fun `shouldIgnoreRepeatKey debounces held discrete keys but passes initial presses`() {
+        assertFalse(TvFullscreenPlayerActivity.shouldIgnoreRepeatKey(KeyEvent.KEYCODE_DPAD_CENTER, 0))
+        assertFalse(TvFullscreenPlayerActivity.shouldIgnoreRepeatKey(KeyEvent.KEYCODE_DPAD_DOWN, 0))
+        assertTrue(TvFullscreenPlayerActivity.shouldIgnoreRepeatKey(KeyEvent.KEYCODE_DPAD_CENTER, 1))
+        assertTrue(TvFullscreenPlayerActivity.shouldIgnoreRepeatKey(KeyEvent.KEYCODE_CHANNEL_UP, 2))
+        assertTrue(TvFullscreenPlayerActivity.shouldIgnoreRepeatKey(KeyEvent.KEYCODE_BACK, 1))
+        assertFalse(TvFullscreenPlayerActivity.shouldIgnoreRepeatKey(KeyEvent.KEYCODE_VOLUME_UP, 3))
+    }
+
+    @Test
+    fun `manifest disables cleartext traffic and exposes leanback launcher with banner`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val appInfo = context.applicationInfo
+        assertEquals(0, appInfo.flags and android.content.pm.ApplicationInfo.FLAG_USES_CLEARTEXT_TRAFFIC)
+
+        val leanbackIntent = android.content.Intent(android.content.Intent.ACTION_MAIN).apply {
+            addCategory(android.content.Intent.CATEGORY_LEANBACK_LAUNCHER)
+            setPackage(context.packageName)
+        }
+        val resolved = context.packageManager.queryIntentActivities(leanbackIntent, 0)
+        assertTrue(resolved.isNotEmpty())
+        assertTrue(appInfo.banner != 0)
+    }
+
+    @Test
+    fun `openReleasePage copies sanitized url to clipboard when no browser is installed`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        UpdateManager.openReleasePage(context, "http://insecure.example.com/app.apk")
+        val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+        val copied = clipboard.primaryClip?.getItemAt(0)?.text?.toString()
+        assertEquals(UpdateManager.GITHUB_REPO_PAGE, copied)
+    }
 }
