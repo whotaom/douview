@@ -22,16 +22,6 @@ import org.robolectric.annotation.Config
 class TvPlayerLogicTest {
 
     @Test
-    fun `isPortraitVideo classifies portrait landscape square and SAR streams accurately`() {
-        assertTrue(TvFullscreenPlayerActivity.isPortraitVideo(720, 1280, 1f))
-        assertFalse(TvFullscreenPlayerActivity.isPortraitVideo(1920, 1080, 1f))
-        assertFalse(TvFullscreenPlayerActivity.isPortraitVideo(1080, 1080, 1f))
-        assertTrue(TvFullscreenPlayerActivity.isPortraitVideo(0, 0, 1f))
-        // Anamorphic stream where effective display width exceeds height
-        assertFalse(TvFullscreenPlayerActivity.isPortraitVideo(720, 1080, 2.0f))
-    }
-
-    @Test
     fun `normalizeStreamUrl upgrades protocol-relative urls and trims whitespace`() {
         assertEquals(
             "https://pull-hls.example.com/live/stream.m3u8",
@@ -46,9 +36,8 @@ class TvPlayerLogicTest {
     }
 
     @Test
-    fun `portrait backdrop and overlay drawables exist and load cleanly`() {
+    fun `overlay and banner drawables exist and load cleanly`() {
         val context = ApplicationProvider.getApplicationContext<Context>()
-        assertNotNull(ContextCompat.getDrawable(context, R.drawable.img_tv_portrait_backdrop))
         assertNotNull(ContextCompat.getDrawable(context, R.drawable.bg_tv_overlay_panel))
         assertNotNull(ContextCompat.getDrawable(context, R.drawable.tv_banner))
     }

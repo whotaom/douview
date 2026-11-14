@@ -20,3 +20,6 @@
 }
 -dontwarn okio.**
 -dontwarn javax.annotation.**
+-dontwarn org.bouncycastle.**
+-dontwarn org.conscrypt.**
+-dontwarn org.openjsse.**

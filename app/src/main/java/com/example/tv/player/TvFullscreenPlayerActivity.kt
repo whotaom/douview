@@ -16,7 +16,6 @@ import android.view.ViewGroup
 import android.view.WindowManager
 import android.widget.Button
 import android.widget.FrameLayout
-import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
@@ -64,11 +63,10 @@ import java.util.concurrent.TimeUnit
 
 /**
  * 电视大屏全屏直播播放器（极简高稳单个 PlayerView 架构）
- * 1. 仅使用单个原生 SurfaceView PlayerView（RESIZE_MODE_FIT），彻底移除动态背景采样与头像背景，杜绝黑屏与表面冲突
- * 2. 竖屏直播两侧展示符合系统暗夜霓虹风格的固定竖屏背景图，横屏直播自动隐藏显纯暗底
- * 3. 「先备后切」(prepare-then-swap)：冷启动直绑 Surface；切台后台静默缓冲至 READY 再瞬切并立即释放旧解码器
- * 4. 硬件解码首帧超时（4.5s）或解码异常自动切软件兼容解码；支持直播窗口落后（BEHIND_LIVE_WINDOW）无缝回拉直播前沿
- * 5. 菜单仅展示在线频道并带实时在线台数「在线频道（N）」；OK 键技术参数面板 1 秒实时刷新
+ * 1. 仅使用单个原生 SurfaceView PlayerView（RESIZE_MODE_FIT），纯暗底显示，彻底杜绝动态背景与表面冲突导致的黑屏
+ * 2. 「先备后切」(prepare-then-swap)：冷启动直绑 Surface；切台后台静默缓冲至 READY 再瞬切并立即释放旧解码器
+ * 3. 硬件解码首帧超时（4.5s）或解码异常自动切软件兼容解码；支持直播窗口落后（BEHIND_LIVE_WINDOW）无缝回拉直播前沿
+ * 4. 菜单仅展示在线频道并带实时在线台数「在线频道（N）」；OK 键技术参数面板 1 秒实时刷新
  */
 class TvFullscreenPlayerActivity : ComponentActivity() {
 
@@ -93,12 +91,6 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         fun clearStreamCache() {
             streamCache.clear()
             streamCacheTime.clear()
-        }
-
-        fun isPortraitVideo(videoWidth: Int, videoHeight: Int, pixelWidthHeightRatio: Float = 1f): Boolean {
-            if (videoWidth <= 0 || videoHeight <= 0) return true
-            val effectiveW = (videoWidth * pixelWidthHeightRatio).toInt().coerceAtLeast(1)
-            return videoHeight > effectiveW
         }
 
         fun normalizeStreamUrl(raw: String?): String {
@@ -210,9 +202,8 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
     private lateinit var preferences: LivePreferences
     private var currentLine: Int = 1
 
-    // UI 组件（单个 PlayerView + 固定竖屏背景图 + TV 安全区交互浮层）
+    // UI 组件（单个 PlayerView + TV 安全区交互浮层）
     private lateinit var root: FrameLayout
-    private lateinit var portraitBackdrop: ImageView       // 固定系统风格竖屏背景图
     private lateinit var playerView: PlayerView            // 唯一全屏主播放器（SurfaceView + RESIZE_MODE_FIT）
     private lateinit var tipView: TextView                 // 顶部高层级换台与状态提示
     private lateinit var bufferingPill: LinearLayout       // 右上角 TV 安全区缓冲指示胶囊
@@ -235,8 +226,7 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
     private var isInfoShowing = false
     private var wasStoppedInBackground = false
 
-    // 画面比例与解码自愈状态
-    private var isPortraitStream: Boolean = true
+    // 解码自愈状态
     private var hasRenderedFirstFrameForCurrent: Boolean = false
     private var preferSoftwareDecoderForCurrent: Boolean = false
     private var activeStreamUrl: String = ""
@@ -326,7 +316,6 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
     private fun buildUi() {
         setContentView(R.layout.activity_tv_fullscreen_player)
         root = findViewById(R.id.rootContainer)
-        portraitBackdrop = findViewById(R.id.portraitBackdrop)
         playerView = findViewById(R.id.playerView)
         tipView = findViewById(R.id.tipView)
         bufferingPill = findViewById(R.id.bufferingPill)
@@ -338,13 +327,13 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         btnNextChannel = findViewById(R.id.btnNextChannel)
         btnExitPlayer = findViewById(R.id.btnExitPlayer)
 
-        root.setBackgroundColor(Color.parseColor("#09090C"))
-        portraitBackdrop.visibility = if (isPortraitStream) View.VISIBLE else View.GONE
+        val darkBgColor = Color.parseColor("#09090C")
+        root.setBackgroundColor(darkBgColor)
 
         playerView.useController = false
         playerView.resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
-        playerView.setBackgroundColor(Color.TRANSPARENT)
-        playerView.setShutterBackgroundColor(Color.TRANSPARENT)
+        playerView.setBackgroundColor(darkBgColor)
+        playerView.setShutterBackgroundColor(darkBgColor)
         playerView.keepScreenOn = preferences.keepScreenOn
         playerView.isFocusable = false
         playerView.isFocusableInTouchMode = false
@@ -755,9 +744,6 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
                 if (player === next) {
                     cancelFirstFrameWatchdog()
                     hasRenderedFirstFrameForCurrent = true
-                    if (next.videoSize.width > 0 && next.videoSize.height > 0) {
-                        updateBackdropForVideoSize(next.videoSize)
-                    }
                     if (tipView.visibility == View.VISIBLE) {
                         tipView.removeCallbacks(hideTipRunnable)
                         tipView.postDelayed(hideTipRunnable, 600)
@@ -806,9 +792,6 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
             }
 
             override fun onVideoSizeChanged(videoSize: VideoSize) {
-                if (player === next && videoSize.width > 0 && videoSize.height > 0) {
-                    updateBackdropForVideoSize(videoSize)
-                }
                 Log.d(TAG, "视频尺寸已更新: ${videoSize.width}x${videoSize.height} ratio=${videoSize.pixelWidthHeightRatio}")
             }
         })
@@ -859,14 +842,6 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         } catch (_: Exception) {}
 
         next.playWhenReady = true
-
-        val vs = next.videoSize
-        if (vs.width > 0 && vs.height > 0) {
-            updateBackdropForVideoSize(vs)
-        } else {
-            isPortraitStream = true
-            portraitBackdrop.visibility = View.VISIBLE
-        }
 
         if (next.playbackState == Player.STATE_READY &&
             next.playWhenReady &&
@@ -949,17 +924,6 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         releasePreparing()
         releasePlayerOnly()
         prepareThenSwap(gen, url, name, preferSoftwareDecoder = true)
-    }
-
-    // -------------------- 固定竖屏背景图控制 --------------------
-
-    private fun updateBackdropForVideoSize(videoSize: VideoSize) {
-        isPortraitStream = isPortraitVideo(
-            videoWidth = videoSize.width,
-            videoHeight = videoSize.height,
-            pixelWidthHeightRatio = videoSize.pixelWidthHeightRatio
-        )
-        portraitBackdrop.visibility = if (isPortraitStream) View.VISIBLE else View.GONE
     }
 
     // -------------------- 取流与超时 --------------------
@@ -1158,11 +1122,7 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
             else -> "已离线"
         }
 
-        val screenDesc = if (isPortraitStream) {
-            "竖屏 FIT（固定背景图）"
-        } else {
-            "横屏 FIT（纯暗底）"
-        }
+        val screenDesc = "自适应 FIT（纯暗底，完整比例不变形）"
         val decodeDesc = if (preferSoftwareDecoderForCurrent) "软件兼容解码" else "硬件直出解码"
 
         infoOverlay.text = buildString {

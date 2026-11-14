@@ -6,32 +6,22 @@
     android:layout_height="match_parent"
     android:background="#09090C">
 
-    <!-- 1. 符合系统风格的固定竖屏背景图（仅竖屏直播两侧展示，横屏隐藏显纯暗底） -->
-    <ImageView
-        android:id="@+id/portraitBackdrop"
-        android:layout_width="match_parent"
-        android:layout_height="match_parent"
-        android:contentDescription="@null"
-        android:scaleType="centerCrop"
-        android:src="@drawable/img_tv_portrait_backdrop"
-        android:visibility="visible" />
-
-    <!-- 2. 唯一全屏主播放器（SurfaceView 原生硬件直出 + RESIZE_MODE_FIT 完整不变形） -->
+    <!-- 1. 唯一全屏主播放器（SurfaceView 原生硬件直出 + RESIZE_MODE_FIT 完整不变形） -->
     <androidx.media3.ui.PlayerView
         android:id="@+id/playerView"
         android:layout_width="match_parent"
         android:layout_height="match_parent"
-        android:background="@android:color/transparent"
+        android:background="#09090C"
         android:descendantFocusability="blocksDescendants"
         android:focusable="false"
         android:focusableInTouchMode="false"
         app:keep_content_on_player_reset="true"
         app:resize_mode="fit"
-        app:shutter_background_color="@android:color/transparent"
+        app:shutter_background_color="#09090C"
         app:surface_type="surface_view"
         app:use_controller="false" />
 
-    <!-- 3. 顶部安全区居中换台与状态提示（遵守 TV 5% Overscan 安全区） -->
+    <!-- 2. 顶部安全区居中换台与状态提示（遵守 TV 5% Overscan 安全区） -->
     <TextView
         android:id="@+id/tipView"
         android:layout_width="wrap_content"
@@ -51,7 +41,7 @@
         android:textSize="17sp"
         android:visibility="gone" />
 
-    <!-- 4. 右上角 TV 安全区轻量缓冲加载指示胶囊 -->
+    <!-- 3. 右上角 TV 安全区轻量缓冲加载指示胶囊 -->
     <LinearLayout
         android:id="@+id/bufferingPill"
         android:layout_width="wrap_content"
@@ -86,7 +76,7 @@
             android:textStyle="bold" />
     </LinearLayout>
 
-    <!-- 5. 高对比度可遥控操作的直播加载失败 / 无可用频道兜底面板 -->
+    <!-- 4. 高对比度可遥控操作的直播加载失败 / 无可用频道兜底面板 -->
     <LinearLayout
         android:id="@+id/errorOverlay"
         android:layout_width="520dp"
