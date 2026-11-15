@@ -73,6 +73,7 @@ fun TvHomeScreen(
             compareBy { if (it.isLive) 0 else if (!it.statusKnown) 1 else 2 }
         )
     }
+    val liveCount = remember(channels) { channels.count { it.isLive } }
 
     // D-pad 焦点管理与弹窗关闭后焦点安全归位
     val firstChannelFocusRequester = remember { FocusRequester() }
@@ -135,8 +136,10 @@ fun TvHomeScreen(
                 probeStatusTip = "在线检测失败，请检查网络"
                 Toast.makeText(context, "在线检测失败，请检查网络", Toast.LENGTH_SHORT).show()
             } else {
-                channelManager.saveChannels(outcome.channels)
-                channels = outcome.channels
+                if (outcome.channels != channels) {
+                    channelManager.saveChannels(outcome.channels)
+                    channels = outcome.channels
+                }
                 probeStatusTip = when {
                     outcome.unknownCount > 0 -> "在线 ${outcome.liveCount} 台 · ${outcome.unknownCount} 台状态未知"
                     else -> "状态已同步 · 在线 ${outcome.liveCount} 台"
@@ -218,7 +221,7 @@ fun TvHomeScreen(
                         fontWeight = FontWeight.SemiBold
                     )
                     Text(
-                        text = "共 ${channels.size} 台 · 在线 ${channels.count { it.isLive }} 台",
+                        text = "共 ${channels.size} 台 · 在线 $liveCount 台",
                         color = Color.White.copy(alpha = 0.9f),
                         fontSize = 16.sp,
                         fontWeight = FontWeight.Bold

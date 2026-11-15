@@ -1,6 +1,7 @@
 package com.example.tv.channel
 
 import android.content.Context
+import android.content.SharedPreferences
 import android.util.Log
 import com.example.util.NetworkClient
 import kotlinx.coroutines.Dispatchers
@@ -9,6 +10,7 @@ import okhttp3.Request
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.lang.ref.WeakReference
 import java.net.URI
 import java.net.URLEncoder
 
@@ -32,6 +34,15 @@ class ChannelManager(private val context: Context) {
             "Mozilla/5.0 (Linux; Android 13; TV) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
         private val RID_REGEX = Regex("^\\d{3,22}$")
+
+        @Volatile
+        private var cachedChannels: List<Channel>? = null
+
+        @Volatile
+        private var cachedJson: String? = null
+
+        @Volatile
+        private var cachedPrefsRef: WeakReference<SharedPreferences>? = null
 
         /**
          * 规范化基础域名，去除多余 path 与尾部斜杠，确保始终拼出 https://host/live.php
@@ -148,24 +159,45 @@ class ChannelManager(private val context: Context) {
     )
 
     /**
-     * 加载本地保存的频道（若无则返回默认列表）
+     * 加载本地保存的频道（命中同进程 SharedPreferences 内存缓存时零 I/O 零 JSON 解析开销）
      */
     fun loadChannels(): List<Channel> {
+        if (cachedPrefsRef?.get() === prefs) {
+            cachedChannels?.let { return it }
+        }
         val raw = prefs.getString(KEY_CHANNELS, null)
-        if (raw.isNullOrBlank()) return getDefaultChannels()
+        cachedPrefsRef = WeakReference(prefs)
+        if (raw.isNullOrBlank()) {
+            cachedJson = null
+            return getDefaultChannels().also {
+                cachedChannels = it
+            }
+        }
         return try {
             val list = parseJsonArray(raw)
-            if (list.isEmpty()) getDefaultChannels() else list
+            val resolved = if (list.isEmpty()) getDefaultChannels() else list
+            cachedChannels = resolved
+            cachedJson = raw
+            resolved
         } catch (_: Exception) {
-            getDefaultChannels()
+            cachedJson = null
+            getDefaultChannels().also { cachedChannels = it }
         }
     }
 
     /**
-     * 保存频道列表到 SharedPreferences
+     * 保存频道列表到 SharedPreferences（内容未变化时跳过磁盘写入）
      */
     fun saveChannels(list: List<Channel>) {
-        val jsonStr = channelsToJsonString(list)
+        val snapshot = list.toList()
+        val jsonStr = channelsToJsonString(snapshot)
+        if (cachedPrefsRef?.get() === prefs && jsonStr == cachedJson) {
+            cachedChannels = snapshot
+            return
+        }
+        cachedPrefsRef = WeakReference(prefs)
+        cachedChannels = snapshot
+        cachedJson = jsonStr
         prefs.edit().putString(KEY_CHANNELS, jsonStr).apply()
     }
 

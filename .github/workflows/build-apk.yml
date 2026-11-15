@@ -77,6 +77,10 @@ jobs:
           fi
           cp .env app/.env 2>/dev/null || true
 
+      - name: Run Unit Tests
+        run: |
+          ./gradlew testDebugUnitTest --stacktrace --no-daemon -Djava.awt.headless=true
+
       - name: Build Production Release APK
         env:
           KEYSTORE_PATH: ${{ github.workspace }}/app/my-upload-key.jks
@@ -86,7 +90,7 @@ jobs:
           ./gradlew assembleRelease --stacktrace --no-daemon -Djava.awt.headless=true
           cd app/build/outputs/apk/release/
           if [ -f "app-release.apk" ]; then
-            cp app-release.apk douv-1.0.1.apk
+            cp app-release.apk douv-1.1.0.apk
           fi
 
       - name: Build Debug APK
@@ -96,14 +100,14 @@ jobs:
       - name: Upload Release APK Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: DouView-Release-v1.0.1-APK
+          name: DouView-Release-v1.1.0-APK
           path: app/build/outputs/apk/release/app-release.apk
           retention-days: 30
 
       - name: Upload Debug APK Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: DouView-Debug-v1.0.1-APK
+          name: DouView-Debug-v1.1.0-APK
           path: app/build/outputs/apk/debug/app-debug.apk
           retention-days: 30
 
@@ -114,7 +118,7 @@ jobs:
           name: Release ${{ github.ref_name }}
           files: |
             app/build/outputs/apk/release/app-release.apk
-            app/build/outputs/apk/release/douv-1.0.1.apk
+            app/build/outputs/apk/release/douv-1.1.0.apk
             app/build/outputs/apk/debug/app-debug.apk
           generate_release_notes: true
         env:

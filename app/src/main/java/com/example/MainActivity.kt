@@ -3,6 +3,7 @@ package com.example
 import android.annotation.SuppressLint
 import android.app.Activity
 import android.app.PictureInPictureParams
+import android.content.ComponentCallbacks2
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ActivityInfo
@@ -85,9 +86,24 @@ class MainActivity : ComponentActivity() {
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
     private var defaultMobileUserAgent: String = ""
 
+    companion object {
+        internal fun hasPipParamsChanged(
+            prevPortrait: Boolean?,
+            prevRect: Rect?,
+            newPortrait: Boolean,
+            newRect: Rect?
+        ): Boolean {
+            if (prevPortrait != newPortrait) return true
+            return prevRect != newRect
+        }
+    }
+
     // 实时直播流横竖比标记与视频位置探测 (用于画中画无缝贴合裁剪)
     private var isStreamPortrait: Boolean = true
     private var videoSourceRect: Rect? = null
+    private var lastPipRect: Rect? = null
+    private var lastPipPortrait: Boolean? = null
+    private var wasStoppedInBackground: Boolean = false
     // 画中画模式状态
     private val pipModeState = mutableStateOf(false)
     // 菜单键回调
@@ -143,22 +159,26 @@ class MainActivity : ComponentActivity() {
         enterPipModeSafely()
     }
 
-    fun updatePipParams() {
+    fun updatePipParams(force: Boolean = false) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val currentRect = videoSourceRect?.takeIf { it.width() > 10 && it.height() > 10 }
+            if (!force && !hasPipParamsChanged(lastPipPortrait, lastPipRect, isStreamPortrait, currentRect)) {
+                return
+            }
             try {
                 val ratio = if (isStreamPortrait) Rational(9, 16) else Rational(16, 9)
                 val builder = PictureInPictureParams.Builder()
                     .setAspectRatio(ratio)
-                videoSourceRect?.let { r ->
-                    if (r.width() > 10 && r.height() > 10) {
-                        builder.setSourceRectHint(r)
-                    }
+                currentRect?.let { r ->
+                    builder.setSourceRectHint(r)
                 }
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
                     builder.setAutoEnterEnabled(true)
                     builder.setSeamlessResizeEnabled(true)
                 }
                 setPictureInPictureParams(builder.build())
+                lastPipPortrait = isStreamPortrait
+                lastPipRect = currentRect?.let { Rect(it) }
             } catch (e: Exception) {
                 e.printStackTrace()
             }
@@ -238,9 +258,6 @@ class MainActivity : ComponentActivity() {
         defaultMobileUserAgent = WebSettings.getDefaultUserAgent(this)
         audioManager = applicationContext.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
 
-        requestAppAudioFocus()
-        updateKeepScreenOn(preferences.keepScreenOn)
-
         checkAndPerformAutoCacheCleanup()
 
         fileChooserLauncher =
@@ -264,46 +281,54 @@ class MainActivity : ComponentActivity() {
 
     /**
      * 自动定期巡检与缓存清理守护：
-     * 每24小时自动巡检并清理过期临时网络分片，在IO线程平滑执行，保持应用轻盈疾速
+     * 每24小时轻量清理过期流元数据（保留有效 WebView HTTP 缓存以极限降低蜂窝/Wi-Fi 射频重下载耗电）
      */
     private fun checkAndPerformAutoCacheCleanup() {
         if (preferences.shouldAutoClearCache()) {
-            performFullCacheCleanupInternal()
+            performFullCacheCleanupInternal(clearWebHttpCache = false)
         }
     }
 
-    fun performFullCacheCleanupInternal(onDone: (() -> Unit)? = null) {
+    fun performFullCacheCleanupInternal(
+        clearWebHttpCache: Boolean = true,
+        onDone: (() -> Unit)? = null
+    ) {
         lifecycleScope.launch(Dispatchers.IO) {
             try {
-                cacheDir?.listFiles()?.forEach { file ->
+                if (clearWebHttpCache) {
+                    cacheDir?.listFiles()?.forEach { file ->
+                        try {
+                            file.deleteRecursively()
+                        } catch (e: Exception) {
+                            e.printStackTrace()
+                        }
+                    }
+                    codeCacheDir?.listFiles()?.forEach { file ->
+                        try {
+                            file.deleteRecursively()
+                        } catch (e: Exception) {
+                            e.printStackTrace()
+                        }
+                    }
+                    externalCacheDir?.listFiles()?.forEach { file ->
+                        try {
+                            file.deleteRecursively()
+                        } catch (e: Exception) {
+                            e.printStackTrace()
+                        }
+                    }
+                }
+                // 仅在 Android 9 及以下清理公共下载目录中的历史更新包，避免 Scoped Storage 无谓扫描
+                if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
                     try {
-                        file.deleteRecursively()
+                        @Suppress("DEPRECATION")
+                        val downloadDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+                        downloadDir?.listFiles { file ->
+                            file.name.startsWith("douview_update") && file.name.endsWith(".apk")
+                        }?.forEach { it.delete() }
                     } catch (e: Exception) {
                         e.printStackTrace()
                     }
-                }
-                codeCacheDir?.listFiles()?.forEach { file ->
-                    try {
-                        file.deleteRecursively()
-                    } catch (e: Exception) {
-                        e.printStackTrace()
-                    }
-                }
-                externalCacheDir?.listFiles()?.forEach { file ->
-                    try {
-                        file.deleteRecursively()
-                    } catch (e: Exception) {
-                        e.printStackTrace()
-                    }
-                }
-                // 清理下载目录中的历史更新包
-                try {
-                    val downloadDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
-                    downloadDir?.listFiles { file ->
-                        file.name.startsWith("douview_update") && file.name.endsWith(".apk")
-                    }?.forEach { it.delete() }
-                } catch (e: Exception) {
-                    e.printStackTrace()
                 }
                 preferences.recordCacheCleared()
             } catch (e: Exception) {
@@ -311,7 +336,9 @@ class MainActivity : ComponentActivity() {
             }
             launch(Dispatchers.Main) {
                 try {
-                    webView?.clearCache(true)
+                    if (clearWebHttpCache) {
+                        webView?.clearCache(true)
+                    }
                     // 在网页端检测并自动移除已过期的临时直播流缓存与离线频道数据
                     val cleanJs = """
                         (function() {
@@ -363,12 +390,12 @@ class MainActivity : ComponentActivity() {
                     .setUsage(AudioAttributes.USAGE_MEDIA)
                     .setContentType(AudioAttributes.CONTENT_TYPE_MOVIE)
                     .build()
-                val request = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+                val request = audioFocusRequest ?: AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
                     .setAudioAttributes(attributes)
                     .setAcceptsDelayedFocusGain(true)
                     .setOnAudioFocusChangeListener { /* maintain audio */ }
                     .build()
-                audioFocusRequest = request
+                    .also { audioFocusRequest = it }
                 audioManager?.requestAudioFocus(request)
             } else {
                 @Suppress("DEPRECATION")
@@ -377,6 +404,19 @@ class MainActivity : ComponentActivity() {
                     AudioManager.STREAM_MUSIC,
                     AudioManager.AUDIOFOCUS_GAIN
                 )
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+    }
+
+    private fun abandonAppAudioFocus() {
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                audioFocusRequest?.let { audioManager?.abandonAudioFocusRequest(it) }
+            } else {
+                @Suppress("DEPRECATION")
+                audioManager?.abandonAudioFocus(null)
             }
         } catch (e: Exception) {
             e.printStackTrace()
@@ -606,6 +646,23 @@ class MainActivity : ComponentActivity() {
                                     isPageError = true
                                     errorMessage = "HTTPS 证书校验未通过，已拦截不安全连接"
                                 }
+                            }
+
+                            override fun onRenderProcessGone(
+                                view: WebView?,
+                                detail: RenderProcessGoneDetail?
+                            ): Boolean {
+                                isLoading = false
+                                isPageError = true
+                                errorMessage = "网页渲染进程意外释放，请点击重新加载恢复播放"
+                                view?.let { crashed ->
+                                    (crashed.parent as? ViewGroup)?.removeView(crashed)
+                                    crashed.destroy()
+                                }
+                                if (webView === view) {
+                                    webView = null
+                                }
+                                return true
                             }
                         }
 
@@ -1166,12 +1223,14 @@ class MainActivity : ComponentActivity() {
                     """.trimIndent()
                 ) { result ->
                     val cleanResult = result?.replace("\"", "") ?: "unknown"
-                    requestedOrientation = if (cleanResult == "portrait" || isStreamPortrait) {
-                        ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
-                    } else if (cleanResult == "landscape") {
-                        ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
-                    } else {
-                        ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+                    requestedOrientation = when (cleanResult) {
+                        "portrait" -> ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+                        "landscape" -> ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+                        else -> if (isStreamPortrait) {
+                            ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+                        } else {
+                            ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+                        }
                     }
                 }
             }
@@ -1501,19 +1560,29 @@ class MainActivity : ComponentActivity() {
                 }
 
                 function notifyDimensions() {
-                    if (document.body && document.body.classList.contains('android-pip-mode')) {
+                    if (document.hidden || (document.body && document.body.classList.contains('android-pip-mode'))) {
                         return;
                     }
                     var v = document.getElementById('video') || document.querySelector('video');
                     if (v && v.videoWidth > 0 && v.videoHeight > 0) {
                         var vw = v.videoWidth;
                         var vh = v.videoHeight;
+                        var stage = document.getElementById('stage') || v;
+                        var rect = stage.getBoundingClientRect();
+                        var l = Math.round(rect.left);
+                        var t = Math.round(rect.top);
+                        var r = Math.round(rect.right);
+                        var b = Math.round(rect.bottom);
+                        var metricsKey = l + ':' + t + ':' + r + ':' + b + ':' + vw + ':' + vh;
+                        if (window.__lastReportedMetricsKey === metricsKey) {
+                            return;
+                        }
+                        window.__lastReportedMetricsKey = metricsKey;
+
                         var isPortrait = (vh > vw);
                         if (window.AndroidLiveBridge && window.AndroidLiveBridge.onVideoRatioDetected) {
                             window.AndroidLiveBridge.onVideoRatioDetected(isPortrait);
                         }
-                        var stage = document.getElementById('stage') || v;
-                        var rect = stage.getBoundingClientRect();
                         if (window.AndroidLiveBridge && window.AndroidLiveBridge.onVideoMetricsReported) {
                             window.AndroidLiveBridge.onVideoMetricsReported(
                                 rect.left,
@@ -1527,15 +1596,16 @@ class MainActivity : ComponentActivity() {
                     }
                 }
 
-                // 2. 首次载入极速首播与声画自愈，彻底杜绝一卡一卡与需切频道才播的假死问题
+                // 2. 首次载入极速首播与声画自愈，消除静音重试死循环与低效轮询
                 function triggerImmediateAutoplayAndUnmute() {
+                    if (document.hidden || window.__userPaused) return;
                     var videos = document.querySelectorAll('video');
                     videos.forEach(function(v) {
                         v.setAttribute('playsinline', 'true');
                         v.setAttribute('webkit-playsinline', 'true');
                         v.setAttribute('x5-video-player-type', 'h5');
                         v.preload = 'auto';
-                        if (v.muted) {
+                        if (v.muted && !window.__autoUnmuteAttempted) {
                             v.muted = false;
                         }
                         v.volume = 1.0;
@@ -1544,12 +1614,16 @@ class MainActivity : ComponentActivity() {
                             var p = v.play();
                             if (p && p.catch) {
                                 p.catch(function() {
-                                    // 若策略拦截带声首播，立即先静音解码拉起画面，并在150ms内无缝解静音
+                                    if (window.__autoUnmuteAttempted) return;
+                                    window.__autoUnmuteAttempted = true;
+                                    // 若策略拦截带声首播，仅回退静音拉起一次并在150ms后尝试单次解静音，绝不无限循环
                                     v.muted = true;
                                     v.play().then(function() {
                                         setTimeout(function() {
-                                            v.muted = false;
-                                            v.volume = 1.0;
+                                            if (!document.hidden && !window.__userPaused) {
+                                                v.muted = false;
+                                                v.volume = 1.0;
+                                            }
                                         }, 150);
                                     }).catch(function() {});
                                 });
@@ -1564,7 +1638,7 @@ class MainActivity : ComponentActivity() {
 
                     // 仅当主视频明确暂停时才轻量激活大播放按钮，杜绝连点导致的播放/暂停震荡与频繁缓冲
                     var mainVideo = document.getElementById('video') || document.querySelector('video');
-                    if (mainVideo && mainVideo.paused) {
+                    if (mainVideo && mainVideo.paused && !window.__userPaused) {
                         var playBtn = document.querySelector('.xgplayer-start, .vjs-big-play-button');
                         if (playBtn && playBtn.offsetParent !== null) {
                             playBtn.click();
@@ -1582,7 +1656,15 @@ class MainActivity : ComponentActivity() {
 
                     document.addEventListener('play', function(e) {
                         if (e.target && e.target.tagName === 'VIDEO') {
+                            window.__userPaused = false;
+                            window.__sysPausedForBg = false;
                             setTimeout(notifyDimensions, 100);
+                        }
+                    }, true);
+
+                    document.addEventListener('pause', function(e) {
+                        if (e.target && e.target.tagName === 'VIDEO' && !document.hidden && !window.__sysPausedForBg) {
+                            window.__userPaused = true;
                         }
                     }, true);
 
@@ -1592,14 +1674,13 @@ class MainActivity : ComponentActivity() {
                         }
                     }, true);
 
-                    document.addEventListener('volumechange', function(e) {
-                        var v = document.getElementById('video') || document.querySelector('video');
-                        if (v && v.muted) {
-                            setTimeout(triggerImmediateAutoplayAndUnmute, 150);
-                        }
-                    }, true);
+                    window.addEventListener('resize', function() {
+                        setTimeout(notifyDimensions, 120);
+                    }, { passive: true });
 
                     function onLineChange() {
+                        window.__autoUnmuteAttempted = false;
+                        window.__userPaused = false;
                         var v = document.getElementById('video') || document.querySelector('video');
                         if (v) {
                             try {
@@ -1619,22 +1700,26 @@ class MainActivity : ComponentActivity() {
                     if (protoSel) protoSel.addEventListener('change', onLineChange);
                     if (qualSel) qualSel.addEventListener('change', onLineChange);
 
-                    // 3. 军工级平稳流媒体自愈看门狗 (Smooth & Resilient Stream Watchdog)
-                    // 彻底移除对 waiting/stalled 的激进拦截，让内核原生缓冲机制平稳工作；
-                    // 仅在真实持续停滞（6秒以上未前进）且非暂停时，才进行轻量级拉流唤醒
+                    // 3. 低功耗事件感知流媒体看门狗：仅在前台可见且未手动暂停时以 6s 周期轻检，后台零轮询零唤醒
                     var lastPlaybackCurrentTime = -1;
                     var streamStagnantCount = 0;
 
-                    setInterval(function() {
-                        var v = document.getElementById('video') || document.querySelector('video');
-                        if (v) {
-                            if (v.paused && !v.ended) {
+                    function startLiveWatchdog() {
+                        if (window.__liveWatchdogTimer || document.hidden) return;
+                        window.__liveWatchdogTimer = setInterval(function() {
+                            if (document.hidden) {
+                                stopLiveWatchdog();
+                                return;
+                            }
+                            var v = document.getElementById('video') || document.querySelector('video');
+                            if (!v) return;
+                            if (v.paused && !v.ended && !window.__userPaused) {
                                 v.play().catch(function(){});
-                            } else if (!v.ended && v.readyState >= 1) {
+                            } else if (!v.paused && !v.ended && v.readyState >= 1) {
                                 if (v.currentTime === lastPlaybackCurrentTime && lastPlaybackCurrentTime > 0) {
                                     streamStagnantCount++;
-                                    // 连续停滞 3 周期 (6秒)，确认为断流卡死，平稳自愈
-                                    if (streamStagnantCount >= 3) {
+                                    // 连续停滞 2 周期 (12秒)，确认为断流卡死，平稳自愈
+                                    if (streamStagnantCount >= 2) {
                                         var retryBtn = document.getElementById('retryBtn');
                                         if (retryBtn && !retryBtn.hidden) {
                                             retryBtn.click();
@@ -1649,8 +1734,26 @@ class MainActivity : ComponentActivity() {
                                 }
                             }
                             notifyDimensions();
+                        }, 6000);
+                    }
+
+                    function stopLiveWatchdog() {
+                        if (window.__liveWatchdogTimer) {
+                            clearInterval(window.__liveWatchdogTimer);
+                            window.__liveWatchdogTimer = null;
                         }
-                    }, 2000);
+                    }
+
+                    document.addEventListener('visibilitychange', function() {
+                        if (document.hidden) {
+                            stopLiveWatchdog();
+                        } else {
+                            startLiveWatchdog();
+                            notifyDimensions();
+                        }
+                    });
+
+                    startLiveWatchdog();
                 }
             })();
         """.trimIndent()
@@ -1813,8 +1916,18 @@ class MainActivity : ComponentActivity() {
         wv.setLayerType(View.LAYER_TYPE_HARDWARE, null)
     }
 
+    override fun onStart() {
+        super.onStart()
+        if (isFinishing || !::preferences.isInitialized) return
+        updateKeepScreenOn(preferences.keepScreenOn)
+        requestAppAudioFocus()
+        webView?.resumeTimers()
+        webView?.onResume()
+    }
+
     override fun onResume() {
         super.onResume()
+        if (isFinishing || !::preferences.isInitialized) return
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
             if (!isInPictureInPictureMode) {
                 pipModeState.value = false
@@ -1831,12 +1944,16 @@ class MainActivity : ComponentActivity() {
             }
         }
         webView?.onResume()
-        resumeLiveStreamOnScreenOn()
+        if (wasStoppedInBackground) {
+            wasStoppedInBackground = false
+            resumeLiveStreamOnScreenOn()
+        }
         checkAndPerformAutoCacheCleanup()
     }
 
     override fun onPause() {
         super.onPause()
+        if (isFinishing) return
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N && isInPictureInPictureMode) {
             // 画中画模式保持活动运行，绝不挂起 WebView，避免视频黑屏与音频中断
         } else {
@@ -1844,13 +1961,36 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    override fun onDestroy() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            audioFocusRequest?.let { audioManager?.abandonAudioFocusRequest(it) }
-        } else {
-            @Suppress("DEPRECATION")
-            audioManager?.abandonAudioFocus(null)
+    override fun onStop() {
+        super.onStop()
+        if (isFinishing) return
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N && isInPictureInPictureMode) {
+            // 画中画期间维持视频与音频调度，不冻结 JS 定时器
+            return
         }
+        wasStoppedInBackground = true
+        updateKeepScreenOn(false)
+        abandonAppAudioFocus()
+        webView?.evaluateJavascript(
+            "(function(){var v=document.getElementById('video')||document.querySelector('video');if(v&&!v.paused){window.__sysPausedForBg=true;v.pause();}})();",
+            null
+        )
+        webView?.pauseTimers()
+    }
+
+    @Suppress("DEPRECATION")
+    override fun onTrimMemory(level: Int) {
+        super.onTrimMemory(level)
+        if (level >= ComponentCallbacks2.TRIM_MEMORY_UI_HIDDEN ||
+            level >= ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW
+        ) {
+            // 仅清理内存解码缓存，保留磁盘 HTTP 缓存避免唤醒无线电重拉
+            webView?.clearCache(false)
+        }
+    }
+
+    override fun onDestroy() {
+        abandonAppAudioFocus()
         webView?.let { wv ->
             wv.removeCallbacks(null)
             wv.stopLoading()

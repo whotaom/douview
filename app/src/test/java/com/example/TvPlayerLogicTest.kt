@@ -2,6 +2,7 @@ package com.example
 
 import android.content.Context
 import android.content.pm.PackageManager
+import android.graphics.Rect
 import android.graphics.drawable.GradientDrawable
 import android.view.KeyEvent
 import android.view.View
@@ -16,6 +17,8 @@ import com.example.util.UpdateManager
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNotSame
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -231,5 +234,74 @@ class TvPlayerLogicTest {
         assertEquals("1002", selectedRid)
         overlay.hide()
         assertFalse(overlay.isShowing)
+    }
+
+    @Test
+    fun `fast zap buffer tuning and prefetch candidate selection behave deterministically`() {
+        assertTrue(TvFullscreenPlayerActivity.FAST_ZAP_PLAYBACK_BUFFER_MS <= 1000)
+        assertTrue(TvFullscreenPlayerActivity.FAST_ZAP_MIN_BUFFER_MS < TvFullscreenPlayerActivity.FAST_ZAP_MAX_BUFFER_MS)
+        assertTrue(TvFullscreenPlayerActivity.FAST_ZAP_MAX_BUFFER_MS <= 20_000)
+
+        val list = listOf(
+            Channel(rid = "101", name = "A", isLive = true, statusKnown = true),
+            Channel(rid = "102", name = "Offline", isLive = false, statusKnown = true),
+            Channel(rid = "103", name = "B", isLive = true, statusKnown = true),
+            Channel(rid = "104", name = "Unknown", isLive = false, statusKnown = false),
+            Channel(rid = "105", name = "C", isLive = true, statusKnown = true)
+        )
+
+        // From index 0 ("101"), skip known-offline "102", pick "103" and "104"
+        assertEquals(
+            listOf("103", "104"),
+            TvFullscreenPlayerActivity.selectPrefetchRids(list, currentIndex = 0)
+        )
+        // Wrap around from index 4 ("105") back to "101", skipping "102" -> pick "101" and "103"
+        assertEquals(
+            listOf("101", "103"),
+            TvFullscreenPlayerActivity.selectPrefetchRids(list, currentIndex = 4)
+        )
+        assertTrue(TvFullscreenPlayerActivity.selectPrefetchRids(list.take(1), 0).isEmpty())
+    }
+
+    @Test
+    fun `tv channel menu overlay memoizes unchanged rows to eliminate reopen inflation`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val overlay = TvChannelMenuOverlay(
+            context = context,
+            onChannelSelected = {},
+            onDismissRequested = {}
+        )
+        val channels = listOf(
+            Channel(rid = "1001", name = "频道1", isLive = true, statusKnown = true),
+            Channel(rid = "1002", name = "频道2", isLive = true, statusKnown = true)
+        )
+
+        overlay.show(channels, currentRid = "1001")
+        val firstRowInitial = overlay.rootScrim.findViewWithTag<View>("1001")
+        assertNotNull(firstRowInitial)
+        overlay.hide()
+
+        // Re-opening with identical channels and currentRid should reuse the exact same child view instance
+        overlay.show(channels, currentRid = "1001")
+        val firstRowReopened = overlay.rootScrim.findViewWithTag<View>("1001")
+        assertSame(firstRowInitial, firstRowReopened)
+
+        // Changing currentRid must update rows cleanly
+        overlay.hide()
+        overlay.show(channels, currentRid = "1002")
+        val firstRowUpdated = overlay.rootScrim.findViewWithTag<View>("1001")
+        assertNotSame(firstRowInitial, firstRowUpdated)
+    }
+
+    @Test
+    fun `hasPipParamsChanged skips duplicate IPC updates when ratio and bounds are identical`() {
+        val r1 = Rect(0, 100, 540, 1060)
+        val r2 = Rect(0, 100, 540, 1060)
+        val r3 = Rect(0, 120, 540, 1080)
+
+        assertTrue(MainActivity.hasPipParamsChanged(null, null, newPortrait = true, newRect = r1))
+        assertFalse(MainActivity.hasPipParamsChanged(true, r1, newPortrait = true, newRect = r2))
+        assertTrue(MainActivity.hasPipParamsChanged(true, r1, newPortrait = false, newRect = r2))
+        assertTrue(MainActivity.hasPipParamsChanged(true, r1, newPortrait = true, newRect = r3))
     }
 }

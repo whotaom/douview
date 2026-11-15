@@ -161,4 +161,20 @@ class ChannelProbeTest {
         val fileResult = manager.remoteImport("file:///sdcard/channels.json")
         assertTrue(fileResult.isFailure)
     }
+
+    @Test
+    fun `channel manager reuses in-memory cache across instances sharing prefs`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val managerA = ChannelManager(context)
+        val sample = listOf(
+            Channel("127453393722", "央视网快看", "新闻直播", isLive = true, statusKnown = true),
+            Channel("232551178364", "电影频道", "电影", isLive = false, statusKnown = true)
+        )
+        managerA.saveChannels(sample)
+
+        // Saving identical list should keep data consistent and second manager hits cache seamlessly
+        managerA.saveChannels(sample)
+        val managerB = ChannelManager(context)
+        assertEquals(sample, managerB.loadChannels())
+    }
 }

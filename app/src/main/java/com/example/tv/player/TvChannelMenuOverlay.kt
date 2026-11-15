@@ -46,6 +46,9 @@ internal class TvChannelMenuOverlay(
     var isShowing: Boolean = false
         private set
 
+    private var lastSignature: String = ""
+    private var lastFocusedRid: String? = null
+
     init {
         val screenW = context.resources.displayMetrics.widthPixels
         val safeMaxDrawerWidth = (screenW - 96.dp()).coerceAtLeast(280.dp())
@@ -238,6 +241,27 @@ internal class TvChannelMenuOverlay(
         currentRid: String?,
         focusTargetRid: String?
     ) {
+        val sig = buildString(onlineChannels.size * 24) {
+            append(currentRid.orEmpty())
+            append('|')
+            onlineChannels.forEach {
+                append(it.rid).append(':').append(it.name).append(':').append(it.title).append(';')
+            }
+        }
+
+        if (sig == lastSignature && channelListContainer.childCount == onlineChannels.size) {
+            val targetView = focusTargetRid?.let { rid ->
+                channelListContainer.findViewWithTag<View>(rid)
+            } ?: channelListContainer.getChildAt(0)
+            targetView?.post {
+                targetView.requestFocus()
+                val scrollY = (targetView.top - listScrollView.height / 3).coerceAtLeast(0)
+                listScrollView.smoothScrollTo(0, scrollY)
+            }
+            return
+        }
+        lastSignature = sig
+
         subtitleView.text = "${onlineChannels.size} 个主播正在直播"
         channelListContainer.removeAllViews()
 
@@ -455,7 +479,7 @@ internal class TvChannelMenuOverlay(
         }
     }
 
-    /** 频道圆形头像微标（按 rid 生成稳定配色 + 首字缩写 + 左下直播绿点） */
+    /** 频道圆形头像微标（按 rid 生成稳定配色 + 首字缩写 + 共享 Paint 减少内存分配） */
     private class ChannelAvatarBadgeView(
         context: Context,
         rid: String,
@@ -470,28 +494,26 @@ internal class TvChannelMenuOverlay(
                 Color.parseColor("#FF335482"),
                 Color.parseColor("#FF6E3554")
             )
+            private val SHARED_TEXT_PAINT = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.WHITE
+                typeface = Typeface.DEFAULT_BOLD
+                textAlign = Paint.Align.CENTER
+            }
+            private val SHARED_DOT_BORDER_PAINT = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.parseColor("#FF141822")
+            }
+            private val SHARED_DOT_PAINT = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.parseColor("#FF25E69B")
+            }
+            private val SHARED_RING_PAINT = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                style = Paint.Style.STROKE
+                color = Color.parseColor("#66FFFFFF")
+            }
         }
 
         private val bgColor = AVATAR_COLORS[abs(rid.hashCode()) % AVATAR_COLORS.size]
         private val initialChar = name.trim().firstOrNull()?.uppercaseChar()?.toString() ?: "直"
-
         private val circlePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = bgColor }
-        private val ringPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            style = Paint.Style.STROKE
-            strokeWidth = 1.4f * resources.displayMetrics.density
-            color = Color.parseColor("#66FFFFFF")
-        }
-        private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.WHITE
-            typeface = Typeface.DEFAULT_BOLD
-            textAlign = Paint.Align.CENTER
-        }
-        private val dotBorderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.parseColor("#FF141822")
-        }
-        private val dotPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.parseColor("#FF25E69B")
-        }
 
         override fun onDraw(canvas: Canvas) {
             super.onDraw(canvas)
@@ -500,18 +522,19 @@ internal class TvChannelMenuOverlay(
             val cy = height / 2f
             val radius = (minOf(width, height) / 2f) - 2f * d
             canvas.drawCircle(cx, cy, radius, circlePaint)
-            canvas.drawCircle(cx, cy, radius, ringPaint)
+            SHARED_RING_PAINT.strokeWidth = 1.4f * d
+            canvas.drawCircle(cx, cy, radius, SHARED_RING_PAINT)
 
-            textPaint.textSize = radius * 0.92f
-            val fm = textPaint.fontMetrics
+            SHARED_TEXT_PAINT.textSize = radius * 0.92f
+            val fm = SHARED_TEXT_PAINT.fontMetrics
             val textY = cy - (fm.ascent + fm.descent) / 2f
-            canvas.drawText(initialChar, cx, textY, textPaint)
+            canvas.drawText(initialChar, cx, textY, SHARED_TEXT_PAINT)
 
             val dotR = 4.2f * d
             val dotX = width - dotR - 1.5f * d
             val dotY = height - dotR - 1.5f * d
-            canvas.drawCircle(dotX, dotY, dotR + 1.5f * d, dotBorderPaint)
-            canvas.drawCircle(dotX, dotY, dotR, dotPaint)
+            canvas.drawCircle(dotX, dotY, dotR + 1.5f * d, SHARED_DOT_BORDER_PAINT)
+            canvas.drawCircle(dotX, dotY, dotR, SHARED_DOT_PAINT)
         }
     }
 }

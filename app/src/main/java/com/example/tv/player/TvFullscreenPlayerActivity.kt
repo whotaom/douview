@@ -1,5 +1,6 @@
 package com.example.tv.player
 
+import android.content.ComponentCallbacks2
 import android.content.Intent
 import android.graphics.Color
 import android.net.Uri
@@ -86,6 +87,34 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         val streamCacheTime = mutableMapOf<String, Long>()
         const val CACHE_TTL = 5 * 60 * 1000L
         const val MAX_STREAM_CACHE_SIZE = 64
+
+        // TV 极速切台缓冲参数：首帧秒开同时限制内存高位（适配 RK3528 等 32 位盒子）
+        const val FAST_ZAP_MIN_BUFFER_MS = 6_000
+        const val FAST_ZAP_MAX_BUFFER_MS = 18_000
+        const val FAST_ZAP_PLAYBACK_BUFFER_MS = 800
+        const val FAST_ZAP_REBUFFER_MS = 2_000
+        private const val PREFETCH_CANDIDATE_COUNT = 2
+
+        fun selectPrefetchRids(
+            channels: List<Channel>,
+            currentIndex: Int,
+            limit: Int = PREFETCH_CANDIDATE_COUNT
+        ): List<String> {
+            if (channels.size <= 1 || currentIndex !in channels.indices || limit <= 0) return emptyList()
+            val currentRid = channels[currentIndex].rid
+            val result = ArrayList<String>(limit)
+            for (offset in 1 until channels.size) {
+                val idx = (currentIndex + offset) % channels.size
+                val ch = channels[idx]
+                if (ch.rid == currentRid || ch.rid.isBlank()) continue
+                if (ch.statusKnown && !ch.isLive) continue
+                if (ch.rid !in result) {
+                    result.add(ch.rid)
+                    if (result.size >= limit) break
+                }
+            }
+            return result
+        }
 
         fun putStreamCache(
             rid: String,
@@ -263,6 +292,7 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
     // 单飞 Job、防竞态、自动跳台防死循环
     private var switchJob: Job? = null
     private var probeJob: Job? = null
+    private var prefetchJob: Job? = null
     private var switchGen = 0L
     private var lastSwitchAt = 0L
     private val SWITCH_MIN_INTERVAL = 250L
@@ -284,6 +314,54 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
     }
 
     private val okHttpClient get() = NetworkClient.fastOkHttpClient
+    private val darkBgColor = Color.parseColor("#09090C")
+
+    // 复用不可变播放器组件，避免每次换台重复分配大对象与缓冲池
+    private val bandwidthMeter by lazy(LazyThreadSafetyMode.NONE) {
+        DefaultBandwidthMeter.getSingletonInstance(applicationContext)
+    }
+
+    @get:OptIn(UnstableApi::class)
+    private val sharedHttpDataSourceFactory by lazy(LazyThreadSafetyMode.NONE) {
+        DefaultHttpDataSource.Factory()
+            .setUserAgent(TV_UA)
+            .setAllowCrossProtocolRedirects(true)
+            .setConnectTimeoutMs(10_000)
+            .setReadTimeoutMs(12_000)
+    }
+
+    @get:OptIn(UnstableApi::class)
+    private val sharedMediaSourceFactory by lazy(LazyThreadSafetyMode.NONE) {
+        DefaultMediaSourceFactory(this).setDataSourceFactory(sharedHttpDataSourceFactory)
+    }
+
+    @get:OptIn(UnstableApi::class)
+    private val sharedLoadControl by lazy(LazyThreadSafetyMode.NONE) {
+        DefaultLoadControl.Builder()
+            .setBufferDurationsMs(
+                FAST_ZAP_MIN_BUFFER_MS,
+                FAST_ZAP_MAX_BUFFER_MS,
+                FAST_ZAP_PLAYBACK_BUFFER_MS,
+                FAST_ZAP_REBUFFER_MS
+            )
+            .setPrioritizeTimeOverSizeThresholds(true)
+            .build()
+    }
+
+    private val sharedAudioAttributes by lazy(LazyThreadSafetyMode.NONE) {
+        AudioAttributes.Builder()
+            .setUsage(C.USAGE_MEDIA)
+            .setContentType(C.AUDIO_CONTENT_TYPE_MOVIE)
+            .build()
+    }
+
+    @get:OptIn(UnstableApi::class)
+    private val sharedLiveSpeedControl by lazy(LazyThreadSafetyMode.NONE) {
+        DefaultLivePlaybackSpeedControl.Builder()
+            .setFallbackMinPlaybackSpeed(0.97f)
+            .setFallbackMaxPlaybackSpeed(1.03f)
+            .build()
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -335,7 +413,6 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         btnNextChannel = findViewById(R.id.btnNextChannel)
         btnExitPlayer = findViewById(R.id.btnExitPlayer)
 
-        val darkBgColor = Color.parseColor("#09090C")
         root.setBackgroundColor(darkBgColor)
 
         playerView.useController = false
@@ -500,7 +577,8 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         probeJob = lifecycleScope.launch {
             val outcome = channelManager.probeLiveStatus(base, playList)
             if (!isActive || outcome.networkFailed) return@launch
-            val playingRid = playList.getOrNull(currentIndex)?.rid
+            val previousList = playList
+            val playingRid = previousList.getOrNull(currentIndex)?.rid
             val sorted = outcome.channels.sortedWith(
                 compareBy { if (it.isLive) 0 else if (!it.statusKnown) 1 else 2 }
             )
@@ -511,7 +589,9 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
                     currentIndex = syncedIdx
                 }
             }
-            channelManager.saveChannels(sorted)
+            if (sorted != previousList) {
+                channelManager.saveChannels(sorted)
+            }
             if (isMenuShowing) {
                 channelMenuOverlay.refreshIfShowing(
                     onlineChannels = sorted.filter { it.isLive },
@@ -545,6 +625,7 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         }
 
         switchJob?.cancel()
+        prefetchJob?.cancel()
         releasePreparing()
         cancelBufferingTimeout()
 
@@ -661,38 +742,19 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
             setEnableDecoderFallback(true)
             setMediaCodecSelector(buildMediaCodecSelector(preferSoftwareDecoder))
         }
-        val loadControl = DefaultLoadControl.Builder()
-            .setBufferDurationsMs(10_000, 25_000, 1_500, 4_000)
-            .build()
         val trackSelector = DefaultTrackSelector(this).apply {
             parameters = buildUponParameters()
                 .setTunnelingEnabled(false)
                 .setAllowVideoMixedMimeTypeAdaptiveness(true)
                 .build()
         }
-        val dataSourceFactory = DefaultHttpDataSource.Factory()
-            .setUserAgent(TV_UA)
-            .setAllowCrossProtocolRedirects(true)
-            .setConnectTimeoutMs(12_000)
-            .setReadTimeoutMs(15_000)
-        val mediaSourceFactory = DefaultMediaSourceFactory(this).setDataSourceFactory(dataSourceFactory)
-
-        val audioAttributes = AudioAttributes.Builder()
-            .setUsage(C.USAGE_MEDIA)
-            .setContentType(C.AUDIO_CONTENT_TYPE_MOVIE)
-            .build()
-
-        val liveSpeedControl = DefaultLivePlaybackSpeedControl.Builder()
-            .setFallbackMinPlaybackSpeed(0.97f)
-            .setFallbackMaxPlaybackSpeed(1.03f)
-            .build()
 
         val next = ExoPlayer.Builder(this, renderersFactory)
             .setTrackSelector(trackSelector)
-            .setLoadControl(loadControl)
-            .setMediaSourceFactory(mediaSourceFactory)
-            .setLivePlaybackSpeedControl(liveSpeedControl)
-            .setAudioAttributes(audioAttributes, true)
+            .setLoadControl(sharedLoadControl)
+            .setMediaSourceFactory(sharedMediaSourceFactory)
+            .setLivePlaybackSpeedControl(sharedLiveSpeedControl)
+            .setAudioAttributes(sharedAudioAttributes, true)
             .setWakeMode(C.WAKE_MODE_NETWORK)
             .build()
 
@@ -767,6 +829,7 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
                         tipView.removeCallbacks(hideTipRunnable)
                         tipView.postDelayed(hideTipRunnable, 600)
                     }
+                    prefetchNextChannelQualities()
                 }
             }
 
@@ -877,7 +940,6 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
 
     private fun updatePortraitBackdropForVideoSize(videoSize: VideoSize?) {
         if (!::portraitBackdropView.isInitialized || !::playerView.isInitialized) return
-        val darkBgColor = Color.parseColor("#09090C")
         val isPortrait = videoSize != null &&
             PortraitAmbientBackdropView.isPortraitVideo(
                 videoSize.width,
@@ -891,6 +953,32 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         } else {
             portraitBackdropView.setBackdropActive(false)
             playerView.setBackgroundColor(darkBgColor)
+        }
+    }
+
+    /**
+     * 首帧出画后在后台静默预热相邻 2 个在线频道的清晰度流地址，消除下次 CH+/CH- 切台的 API 等待
+     */
+    private fun prefetchNextChannelQualities() {
+        val candidates = selectPrefetchRids(playList, currentIndex)
+        if (candidates.isEmpty()) return
+        val base = activeBaseUrl()
+        val gen = switchGen
+        prefetchJob?.cancel()
+        prefetchJob = lifecycleScope.launch(Dispatchers.IO) {
+            val now = System.currentTimeMillis()
+            for (rid in candidates) {
+                if (!isActive || gen != switchGen) return@launch
+                val cached = streamCache[rid]
+                val cachedAt = streamCacheTime[rid] ?: 0L
+                if (cached != null && now - cachedAt < CACHE_TTL && cached.isNotEmpty()) {
+                    continue
+                }
+                val fetched = fetchQualities(base, rid)
+                if (fetched.isNotEmpty()) {
+                    putStreamCache(rid, fetched)
+                }
+            }
         }
     }
 
@@ -1112,7 +1200,7 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         val vf = p?.videoFormat
         val af = p?.audioFormat
         val formatBitrate = vf?.bitrate?.takeIf { it > 0 } ?: vf?.averageBitrate?.takeIf { it > 0 }
-        val estBitrate = DefaultBandwidthMeter.getSingletonInstance(applicationContext).bitrateEstimate.takeIf { it > 0 }
+        val estBitrate = bandwidthMeter.bitrateEstimate.takeIf { it > 0 }
         val kbps = (formatBitrate?.toLong() ?: estBitrate ?: 0L) / 1000L
         val (curQuality, _) = qualityList.getOrNull(qualityIndex) ?: ("默认" to "")
 
@@ -1378,6 +1466,7 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
     private fun releaseAll() {
         switchJob?.cancel()
         probeJob?.cancel()
+        prefetchJob?.cancel()
         cancelFirstFrameWatchdog()
         switchGen++
         hideMenu()
@@ -1388,8 +1477,24 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         releasePlayerOnly()
     }
 
+    @Suppress("DEPRECATION")
+    override fun onTrimMemory(level: Int) {
+        super.onTrimMemory(level)
+        if (level >= ComponentCallbacks2.TRIM_MEMORY_UI_HIDDEN ||
+            level >= ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW
+        ) {
+            releasePreparing()
+        }
+        if (level >= ComponentCallbacks2.TRIM_MEMORY_BACKGROUND ||
+            level >= ComponentCallbacks2.TRIM_MEMORY_RUNNING_CRITICAL
+        ) {
+            clearStreamCache()
+        }
+    }
+
     override fun onStop() {
         super.onStop()
+        prefetchJob?.cancel()
         mainHandler.removeCallbacks(infoRefreshRunnable)
         cancelFirstFrameWatchdog()
         if (::portraitBackdropView.isInitialized) {

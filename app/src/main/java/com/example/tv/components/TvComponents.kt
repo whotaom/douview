@@ -152,10 +152,16 @@ fun TvFocusableCard(
         modifier = modifier
             .minimumInteractiveComponentSize()
             .scale(scale)
-            .shadow(
-                elevation = if (isFocused) 16.dp else 2.dp,
-                shape = RoundedCornerShape(14.dp),
-                spotColor = if (isFocused) focusedBorderColor else Color.Transparent
+            .then(
+                if (isFocused) {
+                    Modifier.shadow(
+                        elevation = 14.dp,
+                        shape = RoundedCornerShape(14.dp),
+                        spotColor = focusedBorderColor
+                    )
+                } else {
+                    Modifier
+                }
             )
             .tvInteractive(
                 onClick = onClick,
@@ -274,15 +280,10 @@ fun TvActionButton(
             if (isFocused) 2.5.dp else 1.dp,
             if (isFocused) DouyinCyan else DarkSurfaceBorder
         ),
-        shadowElevation = if (isFocused) 12.dp else 0.dp,
+        shadowElevation = if (isFocused) 10.dp else 0.dp,
         modifier = modifier
             .minimumInteractiveComponentSize()
             .scale(scale)
-            .shadow(
-                elevation = if (isFocused) 14.dp else 0.dp,
-                shape = RoundedCornerShape(10.dp),
-                spotColor = if (isFocused) DouyinCyan else Color.Transparent
-            )
             .tvInteractive(
                 onClick = onClick,
                 focusRequester = focusRequester,
