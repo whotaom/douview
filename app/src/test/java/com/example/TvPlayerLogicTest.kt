@@ -7,6 +7,8 @@ import android.graphics.drawable.GradientDrawable
 import android.view.KeyEvent
 import android.view.View
 import androidx.core.content.ContextCompat
+import androidx.media3.exoplayer.DefaultLoadControl
+import androidx.media3.exoplayer.analytics.PlayerId
 import androidx.test.core.app.ApplicationProvider
 import com.example.tv.channel.Channel
 import com.example.tv.player.PortraitAmbientBackdropView
@@ -14,10 +16,14 @@ import com.example.tv.player.TvChannelMenuOverlay
 import com.example.tv.player.TvFullscreenPlayerActivity
 import com.example.tv.player.TvFullscreenPlayerActivity.Companion.RemoteAction
 import com.example.util.UpdateManager
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNotSame
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -303,5 +309,122 @@ class TvPlayerLogicTest {
         assertFalse(MainActivity.hasPipParamsChanged(true, r1, newPortrait = true, newRect = r2))
         assertTrue(MainActivity.hasPipParamsChanged(true, r1, newPortrait = false, newRect = r2))
         assertTrue(MainActivity.hasPipParamsChanged(true, r1, newPortrait = true, newRect = r3))
+    }
+
+    @Test
+    @Suppress("DEPRECATION")
+    fun `separate DefaultLoadControl instances allow concurrent prepare-then-swap on distinct playback threads`() {
+        val shared = DefaultLoadControl.Builder()
+            .setBufferDurationsMs(
+                TvFullscreenPlayerActivity.FAST_ZAP_MIN_BUFFER_MS,
+                TvFullscreenPlayerActivity.FAST_ZAP_MAX_BUFFER_MS,
+                TvFullscreenPlayerActivity.FAST_ZAP_PLAYBACK_BUFFER_MS,
+                TvFullscreenPlayerActivity.FAST_ZAP_REBUFFER_MS
+            )
+            .build()
+
+        // Confirm Media3 1.5.1 fails if the same DefaultLoadControl is prepared on two distinct playback threads
+        val sharedFailure = AtomicReference<Throwable?>(null)
+        val latch1 = CountDownLatch(1)
+        val t1 = Thread {
+            try {
+                shared.onPrepared(PlayerId(android.media.metrics.LogSessionId.LOG_SESSION_ID_NONE, "player-1"))
+            } catch (t: Throwable) {
+                sharedFailure.set(t)
+            } finally {
+                latch1.countDown()
+            }
+        }
+        t1.start()
+        assertTrue(latch1.await(3, TimeUnit.SECONDS))
+        assertNull("First prepare on thread 1 unexpectedly failed: ${sharedFailure.get()}", sharedFailure.get())
+
+        val latch2 = CountDownLatch(1)
+        val t2 = Thread {
+            try {
+                shared.onPrepared(PlayerId(android.media.metrics.LogSessionId.LOG_SESSION_ID_NONE, "player-2"))
+            } catch (t: Throwable) {
+                sharedFailure.set(t)
+            } finally {
+                latch2.countDown()
+            }
+        }
+        t2.start()
+        assertTrue(latch2.await(3, TimeUnit.SECONDS))
+        assertTrue(
+            "Expected IllegalStateException when sharing DefaultLoadControl across playback threads",
+            sharedFailure.get() is IllegalStateException
+        )
+        assertTrue(
+            sharedFailure.get()?.message?.contains("share the same LoadControl") == true
+        )
+
+        // Separate per-player DefaultLoadControl instances succeed cleanly across distinct threads
+        val perPlayerA = DefaultLoadControl.Builder()
+            .setBufferDurationsMs(
+                TvFullscreenPlayerActivity.FAST_ZAP_MIN_BUFFER_MS,
+                TvFullscreenPlayerActivity.FAST_ZAP_MAX_BUFFER_MS,
+                TvFullscreenPlayerActivity.FAST_ZAP_PLAYBACK_BUFFER_MS,
+                TvFullscreenPlayerActivity.FAST_ZAP_REBUFFER_MS
+            )
+            .build()
+        val perPlayerB = DefaultLoadControl.Builder()
+            .setBufferDurationsMs(
+                TvFullscreenPlayerActivity.FAST_ZAP_MIN_BUFFER_MS,
+                TvFullscreenPlayerActivity.FAST_ZAP_MAX_BUFFER_MS,
+                TvFullscreenPlayerActivity.FAST_ZAP_PLAYBACK_BUFFER_MS,
+                TvFullscreenPlayerActivity.FAST_ZAP_REBUFFER_MS
+            )
+            .build()
+        assertNotSame(perPlayerA, perPlayerB)
+
+        val isolatedError = AtomicReference<Throwable?>(null)
+        val latchIso = CountDownLatch(2)
+        Thread {
+            try {
+                perPlayerA.onPrepared(PlayerId(android.media.metrics.LogSessionId.LOG_SESSION_ID_NONE, "isolated-1"))
+            } catch (t: Throwable) {
+                isolatedError.set(t)
+            } finally {
+                latchIso.countDown()
+            }
+        }.start()
+        Thread {
+            try {
+                perPlayerB.onPrepared(PlayerId(android.media.metrics.LogSessionId.LOG_SESSION_ID_NONE, "isolated-2"))
+            } catch (t: Throwable) {
+                isolatedError.set(t)
+            } finally {
+                latchIso.countDown()
+            }
+        }.start()
+        assertTrue(latchIso.await(3, TimeUnit.SECONDS))
+        assertNull("Isolated per-player LoadControls should succeed across threads: ${isolatedError.get()}", isolatedError.get())
+    }
+
+    @Test
+    fun `tv channel menu overlay currentFocusedRid resolves fallback immediately when showing and null when hidden`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val overlay = TvChannelMenuOverlay(
+            context = context,
+            onChannelSelected = {},
+            onDismissRequested = {}
+        )
+        assertNull(overlay.currentFocusedRid())
+
+        val channels = listOf(
+            Channel(rid = "1001", name = "频道1", isLive = true, statusKnown = true),
+            Channel(rid = "1002", name = "频道2", isLive = true, statusKnown = true)
+        )
+        overlay.show(channels, currentRid = "1002")
+        assertEquals("1002", overlay.currentFocusedRid())
+
+        overlay.hide()
+        assertNull(overlay.currentFocusedRid())
+
+        // Reopen with memoized fast-path targeting 1001
+        overlay.show(channels, currentRid = "1001")
+        assertEquals("1001", overlay.currentFocusedRid())
+        assertEquals(120_000L, TvFullscreenPlayerActivity.CACHE_TTL)
     }
 }

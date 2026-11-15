@@ -64,7 +64,7 @@ import org.json.JSONObject
  * 电视大屏全屏直播播放器（极简高稳单个 SurfaceView PlayerView 架构）
  * 1. 仅使用单个原生 SurfaceView PlayerView（RESIZE_MODE_FIT + 纯暗底），零动态背景采样/合成开销，硬件直出稳防黑屏
  * 2. 「先备后切」(prepare-then-swap)：冷启动直绑 Surface；切台后台静默缓冲至 READY 再瞬切并立即释放旧解码器
- * 3. 硬件解码首帧超时（4.5s）或解码异常自动切软件兼容解码；支持直播窗口落后（BEHIND_LIVE_WINDOW）无缝回拉直播前沿
+ * 3. 硬件解码首帧超时（7.5s）或解码异常自动切软件兼容解码；支持直播窗口落后（BEHIND_LIVE_WINDOW）无缝回拉直播前沿
  * 4. 菜单仅展示在线频道并带实时在线台数「在线频道（N）」；OK 键技术参数面板 1 秒实时刷新
  */
 class TvFullscreenPlayerActivity : ComponentActivity() {
@@ -73,7 +73,7 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         const val DEFAULT_BASE_URL = StreamLines.LINE_1
         private const val TAG = "TVPlayer"
         private const val TV_UA = ChannelManager.TV_UA
-        private const val FIRST_FRAME_WATCHDOG_MS = 4_500L
+        private const val FIRST_FRAME_WATCHDOG_MS = 7_500L
 
         const val EXTRA_URL = "extra_url"
         const val EXTRA_RID = "extra_rid"
@@ -82,10 +82,10 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         const val EXTRA_LINE = "extra_line"
         const val EXTRA_TITLE = "extra_title"
 
-        // 全局静态流缓存 (rid -> 清晰度列表)，支持 5 分钟有效时间与容量上限（防止长期挂机无限增长）
+        // 全局静态流缓存 (rid -> 清晰度列表)，控制 2 分钟短时效（防拉流令牌过期）与容量上限
         val streamCache = mutableMapOf<String, List<Pair<String, String>>>()
         val streamCacheTime = mutableMapOf<String, Long>()
-        const val CACHE_TTL = 5 * 60 * 1000L
+        const val CACHE_TTL = 2 * 60 * 1000L
         const val MAX_STREAM_CACHE_SIZE = 64
 
         // TV 极速切台缓冲参数：首帧秒开同时限制内存高位（适配 RK3528 等 32 位盒子）
@@ -276,9 +276,12 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
     private var isInfoShowing = false
     private var wasStoppedInBackground = false
 
-    // 解码自愈状态
+    // 解码与自愈状态
     private var hasRenderedFirstFrameForCurrent: Boolean = false
     private var preferSoftwareDecoderForCurrent: Boolean = false
+    private var releasedOldForSingleVpuFallback: Boolean = false
+    private var currentQualitiesFromCache: Boolean = false
+    private var explicitUserPickRid: String? = null
     private var activeStreamUrl: String = ""
     private var activeChannelName: String = ""
     private var firstFrameWatchdogRunnable: Runnable? = null
@@ -292,7 +295,6 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
     // 单飞 Job、防竞态、自动跳台防死循环
     private var switchJob: Job? = null
     private var probeJob: Job? = null
-    private var prefetchJob: Job? = null
     private var switchGen = 0L
     private var lastSwitchAt = 0L
     private val SWITCH_MIN_INTERVAL = 250L
@@ -316,7 +318,7 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
     private val okHttpClient get() = NetworkClient.fastOkHttpClient
     private val darkBgColor = Color.parseColor("#09090C")
 
-    // 复用不可变播放器组件，避免每次换台重复分配大对象与缓冲池
+    // 仅复用严格无状态/进程级线程安全的组件；LoadControl 与 LivePlaybackSpeedControl 必须每个 ExoPlayer 独立创建
     private val bandwidthMeter by lazy(LazyThreadSafetyMode.NONE) {
         DefaultBandwidthMeter.getSingletonInstance(applicationContext)
     }
@@ -330,14 +332,16 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
             .setReadTimeoutMs(12_000)
     }
 
-    @get:OptIn(UnstableApi::class)
-    private val sharedMediaSourceFactory by lazy(LazyThreadSafetyMode.NONE) {
-        DefaultMediaSourceFactory(this).setDataSourceFactory(sharedHttpDataSourceFactory)
+    private val sharedAudioAttributes by lazy(LazyThreadSafetyMode.NONE) {
+        AudioAttributes.Builder()
+            .setUsage(C.USAGE_MEDIA)
+            .setContentType(C.AUDIO_CONTENT_TYPE_MOVIE)
+            .build()
     }
 
-    @get:OptIn(UnstableApi::class)
-    private val sharedLoadControl by lazy(LazyThreadSafetyMode.NONE) {
-        DefaultLoadControl.Builder()
+    @OptIn(UnstableApi::class)
+    fun buildFastZapLoadControl(): DefaultLoadControl {
+        return DefaultLoadControl.Builder()
             .setBufferDurationsMs(
                 FAST_ZAP_MIN_BUFFER_MS,
                 FAST_ZAP_MAX_BUFFER_MS,
@@ -348,16 +352,9 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
             .build()
     }
 
-    private val sharedAudioAttributes by lazy(LazyThreadSafetyMode.NONE) {
-        AudioAttributes.Builder()
-            .setUsage(C.USAGE_MEDIA)
-            .setContentType(C.AUDIO_CONTENT_TYPE_MOVIE)
-            .build()
-    }
-
-    @get:OptIn(UnstableApi::class)
-    private val sharedLiveSpeedControl by lazy(LazyThreadSafetyMode.NONE) {
-        DefaultLivePlaybackSpeedControl.Builder()
+    @OptIn(UnstableApi::class)
+    private fun buildLiveSpeedControl(): DefaultLivePlaybackSpeedControl {
+        return DefaultLivePlaybackSpeedControl.Builder()
             .setFallbackMinPlaybackSpeed(0.97f)
             .setFallbackMaxPlaybackSpeed(1.03f)
             .build()
@@ -384,6 +381,10 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         setIntent(intent)
         failedRidsThisRound.clear()
         preferSoftwareDecoderForCurrent = false
+        releasedOldForSingleVpuFallback = false
+        hideMenu()
+        hideLiveInfo()
+        hideErrorOverlay()
         setupPlayListAndStart()
     }
 
@@ -447,7 +448,7 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         btnRetryChannel.setOnClickListener {
             hideErrorOverlay()
             failedRidsThisRound.clear()
-            switchToChannel(currentIndex, force = true)
+            switchToChannel(currentIndex, force = true, allowOfflineAttempt = true)
         }
         btnNextChannel.setOnClickListener {
             hideErrorOverlay()
@@ -549,6 +550,7 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
             }
         }
 
+        explicitUserPickRid = targetRid
         if (!targetRid.isNullOrBlank()) {
             val existingIndex = sortedChannels.indexOfFirst { it.rid == targetRid }
             if (existingIndex >= 0) {
@@ -579,7 +581,14 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
             if (!isActive || outcome.networkFailed) return@launch
             val previousList = playList
             val playingRid = previousList.getOrNull(currentIndex)?.rid
-            val sorted = outcome.channels.sortedWith(
+            val corrected = outcome.channels.map { ch ->
+                if (ch.rid == playingRid && hasRenderedFirstFrameForCurrent && !ch.isLive) {
+                    ch.copy(isLive = true, statusKnown = true)
+                } else {
+                    ch
+                }
+            }
+            val sorted = corrected.sortedWith(
                 compareBy { if (it.isLive) 0 else if (!it.statusKnown) 1 else 2 }
             )
             playList = sorted
@@ -611,7 +620,8 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
     private fun switchToChannel(
         index: Int,
         force: Boolean = false,
-        fromAutoSkip: Boolean = false
+        fromAutoSkip: Boolean = false,
+        allowOfflineAttempt: Boolean = false
     ) {
         if (index !in playList.indices) return
         if (!force && index == currentIndex && player?.playbackState == Player.STATE_READY) return
@@ -625,38 +635,57 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         }
 
         switchJob?.cancel()
-        prefetchJob?.cancel()
         releasePreparing()
         cancelBufferingTimeout()
 
         val gen = ++switchGen
         currentIndex = index
         val channel = playList[index]
+        val isInitialExplicitPick = (explicitUserPickRid != null && explicitUserPickRid == channel.rid && !fromAutoSkip)
+        explicitUserPickRid = null
 
         hideLiveInfo()
         hideErrorOverlay()
 
-        // 明确已知离线的频道直接跳过到下一在线台（防死循环）
-        if (channel.statusKnown && !channel.isLive && !fromAutoSkip && playList.any { it.isLive }) {
+        // 明确已知离线的频道直接跳过到下一在线台（用户显式指定首播或手动重试当前台除外）
+        if (channel.statusKnown && !channel.isLive && !fromAutoSkip && !isInitialExplicitPick && !allowOfflineAttempt && playList.any { it.isLive }) {
             onChannelUnplayable("已离线")
             return
         }
 
         showBuffering("准备切换到：${channel.name}")
         preferSoftwareDecoderForCurrent = false
+        releasedOldForSingleVpuFallback = false
+        currentQualitiesFromCache = false
 
         val base = activeBaseUrl()
 
         switchJob = lifecycleScope.launch {
             try {
-                val list = withContext(Dispatchers.IO) {
-                    val cached = streamCache[channel.rid]
+                val cached = withContext(Dispatchers.IO) {
+                    val c = streamCache[channel.rid]
                     val t = streamCacheTime[channel.rid] ?: 0L
-                    if (cached != null && now - t < CACHE_TTL && cached.isNotEmpty()) {
-                        cached
-                    } else {
-                        fetchQualities(base, channel.rid).also { fetched ->
-                            putStreamCache(channel.rid, fetched)
+                    if (c != null && now - t < CACHE_TTL && c.isNotEmpty()) c else null
+                }
+
+                val list: List<Pair<String, String>>
+                if (cached != null) {
+                    currentQualitiesFromCache = true
+                    list = cached
+                } else {
+                    currentQualitiesFromCache = false
+                    when (val fetched = withContext(Dispatchers.IO) { fetchQualities(base, channel.rid) }) {
+                        is FetchQualitiesResult.Success -> {
+                            putStreamCache(channel.rid, fetched.streams)
+                            list = fetched.streams
+                        }
+                        is FetchQualitiesResult.NetworkError -> {
+                            if (gen != switchGen || !isActive) return@launch
+                            handleFetchNetworkError(channel.name, fetched.reason)
+                            return@launch
+                        }
+                        is FetchQualitiesResult.Unavailable -> {
+                            list = emptyList()
                         }
                     }
                 }
@@ -664,7 +693,7 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
                 if (gen != switchGen || !isActive) return@launch
 
                 if (list.isEmpty()) {
-                    onChannelUnplayable("无法播放")
+                    onChannelUnplayable("暂无流地址")
                     return@launch
                 }
 
@@ -678,6 +707,18 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
                     onChannelUnplayable("无法播放")
                 }
             }
+        }
+    }
+
+    private fun handleFetchNetworkError(channelName: String, detail: String) {
+        hideBuffering()
+        if (player != null) {
+            showTip("网络波动，切台「$channelName」失败（$detail）", autoHide = true)
+        } else {
+            showErrorOverlay(
+                title = "网络请求超时",
+                detail = "无法从服务节点获取「$channelName」直播流（$detail）。\n请检查网络连通性后重试或切换下一台。"
+            )
         }
     }
 
@@ -706,6 +747,8 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
 
         if (next == null) {
             hideBuffering()
+            releasePreparing()
+            releasePlayerOnly()
             showErrorOverlay(
                 title = "暂无可播放信号",
                 detail = "$name $reason，本轮全部候选频道均暂时不可用。\n可使用遥控器重试当前频道、尝试下一台或返回主页。"
@@ -751,9 +794,9 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
 
         val next = ExoPlayer.Builder(this, renderersFactory)
             .setTrackSelector(trackSelector)
-            .setLoadControl(sharedLoadControl)
-            .setMediaSourceFactory(sharedMediaSourceFactory)
-            .setLivePlaybackSpeedControl(sharedLiveSpeedControl)
+            .setLoadControl(buildFastZapLoadControl())
+            .setMediaSourceFactory(DefaultMediaSourceFactory(this).setDataSourceFactory(sharedHttpDataSourceFactory))
+            .setLivePlaybackSpeedControl(buildLiveSpeedControl())
             .setAudioAttributes(sharedAudioAttributes, true)
             .setWakeMode(C.WAKE_MODE_NETWORK)
             .build()
@@ -804,7 +847,11 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
                         cancelBufferingTimeout()
                         hideBuffering()
                         if (player === next) {
+                            releasePlayerOnly()
                             onChannelUnplayable("直播已结束")
+                        } else if (preparingPlayer === next) {
+                            releasePreparing()
+                            refreshStaleCacheOrSkip(gen, "直播已结束")
                         }
                     }
                 }
@@ -829,7 +876,6 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
                         tipView.removeCallbacks(hideTipRunnable)
                         tipView.postDelayed(hideTipRunnable, 600)
                     }
-                    prefetchNextChannelQualities()
                 }
             }
 
@@ -847,29 +893,43 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
                     return
                 }
 
-                if (!preferSoftwareDecoderForCurrent && isLikelyDecoderOrRenderError(error)) {
-                    retryWithSoftwareDecoder(gen, "解码器异常自动切软件兼容解码")
-                    return
+                val isPreparing = (preparingPlayer === next)
+                val isActivePlayer = (player === next)
+
+                if (isLikelyDecoderOrRenderError(error)) {
+                    if (isPreparing && !releasedOldForSingleVpuFallback) {
+                        // 单路 VPU / CMA 受限盒子：先释放旧播放器让出硬件解码槽位，优先尝试硬件直出
+                        releasedOldForSingleVpuFallback = true
+                        Log.w(TAG, "备播硬件初始化受阻，释放旧流让出 VPU 后重试硬解: channel=$name")
+                        releasePreparing()
+                        releasePlayerOnly()
+                        prepareThenSwap(gen, hls, name, preferSoftwareDecoder = false)
+                        return
+                    }
+                    if (!preferSoftwareDecoderForCurrent) {
+                        retryWithSoftwareDecoder(
+                            gen = gen,
+                            reason = "解码器异常自动切软件兼容解码",
+                            failedWasActivePlayer = isActivePlayer
+                        )
+                        return
+                    }
                 }
 
-                if (preparingPlayer === next) {
+                if (isPreparing) {
                     releasePreparing()
-                } else if (player === next) {
+                } else if (isActivePlayer) {
                     releasePlayerOnly()
                 }
 
-                // 自动降级尝试下一清晰度；若全部失败则触发自动切台
+                // 自动降级尝试下一清晰度；若来自过期缓存则强制刷新一次 live.php，再全部失败才触发自动切台
                 val nextQIdx = qualityIndex + 1
                 if (nextQIdx in qualityList.indices) {
                     qualityIndex = nextQIdx
                     preferSoftwareDecoderForCurrent = false
                     prepareThenSwap(gen, qualityList[nextQIdx].second, name, preferSoftwareDecoder = false)
                 } else {
-                    playList.getOrNull(currentIndex)?.rid?.let { rid ->
-                        streamCache.remove(rid)
-                        streamCacheTime.remove(rid)
-                    }
-                    onChannelUnplayable("无法播放")
+                    refreshStaleCacheOrSkip(gen, "无法播放")
                 }
             }
 
@@ -956,27 +1016,41 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         }
     }
 
-    /**
-     * 首帧出画后在后台静默预热相邻 2 个在线频道的清晰度流地址，消除下次 CH+/CH- 切台的 API 等待
-     */
-    private fun prefetchNextChannelQualities() {
-        val candidates = selectPrefetchRids(playList, currentIndex)
-        if (candidates.isEmpty()) return
+    private fun refreshStaleCacheOrSkip(gen: Long, fallbackReason: String) {
+        val ch = playList.getOrNull(currentIndex)
+        if (ch == null) {
+            onChannelUnplayable(fallbackReason)
+            return
+        }
+        streamCache.remove(ch.rid)
+        streamCacheTime.remove(ch.rid)
+
+        if (!currentQualitiesFromCache) {
+            onChannelUnplayable(fallbackReason)
+            return
+        }
+
+        currentQualitiesFromCache = false
         val base = activeBaseUrl()
-        val gen = switchGen
-        prefetchJob?.cancel()
-        prefetchJob = lifecycleScope.launch(Dispatchers.IO) {
-            val now = System.currentTimeMillis()
-            for (rid in candidates) {
-                if (!isActive || gen != switchGen) return@launch
-                val cached = streamCache[rid]
-                val cachedAt = streamCacheTime[rid] ?: 0L
-                if (cached != null && now - cachedAt < CACHE_TTL && cached.isNotEmpty()) {
-                    continue
+        switchJob?.cancel()
+        switchJob = lifecycleScope.launch {
+            when (val fetched = withContext(Dispatchers.IO) { fetchQualities(base, ch.rid) }) {
+                is FetchQualitiesResult.Success -> {
+                    if (gen != switchGen || !isActive) return@launch
+                    putStreamCache(ch.rid, fetched.streams)
+                    qualityList = fetched.streams
+                    qualityIndex = 0
+                    preferSoftwareDecoderForCurrent = false
+                    prepareThenSwap(gen, fetched.streams[0].second, ch.name)
                 }
-                val fetched = fetchQualities(base, rid)
-                if (fetched.isNotEmpty()) {
-                    putStreamCache(rid, fetched)
+                is FetchQualitiesResult.NetworkError -> {
+                    if (gen != switchGen || !isActive) return@launch
+                    handleFetchNetworkError(ch.name, fetched.reason)
+                }
+                is FetchQualitiesResult.Unavailable -> {
+                    if (gen == switchGen && isActive) {
+                        onChannelUnplayable(fallbackReason)
+                    }
                 }
             }
         }
@@ -1043,7 +1117,11 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         firstFrameWatchdogRunnable = null
     }
 
-    private fun retryWithSoftwareDecoder(gen: Long, reason: String) {
+    private fun retryWithSoftwareDecoder(
+        gen: Long,
+        reason: String,
+        failedWasActivePlayer: Boolean = true
+    ) {
         if (gen != switchGen || preferSoftwareDecoderForCurrent || isFinishing || isDestroyed) return
         val url = activeStreamUrl
         if (url.isBlank()) return
@@ -1051,16 +1129,24 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         Log.w(TAG, "硬件解码未出画，切软件兼容解码重试: reason=$reason model=${Build.MODEL}")
         showTip("正切换兼容解码模式…", autoHide = true)
         releasePreparing()
-        releasePlayerOnly()
+        if (failedWasActivePlayer) {
+            releasePlayerOnly()
+        }
         prepareThenSwap(gen, url, name, preferSoftwareDecoder = true)
     }
 
     // -------------------- 取流与超时 --------------------
 
+    private sealed class FetchQualitiesResult {
+        data class Success(val streams: List<Pair<String, String>>) : FetchQualitiesResult()
+        data object Unavailable : FetchQualitiesResult()
+        data class NetworkError(val reason: String) : FetchQualitiesResult()
+    }
+
     private suspend fun fetchQualities(
         baseUrl: String,
         rid: String
-    ): List<Pair<String, String>> =
+    ): FetchQualitiesResult =
         withContext(Dispatchers.IO) {
             val base = ChannelManager.normalizeBaseUrl(baseUrl)
             val apiUrl = "$base/live.php?rid=${rid.trim()}"
@@ -1077,11 +1163,18 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
                     val httpCode = response.code
                     val body = response.body?.string().orEmpty()
                     Log.d(TAG, "fetchQualities url=$apiUrl code=$httpCode body=${body.take(200)}")
-                    if (!response.isSuccessful || body.isBlank()) return@withContext emptyList()
+                    if (!response.isSuccessful) {
+                        return@withContext if (httpCode >= 500 || httpCode == 429) {
+                            FetchQualitiesResult.NetworkError("HTTP $httpCode")
+                        } else {
+                            FetchQualitiesResult.Unavailable
+                        }
+                    }
+                    if (body.isBlank()) return@withContext FetchQualitiesResult.Unavailable
                     val json = JSONObject(body)
-                    if (json.optInt("code", 0) != 200) return@withContext emptyList()
+                    if (json.optInt("code", 0) != 200) return@withContext FetchQualitiesResult.Unavailable
 
-                    val streamsObj = json.optJSONObject("streams") ?: return@withContext emptyList()
+                    val streamsObj = json.optJSONObject("streams") ?: return@withContext FetchQualitiesResult.Unavailable
                     val priorityKeys = listOf("origin", "uhd", "hd", "sd", "ld", "default")
                     val result = mutableListOf<Pair<String, String>>()
 
@@ -1112,11 +1205,15 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
                             }
                         }
                     }
-                    result
+                    if (result.isEmpty()) FetchQualitiesResult.Unavailable
+                    else FetchQualitiesResult.Success(result)
                 }
+            } catch (e: java.io.IOException) {
+                Log.e(TAG, "网络异常导致取流失败: $rid url=$apiUrl", e)
+                FetchQualitiesResult.NetworkError(e.javaClass.simpleName)
             } catch (e: Exception) {
                 Log.e(TAG, "解析流地址失败: $rid url=$apiUrl", e)
-                emptyList()
+                FetchQualitiesResult.Unavailable
             }
         }
 
@@ -1134,11 +1231,8 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
                     prepareThenSwap(gen, qualityList[nextQIdx].second, name, preferSoftwareDecoder = false)
                 } else {
                     if (preparingPlayer === targetPlayer) releasePreparing()
-                    playList.getOrNull(currentIndex)?.rid?.let { rid ->
-                        streamCache.remove(rid)
-                        streamCacheTime.remove(rid)
-                    }
-                    onChannelUnplayable("加载超时")
+                    else if (player === targetPlayer) releasePlayerOnly()
+                    refreshStaleCacheOrSkip(gen, "加载超时")
                 }
             }
         }.also {
@@ -1466,7 +1560,6 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
     private fun releaseAll() {
         switchJob?.cancel()
         probeJob?.cancel()
-        prefetchJob?.cancel()
         cancelFirstFrameWatchdog()
         switchGen++
         hideMenu()
@@ -1494,7 +1587,6 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
 
     override fun onStop() {
         super.onStop()
-        prefetchJob?.cancel()
         mainHandler.removeCallbacks(infoRefreshRunnable)
         cancelFirstFrameWatchdog()
         if (::portraitBackdropView.isInitialized) {

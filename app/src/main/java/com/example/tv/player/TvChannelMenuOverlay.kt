@@ -227,13 +227,15 @@ internal class TvChannelMenuOverlay(
 
     fun hide() {
         isShowing = false
+        lastFocusedRid = null
         rootScrim.animate().cancel()
         channelListContainer.clearFocus()
         rootScrim.visibility = View.GONE
     }
 
     fun currentFocusedRid(): String? {
-        return rootScrim.findFocus()?.tag as? String
+        if (!isShowing) return null
+        return (rootScrim.findFocus()?.tag as? String) ?: lastFocusedRid
     }
 
     private fun populateList(
@@ -253,6 +255,7 @@ internal class TvChannelMenuOverlay(
             val targetView = focusTargetRid?.let { rid ->
                 channelListContainer.findViewWithTag<View>(rid)
             } ?: channelListContainer.getChildAt(0)
+            lastFocusedRid = (targetView?.tag as? String) ?: focusTargetRid
             targetView?.post {
                 targetView.requestFocus()
                 val scrollY = (targetView.top - listScrollView.height / 3).coerceAtLeast(0)
@@ -277,6 +280,7 @@ internal class TvChannelMenuOverlay(
         }
 
         val target = focusTargetView ?: channelListContainer.getChildAt(0)
+        lastFocusedRid = (target?.tag as? String) ?: focusTargetRid
         target?.post {
             target.requestFocus()
             val scrollY = (target.top - listScrollView.height / 3).coerceAtLeast(0)
@@ -404,6 +408,7 @@ internal class TvChannelMenuOverlay(
         card.addView(statusPill)
 
         card.setOnFocusChangeListener { v, hasFocus ->
+            if (hasFocus) lastFocusedRid = channel.rid
             v.background = createCardDrawable(focused = hasFocus, isCurrent = isCurrent)
             nameView.setTextColor(
                 when {
