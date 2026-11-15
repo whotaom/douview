@@ -6,7 +6,14 @@
     android:layout_height="match_parent"
     android:background="#09090C">
 
-    <!-- 1. 唯一全屏主播放器（SurfaceView 原生硬件直出 + RESIZE_MODE_FIT 完整不变形，零额外合成开销） -->
+    <!-- 0. 纯代码生成的竖屏直播舞台氛围背景（仅竖屏流激活，零 PixelCopy / 零 TextureView） -->
+    <com.example.tv.player.PortraitAmbientBackdropView
+        android:id="@+id/portraitBackdropView"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:visibility="gone" />
+
+    <!-- 1. 唯一全屏主播放器（SurfaceView 原生硬件直出 + RESIZE_MODE_FIT 完整不变形） -->
     <androidx.media3.ui.PlayerView
         android:id="@+id/playerView"
         android:layout_width="match_parent"

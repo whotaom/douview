@@ -7,7 +7,6 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import android.text.TextUtils
 import android.util.Log
 import android.view.Gravity
 import android.view.KeyEvent
@@ -159,7 +158,8 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
                 return when (keyCode) {
                     KeyEvent.KEYCODE_MENU,
                     KeyEvent.KEYCODE_INFO,
-                    KeyEvent.KEYCODE_BACK -> RemoteAction.CLOSE_MENU
+                    KeyEvent.KEYCODE_BACK,
+                    KeyEvent.KEYCODE_DPAD_RIGHT -> RemoteAction.CLOSE_MENU
                     KeyEvent.KEYCODE_DPAD_CENTER,
                     KeyEvent.KEYCODE_ENTER,
                     KeyEvent.KEYCODE_NUMPAD_ENTER -> RemoteAction.MENU_CONFIRM
@@ -223,8 +223,9 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
     private lateinit var channelManager: ChannelManager
     private lateinit var preferences: LivePreferences
 
-    // UI 组件（单个 PlayerView + TV 安全区交互浮层）
+    // UI 组件（单个 PlayerView + 纯代码竖屏舞台背景 + TV 安全区交互浮层）
     private lateinit var root: FrameLayout
+    private lateinit var portraitBackdropView: PortraitAmbientBackdropView
     private lateinit var playerView: PlayerView            // 唯一全屏主播放器（SurfaceView + RESIZE_MODE_FIT）
     private lateinit var tipView: TextView                 // 顶部高层级换台与状态提示（与缓冲胶囊互斥）
     private lateinit var bufferingPill: LinearLayout       // 顶部安全区居中缓冲指示胶囊
@@ -235,9 +236,7 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
     private lateinit var btnRetryChannel: Button
     private lateinit var btnNextChannel: Button
     private lateinit var btnExitPlayer: Button
-    private lateinit var channelMenu: FrameLayout          // 左侧在线选台悬浮面板
-    private lateinit var menuTitleView: TextView           // 选台菜单标题：「在线频道（N）」
-    private lateinit var channelMenuList: LinearLayout
+    private lateinit var channelMenuOverlay: TvChannelMenuOverlay // 左侧半透明在线选台浮层
     private lateinit var infoScrollView: ScrollView        // OK 键技术参数可滚动外框（防止小屏底部截断）
     private lateinit var infoOverlay: TextView             // OK 键技术参数浮层（1s 实时刷新）
 
@@ -324,6 +323,7 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
     private fun buildUi() {
         setContentView(R.layout.activity_tv_fullscreen_player)
         root = findViewById(R.id.rootContainer)
+        portraitBackdropView = findViewById(R.id.portraitBackdropView)
         playerView = findViewById(R.id.playerView)
         tipView = findViewById(R.id.tipView)
         bufferingPill = findViewById(R.id.bufferingPill)
@@ -383,43 +383,19 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
             finish()
         }
 
-        // 1. 左侧在线选台悬浮面板（遵循 TV 48dp 左侧与 27dp 上下过扫描安全区）
-        channelMenu = FrameLayout(this).apply {
-            layoutParams = FrameLayout.LayoutParams(
-                safeScreenWidth.coerceAtMost(420.dp()),
-                FrameLayout.LayoutParams.MATCH_PARENT
-            ).also {
-                it.gravity = Gravity.START
-            }
-            setBackgroundColor(Color.parseColor("#EB101218"))
-            setPadding(48.dp(), 27.dp(), 16.dp(), 27.dp())
-            visibility = View.GONE
-            elevation = 24f
-            isClickable = true
-            isFocusable = false
-        }
-
-        menuTitleView = TextView(this).apply {
-            text = "在线频道（0）"
-            setTextColor(Color.WHITE)
-            textSize = 18f
-            setPadding(12.dp(), 8.dp(), 12.dp(), 8.dp())
-        }
-        channelMenuList = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(4.dp(), 0, 4.dp(), 12.dp())
-        }
-        val scroll = ScrollView(this).apply {
-            layoutParams = FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.MATCH_PARENT,
-                FrameLayout.LayoutParams.MATCH_PARENT
-            ).also { it.topMargin = 48.dp() }
-            isFocusable = false
-            addView(channelMenuList)
-        }
-        channelMenu.addView(menuTitleView)
-        channelMenu.addView(scroll)
-        root.addView(channelMenu)
+        // 1. 左侧半透明毛玻璃感悬浮选台菜单（以 channel.rid 精确索引防漂移）
+        channelMenuOverlay = TvChannelMenuOverlay(
+            context = this,
+            onChannelSelected = { rid ->
+                hideMenu()
+                val idx = playList.indexOfFirst { it.rid == rid }
+                if (idx >= 0) {
+                    switchToChannel(idx, force = true)
+                }
+            },
+            onDismissRequested = { hideMenu() }
+        )
+        root.addView(channelMenuOverlay.rootScrim)
 
         // 2. OK 键技术参数信息面板（可滚动容器 + 顶部留出 HUD 安全距，彻底杜绝截断与重叠）
         infoScrollView = ScrollView(this).apply {
@@ -536,6 +512,13 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
                 }
             }
             channelManager.saveChannels(sorted)
+            if (isMenuShowing) {
+                channelMenuOverlay.refreshIfShowing(
+                    onlineChannels = sorted.filter { it.isLive },
+                    currentRid = playingRid
+                )
+                isMenuShowing = channelMenuOverlay.isShowing
+            }
         }
     }
 
@@ -828,7 +811,9 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
             }
 
             override fun onVideoSizeChanged(videoSize: VideoSize) {
+                if (gen != switchGen || player !== next) return
                 Log.d(TAG, "视频尺寸已更新: ${videoSize.width}x${videoSize.height} ratio=${videoSize.pixelWidthHeightRatio}")
+                updatePortraitBackdropForVideoSize(videoSize)
             }
         })
 
@@ -878,6 +863,7 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         } catch (_: Exception) {}
 
         next.playWhenReady = true
+        updatePortraitBackdropForVideoSize(next.videoSize)
 
         if (next.playbackState == Player.STATE_READY &&
             next.playWhenReady &&
@@ -887,6 +873,25 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         }
 
         showTip("已切换到：$name", autoHide = true)
+    }
+
+    private fun updatePortraitBackdropForVideoSize(videoSize: VideoSize?) {
+        if (!::portraitBackdropView.isInitialized || !::playerView.isInitialized) return
+        val darkBgColor = Color.parseColor("#09090C")
+        val isPortrait = videoSize != null &&
+            PortraitAmbientBackdropView.isPortraitVideo(
+                videoSize.width,
+                videoSize.height,
+                videoSize.pixelWidthHeightRatio
+            )
+        if (isPortrait) {
+            val seed = playList.getOrNull(currentIndex)?.rid ?: activeChannelName
+            portraitBackdropView.setBackdropActive(true, seed)
+            playerView.setBackgroundColor(Color.TRANSPARENT)
+        } else {
+            portraitBackdropView.setBackdropActive(false)
+            playerView.setBackgroundColor(darkBgColor)
+        }
     }
 
     private fun releasePreparing() {
@@ -1058,65 +1063,28 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         bufferingTimeoutRunnable = null
     }
 
-    // -------------------- 选台菜单（仅展示在线频道 + 在线台数） --------------------
+    // -------------------- 选台菜单（半透明浮层 + 仅展示在线频道） --------------------
 
     private fun showMenu() {
         if (isMenuShowing) return
         hideLiveInfo()
 
-        val online = playList.mapIndexed { i, c -> i to c }.filter { it.second.isLive }
+        val online = playList.filter { it.isLive }
         if (online.isEmpty()) {
             showTip("当前没有在线频道", autoHide = true)
             return
         }
 
         isMenuShowing = true
-        menuTitleView.text = "在线频道（${online.size}）"
-        channelMenuList.removeAllViews()
-
-        online.forEach { (realIdx, ch) ->
-            val isCurrent = (realIdx == currentIndex)
-            val tv = TextView(this).apply {
-                text = (if (isCurrent) "▶ " else "   ") + ch.name
-                maxLines = 1
-                ellipsize = TextUtils.TruncateAt.END
-                setTextColor(if (isCurrent) Color.parseColor("#4FC3F7") else Color.WHITE)
-                textSize = 16f
-                gravity = Gravity.CENTER_VERTICAL
-                minHeight = 48.dp()
-                setPadding(14.dp(), 10.dp(), 14.dp(), 10.dp())
-                isFocusable = true
-                isClickable = true
-                tag = realIdx
-
-                setOnFocusChangeListener { v, hasFocus ->
-                    v.setBackgroundColor(if (hasFocus) Color.parseColor("#33FFFFFF") else Color.TRANSPARENT)
-                    (v as TextView).setTextColor(
-                        if (hasFocus || (v.tag as Int) == currentIndex) Color.parseColor("#4FC3F7")
-                        else Color.WHITE
-                    )
-                }
-
-                setOnClickListener { v ->
-                    val idx = v.tag as Int
-                    hideMenu()
-                    switchToChannel(idx, force = true)
-                }
-            }
-            channelMenuList.addView(tv)
-        }
-
-        channelMenu.visibility = View.VISIBLE
-        channelMenu.bringToFront()
-        val focus = online.indexOfFirst { it.first == currentIndex }.coerceAtLeast(0)
-        val focusTarget = channelMenuList.getChildAt(focus)
-        focusTarget?.post { focusTarget.requestFocus() }
+        val currentRid = playList.getOrNull(currentIndex)?.rid
+        channelMenuOverlay.show(online, currentRid)
     }
 
     private fun hideMenu() {
         isMenuShowing = false
-        channelMenuList.clearFocus()
-        channelMenu.visibility = View.GONE
+        if (::channelMenuOverlay.isInitialized) {
+            channelMenuOverlay.hide()
+        }
     }
 
     // -------------------- OK 键流信息浮层（1 秒实时刷新） --------------------
@@ -1229,11 +1197,13 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
                 return true
             }
             RemoteAction.MENU_CONFIRM -> {
-                val focusedView = currentFocus ?: channelMenuList.focusedChild
-                val target = focusedView?.tag as? Int
-                if (target != null) {
+                val targetRid = channelMenuOverlay.currentFocusedRid()
+                if (targetRid != null) {
                     hideMenu()
-                    switchToChannel(target, force = true)
+                    val targetIdx = playList.indexOfFirst { it.rid == targetRid }
+                    if (targetIdx >= 0) {
+                        switchToChannel(targetIdx, force = true)
+                    }
                     return true
                 }
                 return false
@@ -1342,7 +1312,9 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
     }
 
     private fun showErrorOverlay(title: String, detail: String) {
+        hideMenu()
         hideLiveInfo()
+        updatePortraitBackdropForVideoSize(null)
         errorTitleView.text = title
         errorDetailView.text = detail
         errorOverlay.visibility = View.VISIBLE
@@ -1393,6 +1365,7 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
     private fun releasePlayerOnly() {
         cancelBufferingTimeout()
         cancelFirstFrameWatchdog()
+        updatePortraitBackdropForVideoSize(null)
         playerView.player = null
         try {
             player?.stop()
@@ -1407,7 +1380,9 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         probeJob?.cancel()
         cancelFirstFrameWatchdog()
         switchGen++
+        hideMenu()
         hideLiveInfo()
+        tipView.animate().cancel()
         tipView.removeCallbacks(hideTipRunnable)
         releasePreparing()
         releasePlayerOnly()
@@ -1417,6 +1392,9 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
         super.onStop()
         mainHandler.removeCallbacks(infoRefreshRunnable)
         cancelFirstFrameWatchdog()
+        if (::portraitBackdropView.isInitialized) {
+            portraitBackdropView.onHostStopped()
+        }
         wasStoppedInBackground = true
         player?.playWhenReady = false
         releasePreparing()
@@ -1425,10 +1403,16 @@ class TvFullscreenPlayerActivity : ComponentActivity() {
 
     override fun onStart() {
         super.onStart()
+        if (::portraitBackdropView.isInitialized) {
+            portraitBackdropView.onHostStarted()
+        }
         player?.let { active ->
             if (wasStoppedInBackground) {
                 wasStoppedInBackground = false
-                if (active.isCurrentMediaItemLive) {
+                if (active.playbackState == Player.STATE_IDLE && activeStreamUrl.isNotBlank()) {
+                    active.setMediaItem(buildLiveMediaItem(activeStreamUrl))
+                    active.prepare()
+                } else if (active.isCurrentMediaItemLive) {
                     active.seekToDefaultPosition()
                 }
             }

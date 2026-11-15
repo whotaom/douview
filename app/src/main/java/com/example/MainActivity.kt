@@ -33,6 +33,7 @@ import androidx.activity.result.ActivityResultLauncher
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.*
 import androidx.compose.animation.core.*
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.focusable
@@ -40,6 +41,7 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -208,9 +210,11 @@ class MainActivity : ComponentActivity() {
 
         // 关键：智能识别电视机顶盒硬件（如 H96 Max 等），若在 TV 上启动自动直达真正的电视交互主入口
         val uiModeManager = getSystemService(Context.UI_MODE_SERVICE) as? android.app.UiModeManager
+        @Suppress("DEPRECATION")
+        val hasLegacyTvFeature = packageManager.hasSystemFeature(PackageManager.FEATURE_TELEVISION)
         val isTvDevice = uiModeManager?.currentModeType == Configuration.UI_MODE_TYPE_TELEVISION
             || packageManager.hasSystemFeature(PackageManager.FEATURE_LEANBACK)
-            || packageManager.hasSystemFeature(PackageManager.FEATURE_TELEVISION)
+            || hasLegacyTvFeature
             || !packageManager.hasSystemFeature(PackageManager.FEATURE_TOUCHSCREEN)
 
         if (isTvDevice) {
@@ -574,8 +578,8 @@ class MainActivity : ComponentActivity() {
                                 pageTitle = view?.title ?: ""
                                 // 页面加载完成后注入军工级流媒体声画保活与首帧自播解静音补丁
                                 injectLiveStabilizerScript(view)
-                                postDelayed({ healAudioAndStreamSilent() }, 200)
-                                postDelayed({ healAudioAndStreamSilent() }, 800)
+                                postDelayed({ if (!isFinishing && !isDestroyed) healAudioAndStreamSilent() }, 200)
+                                postDelayed({ if (!isFinishing && !isDestroyed) healAudioAndStreamSilent() }, 800)
                             }
 
                             override fun onReceivedError(
@@ -772,9 +776,7 @@ class MainActivity : ComponentActivity() {
                         Surface(
                             shape = RoundedCornerShape(12.dp),
                             color = DouyinCyan.copy(alpha = 0.12f),
-                            border = ButtonDefaults.outlinedButtonBorder.copy(
-                                brush = androidx.compose.ui.graphics.SolidColor(DouyinCyan.copy(alpha = 0.25f))
-                            )
+                            border = BorderStroke(1.dp, DouyinCyan.copy(alpha = 0.25f))
                         ) {
                             Text(
                                 text = "极速硬件加速解码已就绪",
@@ -988,7 +990,7 @@ class MainActivity : ComponentActivity() {
                             modifier = Modifier.size(36.dp)
                         ) {
                             Icon(
-                                imageVector = Icons.Default.VolumeUp,
+                                imageVector = Icons.AutoMirrored.Filled.VolumeUp,
                                 contentDescription = "恢复声音",
                                 tint = DouyinGreen,
                                 modifier = Modifier.size(18.dp)
@@ -1783,6 +1785,7 @@ class MainActivity : ComponentActivity() {
         val settings = wv.settings
         settings.javaScriptEnabled = true
         settings.domStorageEnabled = true
+        @Suppress("DEPRECATION")
         settings.databaseEnabled = true
         settings.mediaPlaybackRequiresUserGesture = false
         settings.useWideViewPort = true
@@ -1849,6 +1852,7 @@ class MainActivity : ComponentActivity() {
             audioManager?.abandonAudioFocus(null)
         }
         webView?.let { wv ->
+            wv.removeCallbacks(null)
             wv.stopLoading()
             wv.removeJavascriptInterface("AndroidLiveBridge")
             wv.loadDataWithBaseURL(null, "", "text/html", "utf-8", null)

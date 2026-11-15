@@ -229,11 +229,18 @@ fun ChangeUrlDialog(
         confirmButton = {
             Button(
                 onClick = {
-                    if (inputUrl.isNotBlank()) {
-                        val trimmed = inputUrl.trim()
-                        preferences.recordHistoryUrl(trimmed)
-                        onConfirmUrl(trimmed)
+                    val trimmed = inputUrl.trim()
+                    if (!trimmed.startsWith("https://", ignoreCase = true) || trimmed.length <= 8) {
+                        android.widget.Toast.makeText(
+                            context,
+                            "请输入以 https:// 开头的有效地址",
+                            android.widget.Toast.LENGTH_SHORT
+                        ).show()
+                        return@Button
                     }
+                    val sanitized = LivePreferences.sanitizeWebUrl(trimmed)
+                    preferences.recordHistoryUrl(sanitized)
+                    onConfirmUrl(sanitized)
                 },
                 colors = ButtonDefaults.buttonColors(containerColor = DouyinRed),
                 border = if (isConfirmFocused) BorderStroke(2.5.dp, DouyinCyan) else null,

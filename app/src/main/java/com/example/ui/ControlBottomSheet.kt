@@ -1,5 +1,6 @@
 package com.example.ui
 
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -8,6 +9,8 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.OpenInNew
+import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -207,9 +210,7 @@ fun ControlBottomSheet(
                     .focusable(),
                 shape = RoundedCornerShape(14.dp),
                 colors = CardDefaults.cardColors(containerColor = DarkSurfaceElevated),
-                border = ButtonDefaults.outlinedButtonBorder.copy(
-                    brush = androidx.compose.ui.graphics.SolidColor(DouyinCyan.copy(alpha = 0.35f))
-                )
+                border = BorderStroke(1.dp, DouyinCyan.copy(alpha = 0.35f))
             ) {
                 Row(
                     modifier = Modifier
@@ -252,7 +253,7 @@ fun ControlBottomSheet(
                         }
                     }
                     Icon(
-                        imageVector = Icons.Default.OpenInNew,
+                        imageVector = Icons.AutoMirrored.Filled.OpenInNew,
                         contentDescription = null,
                         tint = DouyinCyan,
                         modifier = Modifier.size(18.dp)
@@ -272,7 +273,7 @@ fun ControlBottomSheet(
                 horizontalArrangement = Arrangement.spacedBy(10.dp)
             ) {
                 QuickActionButton(
-                    icon = Icons.Default.VolumeUp,
+                    icon = Icons.AutoMirrored.Filled.VolumeUp,
                     label = "声画自愈",
                     accentColor = DouyinCyan,
                     modifier = Modifier.weight(1f),
@@ -303,7 +304,7 @@ fun ControlBottomSheet(
                 )
             }
 
-            Divider(color = DarkSurfaceBorder, thickness = 0.8.dp)
+            HorizontalDivider(color = DarkSurfaceBorder, thickness = 0.8.dp)
 
             // Preference Toggles List
             Column(
@@ -345,9 +346,7 @@ fun ControlBottomSheet(
                     modifier = Modifier.weight(1f).focusable(),
                     shape = RoundedCornerShape(12.dp),
                     colors = ButtonDefaults.outlinedButtonColors(contentColor = DouyinCyan),
-                    border = ButtonDefaults.outlinedButtonBorder.copy(
-                        brush = androidx.compose.ui.graphics.SolidColor(DouyinCyan.copy(alpha = 0.4f))
-                    )
+                    border = BorderStroke(1.dp, DouyinCyan.copy(alpha = 0.4f))
                 ) {
                     Icon(
                         imageVector = Icons.Default.SystemUpdate,
@@ -363,9 +362,7 @@ fun ControlBottomSheet(
                     modifier = Modifier.weight(1f).focusable(),
                     shape = RoundedCornerShape(12.dp),
                     colors = ButtonDefaults.outlinedButtonColors(contentColor = TextSecondary),
-                    border = ButtonDefaults.outlinedButtonBorder.copy(
-                        brush = androidx.compose.ui.graphics.SolidColor(DarkSurfaceBorder)
-                    )
+                    border = BorderStroke(1.dp, DarkSurfaceBorder)
                 ) {
                     Icon(
                         imageVector = Icons.Default.DeleteSweep,

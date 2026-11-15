@@ -37,7 +37,9 @@ import com.example.tv.channel.ChannelManager
 import com.example.tv.components.safeRequestFocus
 import com.example.tv.components.tvInteractive
 import com.example.ui.theme.*
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /**
  * 电视端频道管理弹窗（宽屏双栏 10-foot 适配 + 完整 D-pad 焦点高亮）
@@ -397,8 +399,17 @@ fun ChannelManageDialog(
                                         testTagValue = "channel_dialog_export_json_btn",
                                         modifier = Modifier.weight(1f),
                                         onClick = {
-                                            val file = channelManager.exportJson(channels)
-                                            Toast.makeText(context, "已导出 JSON: ${file.name}", Toast.LENGTH_LONG).show()
+                                            val snapshot = channels.toList()
+                                            coroutineScope.launch {
+                                                val result = withContext(Dispatchers.IO) {
+                                                    runCatching { channelManager.exportJson(snapshot) }
+                                                }
+                                                result.onSuccess { file ->
+                                                    Toast.makeText(context, "已导出 JSON: ${file.name}", Toast.LENGTH_LONG).show()
+                                                }.onFailure { err ->
+                                                    Toast.makeText(context, "导出失败: ${err.message}", Toast.LENGTH_SHORT).show()
+                                                }
+                                            }
                                         }
                                     )
 
@@ -409,8 +420,17 @@ fun ChannelManageDialog(
                                         testTagValue = "channel_dialog_export_txt_btn",
                                         modifier = Modifier.weight(1f),
                                         onClick = {
-                                            val file = channelManager.exportTxt(channels)
-                                            Toast.makeText(context, "已导出 TXT: ${file.name}", Toast.LENGTH_LONG).show()
+                                            val snapshot = channels.toList()
+                                            coroutineScope.launch {
+                                                val result = withContext(Dispatchers.IO) {
+                                                    runCatching { channelManager.exportTxt(snapshot) }
+                                                }
+                                                result.onSuccess { file ->
+                                                    Toast.makeText(context, "已导出 TXT: ${file.name}", Toast.LENGTH_LONG).show()
+                                                }.onFailure { err ->
+                                                    Toast.makeText(context, "导出失败: ${err.message}", Toast.LENGTH_SHORT).show()
+                                                }
+                                            }
                                         }
                                     )
                                 }

@@ -6,6 +6,7 @@ import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.widget.Toast
+import com.example.BuildConfig
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.Request
@@ -26,12 +27,14 @@ object UpdateManager {
     private const val GITHUB_REPO_API = "https://api.github.com/repos/whotaom/douview/releases/latest"
     const val GITHUB_REPO_PAGE = "https://github.com/whotaom/douview/releases"
 
+    private const val MAX_RELEASE_RESPONSE_BYTES = 1024 * 1024L
+
     fun getCurrentVersion(context: Context): String {
         return try {
             val pInfo = context.packageManager.getPackageInfo(context.packageName, 0)
-            pInfo.versionName ?: "1.0.1"
+            pInfo.versionName ?: BuildConfig.VERSION_NAME
         } catch (e: Exception) {
-            "1.0.1"
+            BuildConfig.VERSION_NAME
         }
     }
 
@@ -46,7 +49,17 @@ object UpdateManager {
                 .build()
 
             val (isSuccess, responseBody) = NetworkClient.okHttpClient.newCall(request).execute().use { response ->
-                response.isSuccessful to (response.body?.string() ?: "")
+                val len = response.body?.contentLength() ?: -1L
+                if (!response.isSuccessful || len > MAX_RELEASE_RESPONSE_BYTES) {
+                    false to ""
+                } else {
+                    val body = response.body?.string().orEmpty()
+                    if (body.length > MAX_RELEASE_RESPONSE_BYTES) {
+                        false to ""
+                    } else {
+                        true to body
+                    }
+                }
             }
 
             if (isSuccess && responseBody.isNotBlank()) {
@@ -91,7 +104,7 @@ object UpdateManager {
                         currentVersion = currentVer,
                         latestVersion = "v$currentVer",
                         title = "当前版本已是最新 (v$currentVer)",
-                        changelog = "【v1.0.1 稳定版更新要点】\n1. 全屏播放极简高稳单层 PlayerView 架构，杜绝黑屏风险；\n2. 遵循 Android TV Overscan 安全区与全向 D-pad 焦点管理；\n3. 全链路 HTTPS 安全策略与网络稳定性优化。",
+                        changelog = "【v1.1.0 稳定版更新要点】\n1. TV 端选台菜单升级为半透明悬浮玻璃抽屉与翡翠绿焦点高亮；\n2. 新增纯代码生成的 TV 竖屏直播舞台氛围背景，零硬件解码开销；\n3. 优化离线导出异步 I/O、菜单索引防漂移与全链路 HTTPS 安全策略。",
                         apkUrl = GITHUB_REPO_PAGE,
                         hasUpdate = false,
                         releasePageUrl = GITHUB_REPO_PAGE

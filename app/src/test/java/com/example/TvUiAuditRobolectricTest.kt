@@ -119,11 +119,16 @@ class TvUiAuditRobolectricTest {
     fun `player layout aligns tipView and bufferingPill cleanly to shared top-center slot`() {
         val context = ApplicationProvider.getApplicationContext<Context>()
         val root = LayoutInflater.from(context).inflate(R.layout.activity_tv_fullscreen_player, null) as FrameLayout
+        val backdropView = root.findViewById<com.example.tv.player.PortraitAmbientBackdropView>(R.id.portraitBackdropView)
         val playerView = root.findViewById<androidx.media3.ui.PlayerView>(R.id.playerView)
         val tipView = root.findViewById<android.view.View>(R.id.tipView)
         val bufferingPill = root.findViewById<android.view.View>(R.id.bufferingPill)
 
-        // Single pure SurfaceView PlayerView with opaque #09090C background (no dynamic background view)
+        // Pure-code PortraitAmbientBackdropView sits underneath SurfaceView PlayerView and starts GONE
+        assertEquals(android.view.View.GONE, backdropView.visibility)
+        assertTrue(root.indexOfChild(backdropView) < root.indexOfChild(playerView))
+
+        // Cold-start/landscape SurfaceView PlayerView retains opaque #09090C background
         val playerBg = (playerView.background as? android.graphics.drawable.ColorDrawable)?.color
         assertEquals(android.graphics.Color.parseColor("#09090C"), playerBg)
         assertTrue(playerView.videoSurfaceView is android.view.SurfaceView)

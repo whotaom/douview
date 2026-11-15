@@ -2,9 +2,14 @@ package com.example
 
 import android.content.Context
 import android.content.pm.PackageManager
+import android.graphics.drawable.GradientDrawable
 import android.view.KeyEvent
+import android.view.View
 import androidx.core.content.ContextCompat
 import androidx.test.core.app.ApplicationProvider
+import com.example.tv.channel.Channel
+import com.example.tv.player.PortraitAmbientBackdropView
+import com.example.tv.player.TvChannelMenuOverlay
 import com.example.tv.player.TvFullscreenPlayerActivity
 import com.example.tv.player.TvFullscreenPlayerActivity.Companion.RemoteAction
 import com.example.util.UpdateManager
@@ -77,6 +82,10 @@ class TvPlayerLogicTest {
             TvFullscreenPlayerActivity.resolveRemoteAction(KeyEvent.KEYCODE_DPAD_CENTER, isMenuShowing = true, isInfoShowing = false)
         )
         assertEquals(
+            RemoteAction.CLOSE_MENU,
+            TvFullscreenPlayerActivity.resolveRemoteAction(KeyEvent.KEYCODE_DPAD_RIGHT, isMenuShowing = true, isInfoShowing = false)
+        )
+        assertEquals(
             RemoteAction.CLOSE_INFO,
             TvFullscreenPlayerActivity.resolveRemoteAction(KeyEvent.KEYCODE_BACK, isMenuShowing = false, isInfoShowing = true)
         )
@@ -111,8 +120,9 @@ class TvPlayerLogicTest {
             "https://github.com/whotaom/douview/releases/tag/v1.0.2",
             UpdateManager.sanitizeHttpsUrl("https://github.com/whotaom/douview/releases/tag/v1.0.2")
         )
-        assertTrue(UpdateManager.isNewerVersion("1.0.2", "1.0.1"))
-        assertFalse(UpdateManager.isNewerVersion("1.0.1", "1.0.1"))
+        assertEquals("1.1.0", UpdateManager.getCurrentVersion(context))
+        assertTrue(UpdateManager.isNewerVersion("1.1.1", "1.1.0"))
+        assertFalse(UpdateManager.isNewerVersion("1.1.0", "1.1.0"))
     }
 
     @Test
@@ -161,5 +171,65 @@ class TvPlayerLogicTest {
         assertTrue(TvFullscreenPlayerActivity.streamCache.size <= TvFullscreenPlayerActivity.MAX_STREAM_CACHE_SIZE)
         assertTrue(TvFullscreenPlayerActivity.streamCache.containsKey("rid_70"))
         TvFullscreenPlayerActivity.clearStreamCache()
+    }
+
+    @Test
+    fun `portrait ambient backdrop detects portrait aspect ratio and generates procedural bitmap`() {
+        assertTrue(PortraitAmbientBackdropView.isPortraitVideo(1080, 1920))
+        assertFalse(PortraitAmbientBackdropView.isPortraitVideo(1920, 1080))
+        assertFalse(PortraitAmbientBackdropView.isPortraitVideo(1080, 1080))
+        assertFalse(PortraitAmbientBackdropView.isPortraitVideo(0, 1920))
+
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val backdrop = PortraitAmbientBackdropView(context)
+        assertEquals(View.GONE, backdrop.visibility)
+
+        backdrop.setBackdropActive(true, "127453393722")
+        assertEquals(View.VISIBLE, backdrop.visibility)
+
+        val bmp = PortraitAmbientBackdropView.renderProceduralBitmap("127453393722")
+        assertEquals(320, bmp.width)
+        assertEquals(180, bmp.height)
+        bmp.recycle()
+
+        backdrop.setBackdropActive(false)
+        assertEquals(View.GONE, backdrop.visibility)
+    }
+
+    @Test
+    fun `tv channel menu overlay renders translucent drawer and selects by rid`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        var selectedRid: String? = null
+        var dismissed = false
+        val overlay = TvChannelMenuOverlay(
+            context = context,
+            onChannelSelected = { selectedRid = it },
+            onDismissRequested = { dismissed = true }
+        )
+
+        val drawerBg = overlay.drawerCard.background as GradientDrawable
+        val bgAlpha = android.graphics.Color.alpha(drawerBg.color!!.defaultColor)
+        assertTrue("Drawer must be semi-transparent (< 220 alpha), got $bgAlpha", bgAlpha in 120..215)
+
+        val channels = listOf(
+            Channel(rid = "1001", name = "唯一", title = "有没有一首歌你喜欢", isLive = true, statusKnown = true),
+            Channel(rid = "1002", name = "央视一套", title = "直播中", isLive = true, statusKnown = true)
+        )
+        overlay.show(channels, currentRid = "1001")
+        assertTrue(overlay.isShowing)
+        assertEquals(View.VISIBLE, overlay.rootScrim.visibility)
+
+        // Click scrim to dismiss
+        overlay.rootScrim.performClick()
+        assertTrue(dismissed)
+
+        // Refresh in-place with updated channel list and verify click emits rid
+        overlay.refreshIfShowing(channels.reversed(), currentRid = "1002")
+        val row1002 = overlay.rootScrim.findViewWithTag<View>("1002")
+        assertNotNull(row1002)
+        row1002.performClick()
+        assertEquals("1002", selectedRid)
+        overlay.hide()
+        assertFalse(overlay.isShowing)
     }
 }
